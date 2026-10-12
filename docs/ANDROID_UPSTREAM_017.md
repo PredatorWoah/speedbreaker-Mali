@@ -80,3 +80,17 @@ warm-up and bounded captures, check mirror/HUD and engine/music, then begin a
 second race if convenient. Do not benchmark capture frames or enter Career.
 Run scripts/android/capture_visual_fidelity.sh locally to collect one private
 archive if a defect remains. No hardware improvement is claimed before this test.
+
+## Completed build
+
+Optimized full ARM64 release succeeded (sbDiagnostics=OFF, sbBringup=ON), clean
+source `02a9f372a5a2305a8cb7b7217719f162607fdc8a`. Packaged AArch64 libmain.so
+contains all 56,165 unique translated guest functions, visual diagnostics and
+the depth-only fix. Native/app version 0.1.7, version code 8, package unchanged.
+APK v2 signature verifies and matches the retained 0.1.6 certificate exactly.
+Build ID: `8e2b9de560f28dd1ff8c82c773351218156265db`.
+APK SHA256: `54ad66b3d474e07f18e15416ce4c6e919d309408931bb10fc8ac646a14daf664`.
+Size: 20,786,171 bytes. The reconstructed preserved 0.1.6 APK checksum and
+signature match its published build record; its files were not modified.
+Additional existing ZPD, ISO concurrency/lifetime/bounds and bounded-capture
+checks pass. No Adreno graphics, installation or audio execution was performed.

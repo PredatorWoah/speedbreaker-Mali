@@ -274,3 +274,13 @@ No unrelated upstream timing/trails/tuning or renderer quality policy changed.
 Android/native version 0.1.7, code 8, package and retained signing key preserved.
 Collector version check accepts capture-enabled codes >=6. See ANDROID_UPSTREAM_017.md
 for source trace, regression tests, competing hypotheses, rollback and single RP6 test.
+
+0.1.7 build completed: optimized signed ARM64, clean source `02a9f37`, code 8,
+package/certificate unchanged. APK v2 verifies. All 56,165 unique guest functions
+and the new shader path are present. Native Build ID
+`8e2b9de560f28dd1ff8c82c773351218156265db`; APK SHA256
+`54ad66b3d474e07f18e15416ce4c6e919d309408931bb10fc8ac646a14daf664`.
+Artifact is delivered directly; verification and test instructions live under
+builds/android/0.1.7-android-shadows/. Preserved 0.1.6 checksum/signature match.
+Depth-only, exhaustive depth24, optimized SPIR-V (Vulkan 1.1/1.2), ZPD, ISO reader
+and capture-limit tests pass. No RP6/ADB/LAN access; visual result remains untested.
