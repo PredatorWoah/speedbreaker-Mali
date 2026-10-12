@@ -53,3 +53,6 @@ target_link_libraries(audio_downmix_test PRIVATE SDL3::SDL3)
 # Upstream v0.1.1 regression: shared GLSL/C++ arithmetic plus actual resolve integration.
 sb_test(depth24_pack_test ARGS ${RT}/gpu/renderer.cpp)
 sb_test(visual_capture_test ARGS ${CMAKE_CURRENT_BINARY_DIR}/visual_capture_out)
+
+# Upstream v0.1.3 solid shadow caster regression.
+sb_test(depth_only_test ARGS ${RT}/gpu/renderer.cpp)

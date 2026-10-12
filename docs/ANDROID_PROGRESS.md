@@ -263,3 +263,14 @@ Most valuable next test: two-minute same-scene 720p Quick Race, checking restore
 sunlight and stable shadows; evaluate warmed `[perf]`/`[hitch]` only after the three
 bounded captures finish. Check audio/mirror/HUD and start a second race. Source
 review alone cannot identify the RP6 critical path. Return one private archive.
+
+## 0.1.7 isolated upstream solid-shadow test — October 12, 2026
+
+Baseline 0.1.6 (`95533b7`); upstream v0.1.3 (`b49fc32`). Ported the depth-only
+shader semantics fix: solid casters no longer run the stale alpha-killing tree
+pixel shader; depth-only alpha testing is suppressed and guest shader binding
+is restored afterwards. Import helper/test verbatim, retain 0.1.6 depth24 fix.
+No unrelated upstream timing/trails/tuning or renderer quality policy changed.
+Android/native version 0.1.7, code 8, package and retained signing key preserved.
+Collector version check accepts capture-enabled codes >=6. See ANDROID_UPSTREAM_017.md
+for source trace, regression tests, competing hypotheses, rollback and single RP6 test.

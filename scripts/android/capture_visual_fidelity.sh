@@ -12,7 +12,8 @@ OUT=$(realpath -m "${1:-speedbreaker-visual-$(date -u +%Y%m%dT%H%M%SZ)}")
 mkdir -p "$OUT"
 "${ADB[@]}" shell dumpsys package "$PACKAGE" > "$OUT/package-info.txt"
 "${ADB[@]}" exec-out run-as "$PACKAGE" id > "$OUT/run-as.txt" 2> "$OUT/run-as-errors.txt" || { echo 'Extraction requires a debuggable sbBringup=ON build; see run-as-errors.txt' >&2; exit 1; }
-grep -q 'versionName=0.1.5-android-visual-diagnostic' "$OUT/package-info.txt" || { echo 'Install the 0.1.5 visual diagnostic APK first.' >&2; exit 1; }
+VERSION_CODE=$(sed -n 's/.*versionCode=\([0-9]*\).*/\1/p' "$OUT/package-info.txt" | head -n 1)
+[[ "$VERSION_CODE" =~ ^[0-9]+$ && "$VERSION_CODE" -ge 6 ]] || { echo 'Install a capture-enabled SpeedBreaker One test build (code 6 or newer).' >&2; exit 1; }
 # Start before launch, without clearing previous logcat evidence.
 "${ADB[@]}" logcat -v threadtime > "$OUT/logcat.txt" 2> "$OUT/logcat-errors.txt" &
 LOG_PID=$!
