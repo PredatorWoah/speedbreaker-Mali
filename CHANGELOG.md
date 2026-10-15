@@ -4,6 +4,20 @@ What changed in each SpeedBreaker release, newest first. Each release's notes on
 its entry here, and the game shows the entry once, the first time a new version starts (offline:
 it's built into the game).
 
+## v0.1.9 (Android GPU work reduction)
+
+- Adapt native-renderer early depth rejection for read-only depth-tested draws;
+  retain late tests for depth/stencil writes, depth exports, memory exports and queries.
+- Supply actual sampled image reciprocals to offset texture samples, including
+  scaled render targets; retain guest sizes for unnormalized 2D coordinates.
+- Specialize 1x 32-bit resolves and dispatch lanes in tiled-word order, preserving
+  all guest memory writes and cached texture stores.
+- Advanced > GPU Work Reduction switches these paths off after restart for testing.
+- Pause on Android window focus loss as well as Activity background events;
+  avoid resuming a background Activity on focus alone. Park queued GPU batches.
+
+No confirmed RP6 FPS improvement yet. No shadow, motion blur or resolution reduction.
+
 ## v0.1.8 (Android performance trial)
 
 - Android GPU Scheduling: Overlap trials guarded vertex-stage overlap without
