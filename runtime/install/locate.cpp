@@ -1,12 +1,14 @@
 // SpeedBreaker runtime. GPL-3.0-or-later (see COPYING). See locate.h.
 #include "locate.h"
 #include "installer.h"
+#include "placement.h"
 
 #include <user/paths.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <set>
 
 #include <pwd.h>
@@ -141,8 +143,14 @@ namespace install
             RecoverInterruptedInstall(*recorded, manifest);
             if (std::optional<fs::path> xex = UsableXex(*recorded, true, manifest))
                 return Found(*recorded, *xex, InstallOrigin::User, manifest);
-            fprintf(stderr, "[install] the game was installed in %s, which isn't usable now (drive not inserted?)\n",
-                recorded->c_str());
+            // Why, for the log (the installer screen says it to the player:
+            // DescribeRecordedInstall).
+            std::error_code ec;
+            fs::file_status status = fs::status(*recorded, ec);
+            std::string why = status.type() == fs::file_type::not_found ? "isn't there now (a drive not connected?)"
+                : ec ? std::format("can't be read ({})", ec.message())
+                     : "isn't a current install (files missing, or an older version)";
+            fprintf(stderr, "[install] the game was installed in %s, which %s\n", recorded->string().c_str(), why.c_str());
         }
 
         fs::path user = DefaultInstallPath();
@@ -178,39 +186,30 @@ namespace install
         }
     }
 
-    std::optional<std::filesystem::path> RecordedInstallPath()
+    std::optional<std::filesystem::path> ReadInstallRecord(const std::filesystem::path& file, const portable::Layout& layout)
     {
-        FILE* f = fopen(LocationFile().c_str(), "rb");
+        FILE* f = fopen(file.c_str(), "rb");
         if (!f)
             return std::nullopt;
         char buffer[4096];
         size_t n = fread(buffer, 1, sizeof(buffer) - 1, f);
         fclose(f);
-        std::string text(buffer, n);
-        while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
-            text.pop_back();
-        if (text.empty() || text.front() != '/')
-            return std::nullopt;
-        return fs::path(text);
+        // Absolute, or (portable mode) relative to SpeedBreaker's folder; no
+        // trailing separator (records before v0.1.1 kept `--dest dir/`'s).
+        return portable::ParseRecord(std::string_view(buffer, n), layout);
     }
 
-    bool RecordInstallPath(const std::filesystem::path& dir)
+    bool WriteInstallRecord(const std::filesystem::path& file, const std::string& text)
     {
         std::error_code ec;
-        fs::path file = LocationFile();
-        if (fs::absolute(dir, ec).lexically_normal() == fs::absolute(DefaultInstallPath(), ec).lexically_normal())
-        {
-            fs::remove(file, ec);
-            return !ec;
-        }
         fs::create_directories(file.parent_path(), ec);
         fs::path temp = file;
         temp += ".tmp";
         FILE* f = fopen(temp.c_str(), "wb");
         if (!f)
             return false;
-        std::string text = fs::absolute(dir, ec).lexically_normal().string() + "\n";
-        bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();
+        std::string line = text + "\n";
+        bool ok = fwrite(line.data(), 1, line.size(), f) == line.size();
         ok = fflush(f) == 0 && ok;
         fsync(fileno(f));
         fclose(f);
@@ -219,9 +218,39 @@ namespace install
         return ok && !ec;
     }
 
+    std::optional<std::filesystem::path> RecordedInstallPath()
+    {
+        return ReadInstallRecord(LocationFile(), portable::Current());
+    }
+
+    bool RecordInstallPath(const std::filesystem::path& dir)
+    {
+        std::error_code ec;
+        fs::path file = LocationFile();
+        // As the installer compares folders: absolute, links resolved, no
+        // trailing separator (`--dest dir/` and `dir` are one record).
+        fs::path folder = ResolvedFolder(dir);
+        if (SameFolder(folder, DefaultInstallPath()))
+        {
+            fs::remove(file, ec);
+            return !ec;
+        }
+        // In portable mode, a folder inside SpeedBreaker's is recorded
+        // relative to it, so the record still holds once the folder moves.
+        return WriteInstallRecord(file, portable::RecordText(folder, portable::Current()));
+    }
+
     std::vector<InstallDestination> InstallDestinations()
     {
         std::vector<InstallDestination> out;
+        // Portable mode: SpeedBreaker's own folder (its data/game), and no
+        // drive's folder, which would leave the game behind when the folder
+        // moves. Choose a folder... still takes any folder.
+        if (portable::Current().Active())
+        {
+            out.push_back({ "SpeedBreaker's folder", DefaultInstallPath(), false });
+            return out;
+        }
         out.push_back({ "Internal storage", DefaultInstallPath(), false });
         auto addVolume = [&](const fs::path& volume)
         {

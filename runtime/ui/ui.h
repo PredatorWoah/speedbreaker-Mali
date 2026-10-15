@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_video.h>
@@ -47,9 +48,11 @@ namespace ui
     bool Initialize(SDL_Window* window, const VulkanTarget& target);
     // The swapchain was recreated in another format.
     void SetFormat(VkFormat format);
-    // The swapchain's size when it isn't the window's pixels (iOS's present
-    // scale: Screen Resolution or NFSMW_PRESENT_SCALE); 0, 0: the window's
-    // (the default).
+    // The swapchain's size (each time it is built). The UI's framebuffer
+    // scale follows it (iOS's present scale: Screen Resolution or
+    // NFSMW_PRESENT_SCALE makes it smaller than the window's pixels), and
+    // its layout too should the window's size disagree with it in shape
+    // (video/swapchain_policy.h: FitUiDisplay). 0, 0: the window's.
     void SetFramebufferSize(uint32_t width, uint32_t height);
     // Main thread, with the device idle.
     void Shutdown();
@@ -62,6 +65,8 @@ namespace ui
     // Main thread: NFSMW_UI_KEYS asked for a capture of the next presented
     // frame ("Shot"); true once per request.
     bool TakeShot();
+    // Main thread: the same request from elsewhere (NFSMW_VIRTUAL_PAD's SHOT).
+    void RequestShot();
 
     // Main thread: every SDL event, before the game's input sees it. Opens
     // and closes the settings menu (keys, controller chord, three-finger
@@ -111,14 +116,40 @@ namespace ui
     // closes it (A, B, Start, Esc or OK). Nothing without an entry.
     void ShowWhatsNew(std::string_view version);
 
+    // Main thread, before the game starts (main.cpp): a page saying why the
+    // game can't start (memory_status.h's StartupFailure), drawn until it is
+    // closed (Quit, B, Start, Esc; on iOS only by closing the app) or the
+    // window closes. `runFrame` is video::RunFrame. Nothing without a UI.
+    void RunStartupError(const std::string& title, const std::vector<std::string>& paragraphs, const std::string& details,
+        const std::function<bool()>& runFrame);
+
     void OpenSettings();
     void CloseSettings();  // saves any change
     bool SettingsOpen();
 
     // Screens (settings_menu.cpp, perf_overlay.cpp, installer_screen.cpp).
     void DrawSettings();
-    void ResetSettingsMenu();  // on opening: focus the first row
+    void ResetSettingsMenu();  // on opening: focus the first row, no dialog left open
     void DrawPerfOverlay();
+
+    // Settings > Advanced > Check for Updates (update_dialog.cpp, the check
+    // itself is update/updater.h): the row's value and help lines, and its
+    // dialog, drawn inside the settings window.
+    const char* UpdateRowValue();  // "Check", "Checking...", "Up to date", "v0.1.2 is out", "Failed"
+    void UpdateRowHelp();
+    // Starts a check (unless one is running) and opens the dialog next frame.
+    void OpenUpdateDialog();
+    // Every frame inside the settings window, at its top level (not in a
+    // child or a table: the popup's ID). True while the dialog is open: B
+    // closes it, not the menu.
+    bool DrawUpdateDialog();
+    bool UpdateDialogOpen();  // at the same level
+    // The menu closed or reopened: the dialog is gone (a check still running
+    // then ends in a toast).
+    void ForgetUpdateDialog();
+    // The menu closed: Quit Game's prompt (settings_menu.cpp, quit_game.h),
+    // if it was asking, is cancelled.
+    void ForgetQuitPrompt();
 
     // Shared look (ui.cpp).
     SDL_Window* GetWindow();

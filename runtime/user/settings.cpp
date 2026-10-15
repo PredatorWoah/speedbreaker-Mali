@@ -45,6 +45,18 @@ namespace settings
 {
     namespace
     {
+#ifdef __ANDROID__
+        constexpr bool kGpuSchedulingHidden = false;
+        constexpr int kGpuSchedulingDefault = 2;
+#else
+        constexpr bool kGpuSchedulingHidden = true;
+        constexpr int kGpuSchedulingDefault = 0;
+#endif
+        constexpr EnumEntry kGpuSchedulingEntries[] = {
+            { 0, "conservative", "Conservative" },
+            { 2, "overlap", "Overlap (trial)" },
+            { 4, "compare", "Compare" },
+        };
         constexpr EnumEntry kScalingEntries[] = {
             { int32_t(ScalingMode::Bicubic), "bicubic", "Bicubic" },
             { int32_t(ScalingMode::Linear), "linear", "Bilinear" },
@@ -83,11 +95,15 @@ namespace settings
             { int32_t(AspectMode::Widescreen), "16:9", "16:9" },
         };
 
+        // The scale in half steps (settings.h); the tokens are what
+        // settings.toml and NFSMW_RESOLUTION hold, so older files read as
+        // before.
         constexpr EnumEntry kResolutionEntries[] = {
             { kResolutionAuto, "auto", "Auto" },
-            { 1, "1x", "1x (720p)" },
-            { 2, "2x", "2x (1440p)" },
-            { 3, "3x", "3x (2160p)" },
+            { 2, "1x", "1x (720p)" },
+            { 3, "1.5x", "1.5x (1080p)" },
+            { 4, "2x", "2x (1440p)" },
+            { 6, "3x", "3x (2160p)" },
         };
 
         constexpr EnumEntry kAnisotropyEntries[] = {
@@ -130,8 +146,17 @@ namespace settings
               .env = "NFSMW_SCALING", .defaultValue = double(ScalingMode::Bicubic), .entries = kScalingEntries },
             { .id = Id::AspectRatio, .category = Category::Display, .type = Type::Enum, .apply = Apply::Live,
               .table = "video", .key = "aspect_ratio", .label = "Aspect Ratio",
-              .description = "Fill other screen shapes: a wider view on an ultrawide, a taller one on a 4:3 iPad, the HUD at 16:9 (the Steam Deck's 16:10 keeps thin bars). Or 16:9 with bars.",
+              .description = "Fill other screen shapes: a wider view on an ultrawide, a taller one on a Steam Deck or a 4:3 iPad, the HUD at 16:9. Or 16:9 with bars.",
               .env = "NFSMW_ASPECT", .defaultValue = double(AspectMode::Auto), .entries = kAspectEntries },
+            // Brightness: a power curve on the game's picture, -5..+5 (video/display_tone.h).
+            { .id = Id::Brightness, .category = Category::Display, .type = Type::Int, .apply = Apply::Live,
+              .table = "video", .key = "brightness", .label = "Brightness",
+              .description = "Lighter or darker shadows and mid-tones, a gentle step at a time, as a TV's brightness. Black and white stay put. 0 is the original picture.",
+              .env = "NFSMW_BRIGHTNESS", .defaultValue = 0, .min = -5, .max = 5, .step = 1 },
+            { .id = Id::DisplayGamma, .category = Category::Display, .type = Type::Bool, .apply = Apply::Live,
+              .table = "video", .key = "xbox_display_gamma", .label = "Xbox 360 Display Gamma",
+              .description = "The gamma ramp the game itself sets for a real Xbox 360's TV output: a little deeper shadows and brighter mid-tones, as on the console. Off: the flatter picture of SpeedBreaker 0.1.3 and earlier.",
+              .env = "NFSMW_DISPLAY_GAMMA", .defaultValue = 1 },
             { .id = Id::Sharpening, .category = Category::Graphics, .type = Type::Float, .apply = Apply::Live,
               .table = "video", .key = "sharpening", .label = "Sharpening",
               .description = "Extra sharpness for bicubic upscaling. 0 turns it off.",
@@ -146,7 +171,7 @@ namespace settings
               .env = "NFSMW_TEXTURE_MIPS", .defaultValue = 1 },
             { .id = Id::InternalResolution, .category = Category::Graphics, .type = Type::Enum, .apply = Apply::Live,
               .table = "video", .key = "internal_resolution", .label = "Internal Resolution",
-              .description = "Render the 3D scene above the 360's 720p. Auto: from the screen (1440p: 2x, or 3x2 filling an ultrawide).",
+              .description = "Render the 3D scene above the 360's 720p. 1.5x is 1080p, a little over half the pixels of 2x. Auto: from the screen (1440p: 2x, or 3x2 filling an ultrawide).",
               .env = "NFSMW_RESOLUTION", .defaultValue = kResolutionAuto, .entries = kResolutionEntries },
             { .id = Id::WindowWidth, .category = Category::Display, .type = Type::Int, .apply = Apply::Restart, .hidden = true,
               .table = "video", .key = "window_width", .label = "Window Width",
@@ -191,6 +216,10 @@ namespace settings
               .table = "advanced", .key = "performance_overlay", .label = "Performance Overlay",
               .description = "Show the frame rate and frame time in a corner of the screen.",
               .env = "NFSMW_PERF_OVERLAY", .defaultValue = 0 },
+            { .id = Id::GpuScheduling, .category = Category::Advanced, .type = Type::Enum, .apply = Apply::Live, .hidden = kGpuSchedulingHidden,
+              .table = "advanced", .key = "gpu_scheduling", .label = "GPU Scheduling",
+              .description = "Overlap trials independent GPU work without reducing image quality. Conservative restores previous scheduling. Compare alternates both every 480 frames; logs mark transition windows. Changes apply at a frame boundary.",
+              .env = "SB_GPU_SCHEDULING", .defaultValue = kGpuSchedulingDefault, .entries = kGpuSchedulingEntries },
         };
         static_assert(std::size(kOptions) == kCount, "one row per settings::Id");
 
@@ -1086,6 +1115,9 @@ namespace settings
             int64_t n = std::llround(value);
             if (unit == "%")
                 return std::format("{}%", n);
+            // A range around zero (Brightness) shows its sign: -2, 0, +2.
+            if (o.min < 0 && n > 0)
+                return unit.empty() ? std::format("+{}", n) : std::format("+{} {}", n, unit);
             return unit.empty() ? std::format("{}", n) : std::format("{} {}", n, unit);
         }
         if (unit == "%")

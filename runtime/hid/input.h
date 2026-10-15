@@ -10,7 +10,8 @@
 //     (NFSMW_TRIGGER_DEADZONE, default 0.02).
 //   - Keyboard: arrows = D-pad + left stick, W/S = gas/brake (RT/LT), A/D =
 //     steer, Space = A, Backspace = B, Left Shift = X, Left Ctrl = Y,
-//     Q/E = LB/RB, Enter = START, Esc = BACK, C = right stick click.
+//     Q/E = LB/RB, Enter = START, Esc = BACK, O/L and K/; = right stick
+//     (up/down, left/right), C = right stick click.
 //   - NFSMW_INPUT_SCRIPT="12:START,15.5:A,30-90/4:DOWN,100~160:RT": taps
 //     (150 ms) at seconds since launch, taps every `step` seconds over a
 //     range, or inputs held over a range; RT/LT (triggers) and LL/LR/LU/LD
@@ -19,7 +20,8 @@
 //   - NFSMW_VIRTUAL_PAD="2:LX=0.05,4:RT=0.06": an SDL virtual controller whose
 //     axes take those values at those seconds, through the deadzones, and
 //     whose rumble is logged with what the game asked for (tests of the
-//     Input settings without a person).
+//     Input settings without a person). Buttons too ("5:BACK=1", "5.2:BACK=0",
+//     "6:DOWN" for a tap), which reach the menus as a real controller's do.
 //     Both count seconds of guest time (cpu/guest_time.h): a suspension
 //     doesn't count, so what falls due during one happens after it.
 //   - NFSMW_INPUT_LOG=1: the left stick and triggers once a second, raw and

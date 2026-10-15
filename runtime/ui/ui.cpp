@@ -1,10 +1,12 @@
 // SpeedBreaker runtime. GPL-3.0-or-later (see COPYING). See ui.h.
 #include <stdafx.h>
 #include "ui.h"
+#include "cursor_idle.h"
 
 #include <kernel/xam.h>
 #include <report/report.h>
 #include <user/settings.h>
+#include <video/swapchain_policy.h>
 
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
@@ -106,6 +108,7 @@ namespace ui
 
         float s_appliedScale = 0.0f;
         uint32_t s_framebufferW = 0, s_framebufferH = 0;  // SetFramebufferSize
+        bool s_displayFromSwapchain = false;  // the layout follows the swapchain, not the window (FitUiDisplay)
         ImGuiStyle s_baseStyle;
 
         // Back + Start on one controller toggles the settings menu; both must
@@ -467,6 +470,63 @@ namespace ui
         }
     }
 
+    namespace
+    {
+#if !(defined(__APPLE__) && TARGET_OS_IOS)
+        // The mouse cursor over the game (cursor_idle.h). Main thread.
+        CursorIdle s_cursorIdle;
+        bool s_cursorShown = true;  // as SDL starts
+        int s_cursorChanges = 0;    // logged, the first few
+
+        // A real mouse's movement, click or scroll: not the mouse SDL makes
+        // of a finger or a pen, nor a motion event that moved nothing.
+        bool MouseActivity(const SDL_Event& e)
+        {
+            auto touchOrPen = [](SDL_MouseID which) { return which == SDL_TOUCH_MOUSEID || which == SDL_PEN_MOUSEID; };
+            switch (e.type)
+            {
+            case SDL_EVENT_MOUSE_MOTION:
+                return CursorIdle::Activity(true, touchOrPen(e.motion.which), e.motion.xrel, e.motion.yrel);
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            case SDL_EVENT_MOUSE_BUTTON_UP:
+                return CursorIdle::Activity(false, touchOrPen(e.button.which), 0.0f, 0.0f);
+            case SDL_EVENT_MOUSE_WHEEL:
+                return CursorIdle::Activity(false, touchOrPen(e.wheel.which), 0.0f, 0.0f);
+            default:
+                return false;
+            }
+        }
+#endif
+
+        // Shows or hides the cursor for now (each frame, and as the menu
+        // opens or closes). While a menu or modal page has the mouse, ImGui's
+        // backend shows it and picks its shape; otherwise it must keep its
+        // hands off, or it shows it again every frame the performance
+        // overlay or a toast is drawn.
+        void UpdateCursor()
+        {
+#if !(defined(__APPLE__) && TARGET_OS_IOS)
+            const bool menu = s_ready && s_capturing.load(std::memory_order_relaxed);
+            if (s_ready)
+            {
+                ImGuiIO& io = ImGui::GetIO();
+                if (menu)
+                    io.ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
+                else
+                    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+            }
+            const bool show = s_cursorIdle.Shows(SDL_GetTicksNS(), menu);
+            if (show == s_cursorShown)
+                return;
+            s_cursorShown = show;
+            show ? SDL_ShowCursor() : SDL_HideCursor();
+            if (++s_cursorChanges <= 6)
+                fprintf(stderr, "[ui] mouse cursor %s\n", show ? (menu ? "shown (a menu has the mouse)" : "shown (the mouse moved)")
+                                                                : "hidden (still for 2 s over the game)");
+#endif
+        }
+    }
+
     bool Initialize(SDL_Window* window, const VulkanTarget& target)
     {
         if (s_ready)
@@ -553,6 +613,14 @@ namespace ui
 
     void ProcessEvent(const SDL_Event& e)
     {
+#if !(defined(__APPLE__) && TARGET_OS_IOS)
+        if (MouseActivity(e))
+        {
+            // Shown at once, not at the next frame's check.
+            s_cursorIdle.Moved(e.common.timestamp);
+            UpdateCursor();
+        }
+#endif
         if (!s_ready)
             return;
         bool forward = s_capturing.load(std::memory_order_relaxed);
@@ -645,6 +713,7 @@ namespace ui
     void Tick()
     {
         s_pollAt = SDL_GetTicksNS();
+        UpdateCursor();
 #if defined(__APPLE__) && TARGET_OS_IOS
         // Every frame: SDL's text input or the Files picker can have the
         // first responder for a while (ios_ui.h). Cheap when nothing changed.
@@ -659,9 +728,13 @@ namespace ui
         // the next presented frame as build/ui_shot_<n>.ppm: on the keys'
         // own clock, so a capture lands between two keys (the
         // NFSMW_CHECK_PRESENT_SEC clock starts at the first frame, a second
-        // or more later).
+        // or more later). MouseMove moves the pointer to the window's middle
+        // and 40 points either side in turn, for the cursor's hiding:
+        // SDL_WarpMouseInWindow moves the real pointer (SDL reports a warp as
+        // a motion of no distance, which isn't the mouse moving), then the
+        // motion a mouse moving there makes is posted.
         constexpr SDL_Keycode kFocusLost = SDLK_EXTENDED_MASK | 0x7F01, kFocusGained = SDLK_EXTENDED_MASK | 0x7F02,
-                              kShot = SDLK_EXTENDED_MASK | 0x7F03;
+                              kShot = SDLK_EXTENDED_MASK | 0x7F03, kMouseMove = SDLK_EXTENDED_MASK | 0x7F04;
         struct Key { double time; SDL_Keycode key; };
         static const auto start = std::chrono::steady_clock::now();
         static std::vector<Key> keys = [] {
@@ -678,6 +751,7 @@ namespace ui
                     std::string name = item.substr(colon + 1);
                     SDL_Keycode key = name == "FocusLost" ? kFocusLost : name == "FocusGained" ? kFocusGained
                         : name == "Shot"                                                         ? kShot
+                        : name == "MouseMove"                                                    ? kMouseMove
                                                                                                  : SDL_GetKeyFromName(name.c_str());
                     if (key != SDLK_UNKNOWN)
                         parsed.push_back({ std::atof(item.c_str()), key });
@@ -715,6 +789,28 @@ namespace ui
                 shotDue = keys[next++].time;
                 return;
             }
+            if (keys[next].key == kMouseMove)
+            {
+                static int moves = 0;
+                int w = 0, h = 0;
+                SDL_GetWindowSize(s_window, &w, &h);
+                const float x = float(w) * 0.5f + float((moves++ % 3) - 1) * 40.0f, y = float(h) * 0.5f;
+                float fromX = x, fromY = y;
+                SDL_GetMouseState(&fromX, &fromY);
+                SDL_WarpMouseInWindow(s_window, x, y);
+                SDL_Event e{};
+                e.type = SDL_EVENT_MOUSE_MOTION;
+                e.motion.timestamp = SDL_GetTicksNS();
+                e.motion.windowID = SDL_GetWindowID(s_window);
+                e.motion.which = 1;  // a mouse (not SDL_TOUCH_MOUSEID or SDL_PEN_MOUSEID)
+                e.motion.x = x;
+                e.motion.y = y;
+                e.motion.xrel = x - fromX;
+                e.motion.yrel = y - fromY;
+                SDL_PushEvent(&e);
+                fprintf(stderr, "[ui] NFSMW_UI_KEYS: mouse to %.0f,%.0f\n", x, y);
+                continue;
+            }
             if (keys[next].key == kFocusLost || keys[next].key == kFocusGained)
             {
                 SDL_Event e{};
@@ -737,6 +833,11 @@ namespace ui
                 SDL_PushEvent(&e);
             }
         }
+    }
+
+    void RequestShot()
+    {
+        s_shots++;
     }
 
     bool TakeShot()
@@ -799,6 +900,7 @@ namespace ui
         s_frameBuilt = false;
         if (!s_ready)
             return false;
+        UpdateCursor();  // a menu opened or closed by this frame's events
         // A touch press held back for a three-finger tap goes to ImGui once
         // a second finger can no longer land in time (a finger resting on a
         // row, say), without waiting for another touch event. Judged here,
@@ -821,21 +923,45 @@ namespace ui
             return false;
         ImGui_ImplVulkan_NewFrame();
         ImGui_ImplSDL3_NewFrame();
-        // SDL gave the window's pixels at the screen's scale; a smaller
-        // swapchain (iOS's present scale) needs its own for the viewport,
-        // clip rectangles and font density.
-        if (ImGuiIO& io = ImGui::GetIO(); s_framebufferW && io.DisplaySize.x > 0 && io.DisplaySize.y > 0)
-            io.DisplayFramebufferScale = ImVec2(float(s_framebufferW) / io.DisplaySize.x, float(s_framebufferH) / io.DisplaySize.y);
+        // SDL gave the window's size and pixels; the UI is drawn into the
+        // swapchain, which can be smaller (iOS's present scale) and, for a
+        // moment, another shape (a view SDL turned portrait while it is
+        // fitted back): its own scale for the viewport, clip rectangles and
+        // font density, and its shape for the layout (and so the UI scale,
+        // which follows the height).
+        ImGuiIO& io = ImGui::GetIO();
+        if (s_framebufferW && io.DisplaySize.x > 0 && io.DisplaySize.y > 0)
+        {
+            const video::UiDisplay fit = video::FitUiDisplay(io.DisplaySize.x, io.DisplaySize.y, { s_framebufferW, s_framebufferH });
+            if (fit.fromSwapchain != s_displayFromSwapchain)
+            {
+                s_displayFromSwapchain = fit.fromSwapchain;
+                if (fit.fromSwapchain)
+                    fprintf(stderr, "[ui] laying out at the swapchain's %.0fx%.0f points (%ux%u pixels), not the window's %.0fx%.0f\n",
+                        fit.width, fit.height, s_framebufferW, s_framebufferH, io.DisplaySize.x, io.DisplaySize.y);
+                else
+                    fprintf(stderr, "[ui] laying out at the window's %.0fx%.0f points again\n", io.DisplaySize.x, io.DisplaySize.y);
+            }
+            io.DisplaySize = ImVec2(fit.width, fit.height);
+            io.DisplayFramebufferScale = ImVec2(fit.scaleX, fit.scaleY);
+        }
         UpdateScale();
         ImGui::NewFrame();
         // Panels and toasts lay out in the work area: the window's safe area,
         // clear of an iPhone's Dynamic Island and home indicator (elsewhere
         // the whole window, as before).
+        // (The window's, in its points: kept inside the display, which is
+        // the swapchain's shape while FitUiDisplay overrules the window.)
         if (SDL_Rect safe; s_window && SDL_GetWindowSafeArea(s_window, &safe) && safe.w > 0 && safe.h > 0)
         {
             ImGuiViewport* viewport = ImGui::GetMainViewport();
-            viewport->WorkPos = ImVec2(viewport->Pos.x + float(safe.x), viewport->Pos.y + float(safe.y));
-            viewport->WorkSize = ImVec2(float(safe.w), float(safe.h));
+            const float x0 = std::clamp(float(safe.x), 0.0f, io.DisplaySize.x), y0 = std::clamp(float(safe.y), 0.0f, io.DisplaySize.y);
+            const float x1 = std::clamp(float(safe.x + safe.w), x0, io.DisplaySize.x), y1 = std::clamp(float(safe.y + safe.h), y0, io.DisplaySize.y);
+            if (x1 - x0 >= 1.0f && y1 - y0 >= 1.0f)
+            {
+                viewport->WorkPos = ImVec2(viewport->Pos.x + x0, viewport->Pos.y + y0);
+                viewport->WorkSize = ImVec2(x1 - x0, y1 - y0);
+            }
         }
 #if defined(__APPLE__) && TARGET_OS_IOS
         DragToScroll();
@@ -916,6 +1042,8 @@ namespace ui
             return;
         s_settingsOpen = false;
         UpdateCapture();
+        ForgetUpdateDialog();
+        ForgetQuitPrompt();
         report::NoteMenuClosed();
         XamNotifySystemUi(false);
         if (settings::Dirty() && !settings::Save())
