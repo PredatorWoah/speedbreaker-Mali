@@ -27,6 +27,7 @@
 #include <report/report.h>
 #include <platform/thermal.h>
 #include <kernel/memory_status.h>
+#include <platform/android/lifecycle_policy.h>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -49,6 +50,7 @@ namespace video
         VkSurfaceKHR s_surface = VK_NULL_HANDLE;
 #ifdef __ANDROID__
         std::atomic<bool> s_androidSurfaceStale{false};
+        platform::android::LifecyclePolicy s_androidLifecycle;
 #endif
         VkPhysicalDevice s_physical = VK_NULL_HANDLE;
         VkDevice s_device = VK_NULL_HANDLE;
@@ -2351,10 +2353,26 @@ void main()
         {
             switch (e->type)
             {
+#ifdef __ANDROID__
+            case SDL_EVENT_WINDOW_FOCUS_LOST:
+                if (s_window && e->window.windowID == SDL_GetWindowID(s_window)) {
+                    s_androidLifecycle.Focus(false); SuspendGame();
+                }
+                break;
+            case SDL_EVENT_WINDOW_FOCUS_GAINED:
+                if (s_window && e->window.windowID == SDL_GetWindowID(s_window) && s_androidLifecycle.Focus(true)) ResumeGame();
+                break;
+#endif
             case SDL_EVENT_WILL_ENTER_BACKGROUND:
+#ifdef __ANDROID__
+                s_androidLifecycle.Background(true);
+#endif
                 SuspendGame();
                 break;
             case SDL_EVENT_DID_ENTER_BACKGROUND:
+#ifdef __ANDROID__
+                s_androidLifecycle.Background(true);
+#endif
                 // Suspended already, unless "will resign active" never came:
                 // Metal must be idle in the background either way.
                 SuspendGame();
@@ -2370,8 +2388,10 @@ void main()
                 // The document picker can replace Android's native window.
                 // Rebuild its Vulkan surface on the render thread before use.
                 s_androidSurfaceStale.store(true, std::memory_order_release);
-#endif
+                if (s_androidLifecycle.Background(false)) ResumeGame();
+#else
                 ResumeGame();
+#endif
                 break;
             default:
                 // SDL_EVENT_WILL_ENTER_FOREGROUND among them: the app is
