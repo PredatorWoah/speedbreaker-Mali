@@ -9,6 +9,7 @@
 #include "xenos/ucode.h"
 
 #include <cfloat>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <format>
@@ -16,6 +17,8 @@
 
 namespace gpu
 {
+    bool g_workReductionEnabled = true;
+
     using namespace xe::gpu;
     using namespace xe::gpu::ucode;
 
@@ -36,6 +39,7 @@ layout(std140, set = 0, binding = 1) uniform XenosConstants
     uvec4 bools[2];       // 256 bool constants
     uvec4 loops[8];       // 32 loop constants
     uvec4 drawInfo[4];    // see gpu/renderer.cpp
+    vec4 textureReciprocal[32]; // actual sampled host image size, xy reciprocal
 } u;
 
 layout(push_constant) uniform DrawConstants
@@ -682,9 +686,9 @@ float xmul(float a, float b)
                     if (op.unnormalized_coordinates())
                         uv = op.dimension() == xenos::FetchOpDimension::k2D
                             ? std::format("({}) / fetchSize2D({}u)", uv, slot)
-                            : std::format("({}) / vec2(textureSize(t2d_{}, 0))", uv, slot);
+                            : std::format("({}) * inverseTextureSize_{}()", uv, slot);
                     if (op.offset_x() != 0.0f || op.offset_y() != 0.0f)
-                        uv = std::format("({} + vec2({}, {}) / vec2(textureSize(t2d_{}, 0)))", uv, op.offset_x(), op.offset_y(), slot);
+                        uv = std::format("({} + vec2({}, {}) * inverseTextureSize_{}())", uv, op.offset_x(), op.offset_y(), slot);
                     value = sample(std::format("t2d_{}", slot), uv);
                     break;
                 }
@@ -1042,12 +1046,18 @@ vec3 cubeDirection(vec3 c)
             resetRegisters += std::format("    r[{}] = vec4(0.0);\n", i);
 
         std::string g = ShaderCommonGlsl();
+        const char* reciprocal = std::getenv("NFSMW_TEXTURE_RECIPROCAL");
+        if (!g_workReductionEnabled || (reciprocal && reciprocal[0] == '0'))
+            g.insert(g.find('\n') + 1, "#define TEXTURE_SIZE_QUERY\n");
         g += kHelpers;
         g += std::format("#define R_COUNT {}\n", regCount);
         for (uint32_t n = 0; n < 32; n++)
         {
             if (result.texture2DMask & (1u << n))
+            {
                 g += std::format("layout(set = 1, binding = {}) uniform sampler2D t2d_{};\n", n, n);
+                g += std::format("vec2 inverseTextureSize_{0}() {{\n#ifdef TEXTURE_SIZE_QUERY\nreturn 1.0 / vec2(textureSize(t2d_{0}, 0));\n#else\nreturn u.textureReciprocal[{0}].xy;\n#endif\n}}\n", n);
+            }
             if (result.texture3DMask & (1u << n))
                 g += std::format("layout(set = 1, binding = {}) uniform sampler3D t3d_{};\n", 32 + n, n);
             if (result.textureCubeMask & (1u << n))
@@ -1203,7 +1213,7 @@ void main()
         }
         else
         {
-            g += "\nvoid main()\n{\n";
+            g += "\n#ifdef EARLY_DEPTH\nlayout(early_fragment_tests) in;\n#endif\nvoid main()\n{\n";
             g += resetRegisters;
             for (uint32_t i = 0; i < std::min(16u, regCount); i++)
                 g += std::format("#ifdef IN{0}\n    r[{0}] = i_i{0};\n#endif\n", i);

@@ -173,3 +173,6 @@ sb_test(visual_capture_test ARGS ${CMAKE_CURRENT_BINARY_DIR}/visual_capture_out)
 
 # Android scheduling selection, timestamp wrap and bounded interval statistics.
 sb_test(android_schedule_test)
+
+# GPU work-reduction safety boundaries and Android focus/background ordering.
+sb_test(gpu_work_reduction_test)

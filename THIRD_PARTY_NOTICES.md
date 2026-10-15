@@ -75,3 +75,14 @@ for at least three years after a release, its copy is provided at no charge.
 
 The hedge-dev team, for XenonRecomp and the approach of Unleashed Recompiled that SpeedBreaker
 follows, and the Xenia project, for years of Xbox 360 research.
+
+
+### Native-renderer performance reference (Android 0.1.9)
+
+The early read-only depth-test policy and texture-size reciprocal technique were
+adapted from codepdbh/nfsmw-android, commit
+6df1501974d0db84893f5a3ca465b616414f6961, derived from nfsmw-nx.
+That project's application code declares GPL-3.0; its ReXGlue SDK declares
+BSD-3-Clause. Sources: app/src/nfsmw_nativo_dibujos.cpp and
+docs/native-renderer.md. SpeedBreaker retains its own runtime and translator;
+no game data, generated shaders or third-party runtime binaries are incorporated.

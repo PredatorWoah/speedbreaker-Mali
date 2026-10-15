@@ -48,9 +48,11 @@ namespace settings
 #ifdef __ANDROID__
         constexpr bool kGpuSchedulingHidden = false;
         constexpr int kGpuSchedulingDefault = 2;
+        constexpr int kGpuWorkDefault = 1;
 #else
         constexpr bool kGpuSchedulingHidden = true;
         constexpr int kGpuSchedulingDefault = 0;
+        constexpr int kGpuWorkDefault = 0;
 #endif
         constexpr EnumEntry kGpuSchedulingEntries[] = {
             { 0, "conservative", "Conservative" },
@@ -220,6 +222,10 @@ namespace settings
               .table = "advanced", .key = "gpu_scheduling", .label = "GPU Scheduling",
               .description = "Overlap trials independent GPU work without reducing image quality. Conservative restores previous scheduling. Compare alternates both every 480 frames; logs mark transition windows. Changes apply at a frame boundary.",
               .env = "SB_GPU_SCHEDULING", .defaultValue = kGpuSchedulingDefault, .entries = kGpuSchedulingEntries },
+            { .id = Id::GpuWorkReduction, .category = Category::Advanced, .type = Type::Bool, .apply = Apply::Restart, .hidden = kGpuSchedulingHidden,
+              .table = "advanced", .key = "gpu_work_reduction", .label = "GPU Work Reduction",
+              .description = "Reduce graphics overhead while retaining image quality. Restart after changing this setting to compare with the previous rendering paths.",
+              .env = "SB_GPU_WORK_REDUCTION", .defaultValue = kGpuWorkDefault },
         };
         static_assert(std::size(kOptions) == kCount, "one row per settings::Id");
 

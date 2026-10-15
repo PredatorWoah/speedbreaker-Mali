@@ -18,6 +18,7 @@
 #include <report/zip.h>
 #include "depth24_glsl.h"
 #include "depth_only.h"
+#include "early_depth.h"
 #include "android_schedule.h"
 #include "performance_window.h"
 #include "render_scale.h"
@@ -278,7 +279,8 @@ namespace gpu::renderer
 
         // XenosConstants (shader_translator.cpp): c[512], fetch[48], bools[2],
         // loops[8], drawInfo[4], each a vec4/uvec4.
-        constexpr uint32_t kConstantsSize = (512 + 48 + 2 + 8 + 4) * 16;
+        constexpr uint32_t kTextureReciprocalOffset = (512 + 48 + 2 + 8 + 4) * 16;
+        constexpr uint32_t kConstantsSize = kTextureReciprocalOffset + 32 * 16;
 
         // Image memory. Images are bound at offsets into blocks of device
         // memory (64 MB; gpu/block_ranges.h keeps each block's free ranges),
@@ -1706,9 +1708,9 @@ namespace gpu::renderer
             return module;
         }
 
-        std::string PixelPreamble(uint32_t outputs, uint32_t inputs, bool alphaTest)
+        std::string PixelPreamble(uint32_t outputs, uint32_t inputs, bool alphaTest, bool earlyDepth = false)
         {
-            std::string preamble;
+            std::string preamble = earlyDepth ? "#define EARLY_DEPTH\n" : "";
             for (int i = 0; i < 4; i++)
                 if (outputs & (1u << i))
                     preamble += std::format("#define OUT{}\n", i);
@@ -1720,14 +1722,14 @@ namespace gpu::renderer
             return preamble;
         }
 
-        VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest, bool legacySpirv = false)
+        VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest, bool legacySpirv = false, bool earlyDepth = false)
         {
-            uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0) | (legacySpirv ? 1u << 21 : 0);
+            uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0) | (legacySpirv ? 1u << 21 : 0) | (earlyDepth ? 1u << 22 : 0);
             std::lock_guard lock(ps.compileMutex);
             auto it = ps.variants.find(key);
             if (it != ps.variants.end())
                 return it->second;
-            std::string preamble = PixelPreamble(outputs, inputs, alphaTest);
+            std::string preamble = PixelPreamble(outputs, inputs, alphaTest, earlyDepth);
             std::string log;
             auto spirv = CompileGlsl(ps.info.glsl, GLSLANG_STAGE_FRAGMENT, log, preamble, legacySpirv);
             VkShaderModule module = VK_NULL_HANDLE;
@@ -2703,7 +2705,7 @@ namespace gpu::renderer
                 }
             };
             shader(vs, GLSLANG_STAGE_VERTEX, VertexPreamble(key.primitiveMode), ".vert");
-            shader(ps, GLSLANG_STAGE_FRAGMENT, PixelPreamble(outputs, inputs, (key.raster >> 5) & 1), ".frag");
+            shader(ps, GLSLANG_STAGE_FRAGMENT, PixelPreamble(outputs, inputs, (key.raster >> 5) & 1, (key.raster >> 6) & 1), ".frag");
             auto state = std::format("result={}\nvs={:016x}\nps={:016x}\ntopology={}\nrestart={}\ncolorFormats={},{},{},{}\ndepthFormat={}\nraster={:08x}\ndepthControl={:08x}\ncolorMask={:08x}\noutputs={:x}\ninputs={:x}\nblend={:08x},{:08x},{:08x},{:08x}\n",
                 int(result), key.vs, key.ps, key.topology, key.restart,
                 key.colorFormats[0], key.colorFormats[1], key.colorFormats[2], key.colorFormats[3],
@@ -2733,8 +2735,9 @@ namespace gpu::renderer
                     outputs |= 1u << i;
             uint32_t psRegs = std::min(16u, ps.info.registerCount);
             uint32_t inputs = vs.info.interpolatorMask & ((1u << psRegs) - 1);
-            VkShaderModule psModule = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1);
-            if (!psModule)
+            const bool noFragment = (key.raster & 128u) != 0;
+            VkShaderModule psModule = noFragment ? VK_NULL_HANDLE : PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1, false, (key.raster >> 6) & 1);
+            if (!noFragment && !psModule)
                 return VK_NULL_HANDLE;
             stages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
                 psModule, "main", nullptr };
@@ -2825,7 +2828,7 @@ namespace gpu::renderer
 
             VkGraphicsPipelineCreateInfo gpci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
             gpci.pNext = &rci;
-            gpci.stageCount = 2;
+            gpci.stageCount = noFragment ? 1u : 2u;
             gpci.pStages = stages;
             gpci.pVertexInputState = &vi;
             gpci.pInputAssemblyState = &ia;
@@ -2838,6 +2841,15 @@ namespace gpu::renderer
             gpci.layout = layout;
             VkPipeline pipeline = VK_NULL_HANDLE;
             VkResult r = vkCreateGraphicsPipelines(s_dev, s_pipelineCache, 1, &gpci, nullptr, &pipeline);
+            if (r != VK_SUCCESS && noFragment) {
+                // Keep solid casters even if a driver rejects a vertex-only pipeline.
+                stages[1].module = PixelVariant(ps, outputs, inputs, false);
+                gpci.stageCount = 2;
+                if (pipeline) vkDestroyPipeline(s_dev, pipeline, nullptr);
+                pipeline = VK_NULL_HANDLE;
+                if (stages[1].module) r = vkCreateGraphicsPipelines(s_dev, s_pipelineCache, 1, &gpci, nullptr, &pipeline);
+                fprintf(stderr, "[renderer] depth-only fragment fallback result %d\n", int(r));
+            }
             bool legacySpirv = false;
 #ifdef __ANDROID__
             if (r == VK_ERROR_UNKNOWN)
@@ -2851,7 +2863,7 @@ namespace gpu::renderer
                 if (pipeline) vkDestroyPipeline(s_dev, pipeline, nullptr);
                 pipeline = VK_NULL_HANDLE;
                 stages[0].module = VertexModule(vs, key.primitiveMode, true);
-                stages[1].module = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1, true);
+                stages[1].module = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1, true, (key.raster >> 6) & 1);
                 if (stages[0].module && stages[1].module)
                 {
                     legacySpirv = true;
@@ -3962,6 +3974,8 @@ void main()
             return slot;
         }
 
+        std::unordered_map<VkImageView, VkExtent2D> s_textureViewExtents;
+
         VkImageView TextureView(Texture& t, uint32_t swizzle)
         {
             auto& view = t.views[swizzle];
@@ -3989,6 +4003,7 @@ void main()
             vci.components = { comp(swizzle), comp(swizzle >> 3), comp(swizzle >> 6), comp(swizzle >> 9) };
             vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, t.cube ? 6u : 1u };
             Check(vkCreateImageView(s_dev, &vci, nullptr, &view), "vkCreateImageView(texture)");
+            s_textureViewExtents[view] = { t.width, t.height };
             return view;
         }
 
@@ -4606,12 +4621,14 @@ void main()
         // ---------------------------------------------------------------
         // Resolves
 
+        VkPipeline s_resolveWordPipeline = VK_NULL_HANDLE;  // 1x, 32-bit, word-order lanes
         VkPipeline s_resolvePipeline = VK_NULL_HANDLE;
         VkPipeline s_resolveCoalescedPipeline = VK_NULL_HANDLE;  // scaled resolves (see COALESCED in the shader)
         // The same for a source of another scale denominator ([coalesced][den x - 1][den y - 1]: 1.5x is 3/2), made
         // at the first resolve that needs it (ResolvePipeline); [..][0][0] are the two above.
         VkPipeline s_resolveDenPipelines[2][2][2] = {};
         VkPipeline ResolvePipeline(bool coalesced, const gpu::RenderScale& scale);
+        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool wordOrder = false);
 
         // Coalesced scaled resolves: 2.8 -> 1.1 ms of scaled resolves a frame
         // on the Steam Machine (RADV), but 2.6-3.4 -> 4.1-4.4 ms on an M1 Pro
@@ -4752,6 +4769,14 @@ vec4 px(uint x, uint y)
 {
     // Guest pixel (x, y) of the rectangle: its sx x sy block of host pixels,
     // averaged (colour) or its first sample (depth).
+#ifdef RESOLVE_1X
+    vec4 v = texelFetch(src, clamp(p.srcOrigin + ivec2(x, y), ivec2(0), ivec2(p.srcSize) - 1), 0);
+    if ((p.flags & 2u) == 0u) {
+        v *= p.expScale;
+        if ((p.flags & 1u) != 0u) v = v.bgra;
+    }
+    return v;
+#else
     if (kDen.x * kDen.y > 1u) return pxFraction(x, y);
     ivec2 c = clamp(p.srcOrigin + ivec2(x * p.scale.x, y * p.scale.y), ivec2(0), ivec2(p.srcSize) - 1);
     vec4 v = texelFetch(src, c, 0);
@@ -4767,6 +4792,7 @@ vec4 px(uint x, uint y)
     v *= p.expScale;
     if ((p.flags & 1u) != 0u) v = v.bgra;
     return v;
+#endif
 }
 
 uint unorm(float v, float m) { return uint(clamp(v, 0.0, 1.0) * m + 0.5); }
@@ -4816,7 +4842,7 @@ void main()
 {
     uint bl = bppLog2(p.format);
     uint perWord = bl >= 2u ? 1u : (4u >> bl);
-#ifdef COALESCED
+#if defined(COALESCED) || defined(RESOLVE_1X)
     uint l = gl_LocalInvocationIndex;
     uvec2 id = gl_WorkGroupID.xy * uvec2(32u, 2u) + uvec2((l & 3u) | ((l >> 3u) << 2u), (l >> 2u) & 1u);
 #else
@@ -4830,6 +4856,7 @@ void main()
     uint x = uint(p.origin.x) + gx, y = uint(p.origin.y) + gy;
     uint word = ((p.destBase + tiled2D(x, y, p.destPitch, bl)) & 0x1FFFFFFFu) >> 2;
     uint w;
+    #ifndef RESOLVE_1X
     if (bl == 2u && p.scaledWrite != 0u)
     {
         // Each host sample this guest pixel owns into its block's place in
@@ -4880,6 +4907,7 @@ void main()
         }
 #endif
     }
+    #endif
     if (!inside) return;
     if (bl == 3u)
     {
@@ -5681,13 +5709,17 @@ void main()
                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ti, nullptr, nullptr };
                     s_stateEpoch++;
                     bool coalesced = scaledWrite && s_scaled.coalesce;  // 32x2 pixels a group
-                    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ResolvePipeline(coalesced, source->scale));
+                    static const bool wordOrderEnabled = [] { const char* v = std::getenv("NFSMW_RESOLVE_WORD_ORDER"); return !v || v[0] != '0'; }();
+                    const bool wordOrder = gpu::g_workReductionEnabled && wordOrderEnabled && source->scale.IsOne() && !scaledWrite && bl == 2;
+                    if (wordOrder && !s_resolveWordPipeline)
+                        if (gpu::g_workReductionEnabled) MakeResolvePipeline(false, 1, 1, &s_resolveWordPipeline, true);
+                    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, wordOrder ? s_resolveWordPipeline : ResolvePipeline(coalesced, source->scale));
                     s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
                     vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
                     uint32_t perWord = bl >= 2 ? 1 : (4 >> bl);
                     if (!(s_exp & 2))
-                        vkCmdDispatch(s_cmd, coalesced ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
-                            coalesced ? (rc.height + 1) / 2 : (rc.height + 7) / 8, 1);
+                        vkCmdDispatch(s_cmd, (coalesced || wordOrder) ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
+                            (coalesced || wordOrder) ? (rc.height + 1) / 2 : (rc.height + 7) / 8, 1);
                     if (scaledWrite)
                         FullBarrier();  // (above 1x: as before)
                     else
@@ -6325,10 +6357,10 @@ void main()
 
         // The resolve shader for sources whose scale has these denominators
         // (1 or 2 each; the shader's SB_DEN_X, SB_DEN_Y), into `out`.
-        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out)
+        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool wordOrder)
         {
             std::string log;
-            std::string preamble = coalesced ? "#define COALESCED\n" : "";
+            std::string preamble = wordOrder ? "#define RESOLVE_1X\n" : coalesced ? "#define COALESCED\n" : "";
             if (s_resolvePush != offsetof(ResolveConstants, texX))
                 preamble += "#define TEX_OFFSET\n";
             if (denX != 1)
@@ -6388,6 +6420,7 @@ void main()
             Check(vkCreatePipelineLayout(s_dev, &plci, nullptr, &s_resolveLayout), "resolve pipeline layout");
             for (bool coalesced : { false, true })
                 MakeResolvePipeline(coalesced, 1, 1, coalesced ? &s_resolveCoalescedPipeline : &s_resolvePipeline);
+            if (gpu::g_workReductionEnabled) MakeResolvePipeline(false, 1, 1, &s_resolveWordPipeline, true);
             s_resolveDenPipelines[0][0][0] = s_resolvePipeline;
             s_resolveDenPipelines[1][0][0] = s_resolveCoalescedPipeline;
             PrewarmResolvePipelines(s_renderScale);
@@ -6872,8 +6905,10 @@ void main()
                 s_directByBase.erase(it);
             if (auto it = s_directByStart.find(t.guestStart); it != s_directByStart.end() && it->second == &t)
                 s_directByStart.erase(it);
-            for (auto& [swizzle, view] : t.views)
+            for (auto& [swizzle, view] : t.views) {
+                s_textureViewExtents.erase(view);
                 vkDestroyImageView(s_dev, view, nullptr);
+            }
             t.views.clear();
             for (uint32_t layer = 1; layer < 6; layer++)  // ([0] is storeView)
                 if (t.storeViews[layer])
@@ -7077,6 +7112,9 @@ void main()
 
     bool Initialize(const uint32_t* regs)
     {
+        gpu::g_workReductionEnabled = settings::GetBool(settings::Id::GpuWorkReduction);
+        fprintf(stderr, "[renderer] GPU work reduction %s (early depth, texture reciprocals, 1x resolve lanes)\n",
+            gpu::g_workReductionEnabled ? "on" : "off");
         s_vk = video::GetVulkan();
         if (!s_vk)
             return false;
@@ -7707,6 +7745,14 @@ void main()
         key.raster = cull | (modeCntl.face ? 4u : 0u) | (clipCntl.clip_disable ? 8u : 0u) | (depthBias ? 16u : 0u) |
             (alphaTest ? 32u : 0u);
 
+        static const bool earlyDepth = [] { const char* v = std::getenv("NFSMW_EARLY_DEPTH"); return !v || v[0] != '0'; }();
+        if (gpu::g_workReductionEnabled && earlyDepth && gpu::SafeEarlyDepth(key.depthControl, key.depthFormat != 0,
+                s_ps->info.writesDepth, s_ps->info.usesMemExport, !s_zpdOpen.Empty()))
+            key.raster |= 64u;
+
+        if (gpu::g_workReductionEnabled && key.ps == kDepthOnlyPsHash && key.colorMask == 0)
+            key.raster |= 128u;  // Native depth/stencil, with no fragment shader stage.
+
         bool pipelinePending;
         VkPipeline pipeline = GetPipeline(key, layout.pipeline, pipelinePending);
         if (pipelinePending)
@@ -7722,6 +7768,7 @@ void main()
             s_textureCache->generation++;
         }
         VkDescriptorImageInfo textureInfos[96];
+        float textureReciprocal[32][4] = {};
         for (uint32_t d = 0; d < 3; d++)
             for (uint32_t n = 0; n < 32; n++)
             {
@@ -7731,7 +7778,17 @@ void main()
                 ii = { s_sampler, s_dummy[d].view, VK_IMAGE_LAYOUT_GENERAL };
                 if (!(s_exp & 8))  // NFSMW_GPU_EXP bit 8: placeholders only (texture cost experiment)
                     ii.imageView = GetTexture(n, d == 0 ? TexDim::k2D : d == 1 ? TexDim::k3D : TexDim::kCube, ii.sampler);
+                if (d == 0) {
+                    auto found = s_textureViewExtents.find(ii.imageView);
+                    const VkExtent2D extent = found == s_textureViewExtents.end() ? VkExtent2D{1, 1} : found->second;
+                    textureReciprocal[n][0] = 1.0f / float(std::max(extent.width, 1u));
+                    textureReciprocal[n][1] = 1.0f / float(std::max(extent.height, 1u));
+                }
             }
+
+        static float lastTextureReciprocal[32][4] = {};
+        if (memcmp(lastTextureReciprocal, textureReciprocal, sizeof(textureReciprocal)) != 0)
+            g_constantsDirty.store(true, std::memory_order_relaxed);
 
         // Vertex data the guest may reuse before the GPU runs this draw (its
         // fences are published early, see g_eagerWrites): small ranges are
@@ -7864,6 +7921,8 @@ void main()
                 memcpy(c + 560 * 16, &s_regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 2 * 16);
                 memcpy(c + 562 * 16, &s_regs[XE_GPU_REG_SHADER_CONSTANT_LOOP_00], 8 * 16);
                 memset(c + 570 * 16, 0, 4 * 16);
+                memcpy(c + kTextureReciprocalOffset, textureReciprocal, sizeof(textureReciprocal));
+                memcpy(lastTextureReciprocal, textureReciprocal, sizeof(textureReciprocal));
                 s_lastConstantsOffset = at;
                 s_lastConstantsSubmission = s_submissionCounter;
                 s_stats.constantUploads++;

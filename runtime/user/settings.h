@@ -66,6 +66,7 @@ namespace settings
         AsyncShaders,
         PerformanceOverlay,
         GpuScheduling,
+        GpuWorkReduction,
         Count
     };
     constexpr size_t kCount = size_t(Id::Count);

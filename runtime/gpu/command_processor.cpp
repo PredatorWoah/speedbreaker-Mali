@@ -1072,6 +1072,8 @@ namespace gpu
             auto lastWork = std::chrono::steady_clock::now();
             while (true)
             {
+                // Suspend before consuming a queued batch too, not only when idle.
+                guesttime::WaitWhileSuspended();
                 uint32_t primary = s_primaryBuffer;
                 uint32_t writeIndex = *MmioRegister(REG_CP_RB_WPTR);
                 if (primary == 0 || writeIndex == s_readIndex || writeIndex * 4 >= s_primarySize)

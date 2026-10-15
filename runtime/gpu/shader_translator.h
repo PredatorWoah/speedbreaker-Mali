@@ -21,6 +21,9 @@
 
 namespace gpu
 {
+    // Set once by renderer initialization, before shader translation/workers.
+    extern bool g_workReductionEnabled;
+
     enum class ShaderStage : uint32_t { Vertex = 0, Pixel = 1 };
 
     struct TranslatedShader
