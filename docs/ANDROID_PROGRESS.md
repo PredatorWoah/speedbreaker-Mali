@@ -284,3 +284,28 @@ Artifact is delivered directly; verification and test instructions live under
 builds/android/0.1.7-android-shadows/. Preserved 0.1.6 checksum/signature match.
 Depth-only, exhaustive depth24, optimized SPIR-V (Vulkan 1.1/1.2), ZPD, ISO reader
 and capture-limit tests pass. No RP6/ADB/LAN access; visual result remains untested.
+
+
+## 0.1.8 signed performance trial + upstream v0.1.4 — October 15, 2026
+
+Full upstream v0.1.4 merge, not only the earlier shadow/timing backports.
+See ANDROID_UPSTREAM_018.md for conflict decisions, invariants and tests, and
+ANDROID_PERFORMANCE_018.md for the reversible GPU scheduling trial. Gamma /
+brightness, nitrous trails, tuning jump tables, game timing and shared renderer /
+presenter updates are included. Regenerated game sources from verified USA XEX.
+Android ISO/stereo/lifecycle/shader/capture paths and accepted shadows retained.
+
+Clean compiled source 3bea7fcf84d8b44363249ab8c999022d59194f51; Android/native
+0.1.8 code 9, same package and certificate. Full optimized ARM64 link, all 56,146
+generated mapping symbols, 26 host suites, eight optimized/validated SPIR-V
+modules, package/library/ZIP/signature checks passed. SDK Build Tools 35/aapt2
+used via packaging overrides; no fixture/game-free runtime is packaged.
+APK SHA256 d8f15a7863e16f43f50f5205bafed580b0d1e1d61f9af8a8579c600800a83526.
+Build ID 0289cb8044777d7e9de1556db25cd9a8bd05dd42.
+Preserved 0.1.7 checksum is unchanged. Build record under
+builds/android/0.1.8-android-performance/. No RP6 execution or speed gain verified.
+
+Next test: one install, same 720p / Frame Rate 60 Quick Race, warm a minute,
+then GPU Scheduling Compare for four minutes, second race and background/resume.
+Return one local capture_performance.sh archive and observed FPS/power.
+Conservative reverts scheduling only; 0.1.7 is the full rollback.

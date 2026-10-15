@@ -93,6 +93,6 @@ observed FPS/power ranges. No Career progression or cloud ADB is required.
 
 Host scheduling selection, compare boundaries, timestamp 8-/64-bit wrap,
 unavailable counters, bounded interval statistics, upstream queued-frame suite,
-existing depth-only/depth24/ZPD regression tests pass. Full Android build and signing verification are pending; final metadata will
-be recorded under builds/android/0.1.8-android-performance/.
+existing depth-only/depth24/ZPD regression tests pass. Full Android build and signing verification passed; exact metadata is
+recorded under builds/android/0.1.8-android-performance/.
 Build validation does not establish device correctness or a performance gain.

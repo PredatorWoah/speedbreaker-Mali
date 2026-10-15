@@ -51,7 +51,13 @@ integration, depth-only casters, exhaustive depth24 boundaries and source
 integration, Android schedule/timestamp/statistics, swapchain policy, front-end
 matrix, pipeline cache identity, memory placement, switch-table bounds/tuning,
 fullscreen, present scheduling, cursor policy, quit flow and GPU selection.
-Full ARM64 linking, signed packaging and exact certificate verification pending.
+Full optimized ARM64 linking and signed packaging passed. The APK certificate
+matches 0.1.7; package, version code 9, library equality and ZIP integrity passed.
+All 56,146 generated mappings are present in the runtime (upstream config changes
+reduce the old count). Eight synthetic SPIR-V modules compile, optimize and
+validate for Vulkan 1.1/1.2. Final build metadata is under
+builds/android/0.1.8-android-performance/.
+The settings round trip and eight additional host suites also passed (26 total).
 No device execution or FPS improvement has been established.
 
 ## Device acceptance
