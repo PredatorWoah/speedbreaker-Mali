@@ -4,6 +4,20 @@ What changed in each SpeedBreaker release, newest first. Each release's notes on
 its entry here, and the game shows the entry once, the first time a new version starts (offline:
 it's built into the game).
 
+## v0.1.10 (Android GPU measurements and presentation fix)
+
+- Stop rebuilding usable Android swapchains repeatedly for persistent SUBOPTIMAL
+  reports caused by compositor rotation; retain resize, surface-loss and
+  OUT_OF_DATE recovery.
+- Automatically sample GPU intervals for individual render passes, depth/color
+  resolves, texture conversion, transfers and front-buffer conversion while racing.
+  Store bounded CSVs under logs, without image readbacks or extra GPU waits.
+- Record shader queue/compile/wait times, loading waits, skipped draws and the
+  active asynchronous-shader setting. Preserve the player's shader preference.
+- Collector verifies pass timing output and performs the Home/background check.
+
+Device speed and frame-pacing improvements remain to be tested.
+
 ## v0.1.9 (Android GPU work reduction)
 
 - Adapt native-renderer early depth rejection for read-only depth-tested draws;

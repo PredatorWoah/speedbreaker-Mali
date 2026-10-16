@@ -16,6 +16,7 @@ function(sb_test name)
 endfunction()
 
 sb_test(block_ranges_test)
+sb_test(pass_timing_test)
 sb_test(disc_mount_test SOURCES ${RT}/install/disc_mount.cpp ${RT}/install/disc_source.cpp
     ${RT}/install/manifest.cpp ${RT}/install/sha256.cpp ${RT}/install/result.cpp)
 # Where guest memory and the upload ring go (gpu/memory_plan.h, header only).

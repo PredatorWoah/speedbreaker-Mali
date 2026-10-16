@@ -21,6 +21,7 @@
 #include "early_depth.h"
 #include "android_schedule.h"
 #include "performance_window.h"
+#include "pass_timing.h"
 #include "render_scale.h"
 #include "shared_memory_glsl.h"
 #include "xenos/registers.h"
@@ -660,6 +661,30 @@ namespace gpu::renderer
         double s_timestampPeriod = 1.0;
         uint32_t s_timestampBits = 0;
 
+        // Sample normal racing without readbacks, Flush or extra submissions.
+        // Each pool belongs to a command-buffer slot, reset only after its fence
+        // and harvested before that slot is released. Ordered timestamp markers
+        // can perturb overlap; sampled frames are explicitly marked in the CSV.
+        bool s_passTimingEnabled = false, s_passTimingSample = false;
+        uint64_t s_passTimingFrame = 0;
+        gpu::timing::Schedule s_passTimingSchedule;
+        struct TimedRegion
+        {
+            const char* kind = "unknown";
+            uint64_t frame = 0, vs = 0, ps = 0;
+            uint32_t width = 0, height = 0, base = 0, format = 0;
+            uint32_t depthBase = 0, colorMask = 0, draws = 0, depthOnlyDraws = 0;
+            uint32_t loadMask = 0, storeMask = 0, alphaDraws = 0;
+            uint64_t bytes = 0;
+        };
+        struct TimedSlot
+        {
+            VkQueryPool pool = VK_NULL_HANDLE;
+            gpu::timing::Ledger ledger;
+            std::array<TimedRegion, gpu::timing::MaxRegions> regions;
+        } s_timedSlots[kSlots];
+        int s_timedPass = -1;
+        uint64_t s_timingSampledInWindow = 0;
         // NFSMW_PASS_PROFILE=<frame>: time every render pass of one frame and
         // print them (targets, area, draws, GPU us). 256 passes max.
         const int s_profileFrame = [] { const char* v = std::getenv("NFSMW_PASS_PROFILE"); return v ? std::atoi(v) : -1; }();
@@ -693,6 +718,72 @@ namespace gpu::renderer
         // NFSMW_LOG_LATENCY: time with nothing in flight (under s_submitMutex).
         std::chrono::steady_clock::time_point s_emptySince = std::chrono::steady_clock::now();
         double s_emptyUs = 0;
+
+        int TimingBegin(const char* kind, uint32_t width = 0, uint32_t height = 0,
+                        uint32_t base = 0, uint32_t format = 0, uint64_t bytes = 0)
+        {
+            if (!s_passTimingSample || !s_recording) return -1;
+            auto& slot = s_timedSlots[s_slot];
+            if (!slot.pool) return -1;
+            int index = slot.ledger.Add();
+            if (index < 0) return -1;
+            slot.regions[index] = { .kind = kind, .frame = s_passTimingFrame,
+                .width = width, .height = height, .base = base, .format = format, .bytes = bytes };
+            vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, slot.pool, uint32_t(index) * 2);
+            return index;
+        }
+        void TimingEnd(int index)
+        {
+            if (index >= 0)
+                vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                    s_timedSlots[s_slot].pool, uint32_t(index) * 2 + 1);
+        }
+        void TimingHarvest(uint32_t index, uint64_t submission, double submissionUs)
+        {
+            const auto& slot = s_timedSlots[index];
+            if (!slot.ledger.used && !slot.ledger.dropped) return;
+            uint64_t results[gpu::timing::MaxRegions * 4] = {};
+            VkResult status = vkGetQueryPoolResults(s_dev, slot.pool, 0, slot.ledger.used * 2,
+                slot.ledger.used * 4 * sizeof(uint64_t), results, 2 * sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            const bool readable = status == VK_SUCCESS || status == VK_NOT_READY;
+            static uint32_t rows = 0;
+            static FILE* csv = [] {
+                auto path = GetUserPath() / "logs" / ("gpu-passes-" + std::to_string(std::time(nullptr)) + ".csv");
+                std::error_code error; std::filesystem::create_directories(path.parent_path(), error);
+                FILE* out = fopen(path.c_str(), "w");
+                if (out) fputs("frame,submission,slot,region,kind,status,gpu_us,gap_before_us,width,height,base,format,depth_base,color_mask,draws,depth_only_draws,last_vs_hash,last_ps_hash,bytes,dropped_regions,submission_gpu_us,attachment_load_mask,attachment_store_mask,alpha_test_draws\n", out);
+                fprintf(stderr, "[gpu-pass] output %s (%s); ordered GPU intervals, sampled frames may be perturbed; no readbacks or waits\n",
+                    path.string().c_str(), out ? "ready" : "FAILED");
+                return out;
+            }();
+            double total = 0; uint32_t unavailable = 0;
+            uint64_t last = 0; bool lastReady = false;
+            for (uint32_t i = 0; i < slot.ledger.used; ++i)
+            {
+                const auto& region = slot.regions[i];
+                const uint64_t* ts = results + i * 4;
+                bool ready = readable && ts[1] && ts[3];
+                double us = gpu::timing::Microseconds(ts[0], ts[2], ready, ready, s_timestampBits, s_timestampPeriod);
+                double gap = gpu::timing::Microseconds(last, ts[0], lastReady, ready, s_timestampBits, s_timestampPeriod);
+                if (us < 0) ++unavailable; else total += us;
+                if (csv && rows < 40000)
+                {
+                    fprintf(csv, "%llu,%llu,%u,%u,%s,%d,%.3f,%.3f,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%016llx,%llu,%u,%.3f,%u,%u,%u\n",
+                        (unsigned long long)region.frame, (unsigned long long)submission, index, i, region.kind,
+                        ready ? 0 : int(status == VK_SUCCESS ? VK_NOT_READY : status), us, gap,
+                        region.width, region.height, region.base, region.format, region.depthBase, region.colorMask,
+                        region.draws, region.depthOnlyDraws, (unsigned long long)region.vs, (unsigned long long)region.ps,
+                        (unsigned long long)region.bytes, slot.ledger.dropped, submissionUs, region.loadMask, region.storeMask, region.alphaDraws);
+                    ++rows;
+                }
+                last = ts[2]; lastReady = ready;
+            }
+            if (csv) fflush(csv);
+            fprintf(stderr, "[gpu-pass] submission %llu: %u regions %.3f ms (submission %.3f ms), %u unavailable, %u dropped (sampled)\n",
+                (unsigned long long)submission, slot.ledger.used, total / 1000.0, submissionUs / 1000.0, unavailable, slot.ledger.dropped);
+        }
+
 
         // Occlusion queries counted on the GPU (NFSMW_OCCLUSION=1; the
         // presenter decides: VulkanContext::occlusionCounting). Command
@@ -842,6 +933,10 @@ namespace gpu::renderer
             s_recording = true;
             s_stateEpoch++;
             s_recordStart = std::chrono::steady_clock::now();
+            auto& timing = s_timedSlots[s_slot];
+            timing.ledger = {};
+            if (timing.pool)
+                vkCmdResetQueryPool(s_cmd, timing.pool, 0, gpu::timing::MaxRegions * 2);
             if (s_timestamps)
             {
                 vkCmdResetQueryPool(s_cmd, s_timestamps, s_slot * 2, 2);
@@ -1080,15 +1175,20 @@ namespace gpu::renderer
                 if (now > start)
                     s_gpuBusyUs += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - start).count());
                 s_lastCompletion = now;
+                double submissionUs = -1;
                 if (s_timestamps)
                 {
                     uint64_t ts[2];
                     if (vkGetQueryPoolResults(s_dev, s_timestamps, slot * 2, 2, sizeof(ts), ts, sizeof(uint64_t),
                             VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
-                        s_gpuExecNs += uint64_t(double(gpu::TimestampTicks(ts[0], ts[1], s_timestampBits)) * s_timestampPeriod);
+                    {
+                        submissionUs = gpu::timing::Microseconds(ts[0], ts[1], true, true, s_timestampBits, s_timestampPeriod);
+                        s_gpuExecNs += uint64_t(submissionUs * 1000.0);
+                    }
                 }
                 if (!sub.zpdSegments.empty())
                     ZpdHarvest(slot, sub);
+                TimingHarvest(slot, sub.number, submissionUs);
                 {
                     // Writes run under the lock so QueueWrite can't append to
                     // a submission that is being retired.
@@ -2121,6 +2221,7 @@ namespace gpu::renderer
             Begin();
             ToGeneral(rt->image.image, aspect, 1);
             VkImageSubresourceRange range{ aspect, 0, 1, 0, 1 };
+            int clearTiming = TimingBegin("target_clear", rt->width, rt->height, base, format);
             if (depth)
             {
                 VkClearDepthStencilValue v{ 0.0f, 0 };
@@ -2131,6 +2232,7 @@ namespace gpu::renderer
                 VkClearColorValue v{};
                 vkCmdClearColorImage(s_cmd, rt->image.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
             }
+            TimingEnd(clearTiming);
             FullBarrier();
 
             fprintf(stderr, "[renderer] EDRAM target: base %u %s format %u pitch %u -> %ux%u%s\n",
@@ -2186,6 +2288,8 @@ namespace gpu::renderer
             ZpdEndSegment();  // a segment never outlives its pass
             s_vk->cmdEndRendering(s_cmd);
             s_passActive = false;
+            TimingEnd(s_timedPass);
+            s_timedPass = -1;
             if (s_profiling && s_passQueries && !s_passInfos.empty() && s_passInfos.back().query + 1 < s_passQueryNext)
                 vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_passQueries, s_passInfos.back().query + 1);
             PassEndBarrier();
@@ -2214,7 +2318,11 @@ namespace gpu::renderer
             region.bufferOffset = at;
             region.imageSubresource = { aspect, 0, 0, 1 };
             region.imageExtent = { width, height, 1 };
-            vkCmdCopyImageToBuffer(s_cmd, image, VK_IMAGE_LAYOUT_GENERAL, s_ring, 1, &region);
+            {
+                int timed = TimingBegin("transfer");
+                vkCmdCopyImageToBuffer(s_cmd, image, VK_IMAGE_LAYOUT_GENERAL, s_ring, 1, &region);
+                TimingEnd(timed);
+            }
             VkMemoryBarrier host{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
             host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -2471,6 +2579,34 @@ namespace gpu::renderer
                     uint32_t(now.uploads - s_gapLast.uploads), uint32_t(now.submits - s_gapLast.submits), (now.shadowBytes - s_gapLast.shadowBytes) / 1024 });
                 s_gapLast = now;
                 s_passQueryNext += 2;
+            }
+            s_timedPass = TimingBegin("render", s_passArea.extent.width, s_passArea.extent.height);
+            if (s_timedPass >= 0)
+            {
+                auto& timed = s_timedSlots[s_slot].regions[s_timedPass];
+                timed.depthBase = depth ? depth->base : 0;
+                uint64_t bpp = depth ? 5 : 0;
+                if (depth)
+                {
+                    timed.loadMask |= ds.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 16u : 0u;
+                    timed.storeMask |= ds.storeOp == VK_ATTACHMENT_STORE_OP_STORE ? 16u : 0u;
+                }
+                for (uint32_t i = 0; i < 4; ++i)
+                    if (color[i])
+                    {
+                        timed.colorMask |= 1u << i;
+                        timed.loadMask |= colors[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 1u << i : 0u;
+                        timed.storeMask |= colors[i].storeOp == VK_ATTACHMENT_STORE_OP_STORE ? 1u << i : 0u;
+                        bpp += Is64bpp(color[i]->format) ? 8 : 4;
+                        if (!i) { timed.base = color[i]->base; timed.format = color[i]->format; }
+                    }
+                // Structural upper estimate, not measured bus traffic/compression.
+                timed.bytes = uint64_t(s_passArea.extent.width) * s_passArea.extent.height * bpp * 2;
+                if (!timed.colorMask && depth)
+                {
+                    timed.kind = "render_depth_only";
+                    timed.base = depth->base; timed.format = depth->format;
+                }
             }
             s_vk->cmdBeginRendering(s_cmd, &ri);
             s_passActive = true;
@@ -2905,7 +3041,9 @@ namespace gpu::renderer
             bool done = false;
             VkPipeline pipeline = VK_NULL_HANDLE;
             std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now();
-            double createMs = 0;
+            double createMs = 0, queueMs = 0, waitMs = 0;
+            uint32_t skips = 0;
+            bool forcedWait = false;
             uint64_t queuedFrame = 0;
             bool outlasted = false;  // outlasted a frame's wait budget: a real compile, not worth waiting for again
         };
@@ -2990,6 +3128,7 @@ namespace gpu::renderer
                     VkPipeline pipeline = BuildPipeline(key, layout, *vs, *ps);
                     {
                         std::lock_guard lock(job->mutex);
+                        job->queueMs = std::chrono::duration<double, std::milli>(start - job->queued).count();
                         job->pipeline = pipeline;
                         job->createMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
                         job->done = true;
@@ -3022,8 +3161,12 @@ namespace gpu::renderer
                 // Waits share one budget a frame (cache hits make it); once it
                 // is spent, draws just check. A per-draw wait made a pipeline
                 // used by 13 draws cost 47 ms a frame while it compiled.
+                auto waitStart = std::chrono::steady_clock::now();
                 if (!settings::GetBool(settings::Id::AsyncShaders) || s_frame < s_waitPipelinesUntil)
+                {
+                    job->forcedWait |= s_frame < s_waitPipelinesUntil;
                     job->cv.wait(lock, [&] { return job->done; });
+                }
                 else
                 {
                     // The budget catches compiles that finish within a few
@@ -3040,10 +3183,21 @@ namespace gpu::renderer
                     {
                         pending = true;
                         s_pipelineSkips++;
+                        ++job->skips;
+                        job->waitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
                         return VK_NULL_HANDLE;
                     }
                 }
+                job->waitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
             }
+#ifdef __ANDROID__
+            static uint32_t loggedPipelines = 0;
+            if (loggedPipelines++ < 512)
+                fprintf(stderr, "[shader-timing] frame %llu queued_frame %llu vs %016llx ps %016llx: async %d forced_loading_wait %d queue %.3f ms compile %.3f ms CP_wait %.3f ms skipped_draws %u ready_after_frames %llu\n",
+                    (unsigned long long)s_frame, (unsigned long long)job->queuedFrame, (unsigned long long)key.vs,
+                    (unsigned long long)key.ps, int(settings::GetBool(settings::Id::AsyncShaders)), int(job->forcedWait),
+                    job->queueMs, job->createMs, job->waitMs, job->skips, (unsigned long long)(s_frame - job->queuedFrame));
+#endif
             if (s_logPipelines)
                 fprintf(stderr, "[pipeline] vs %016llx ps %016llx: %.1f ms to compile, ready %.1f ms and %llu frames after the first draw\n",
                     (unsigned long long)key.vs, (unsigned long long)key.ps, job->createMs,
@@ -4320,7 +4474,11 @@ void main()
                             s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileStoreLayout, 0, AddSharedParts(w, 2), w);
                             vkCmdPushConstants(s_cmd, s_untileStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
                             if (!(s_exp & 4))
-                                vkCmdDispatch(s_cmd, (bw + 7) / 8, (bh + 7) / 8, 1);
+                                {
+                                    int timed = TimingBegin("texture_compute");
+                                    vkCmdDispatch(s_cmd, (bw + 7) / 8, (bh + 7) / 8, 1);
+                                    TimingEnd(timed);
+                                }
                             FullBarrier();
                             SubmitIfStarving();
                             continue;
@@ -4351,7 +4509,11 @@ void main()
                         vkCmdPushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
                         uint32_t groupsX = fi.convert != 0 || fi.bpbLog2 >= 2 ? bw : rowWords;
                         if (!(s_exp & 4))
-                            vkCmdDispatch(s_cmd, (groupsX + 7) / 8, (bh + 7) / 8, 1);
+                            {
+                                int timed = TimingBegin("texture_compute");
+                                vkCmdDispatch(s_cmd, (groupsX + 7) / 8, (bh + 7) / 8, 1);
+                                TimingEnd(timed);
+                            }
                         FullBarrier();
                         if (!t.uploaded && slice == 0)
                             ToGeneral(t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, layers);
@@ -4362,7 +4524,11 @@ void main()
                         region.imageOffset = { 0, 0, int32_t(zSlice) };
                         region.imageExtent = { width, height, 1 };
                         if (!(s_exp & 16))  // NFSMW_GPU_EXP bit 16: no staging copy (upload cost experiment)
-                            vkCmdCopyBufferToImage(s_cmd, s_ring, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                            {
+                                int timed = TimingBegin("transfer");
+                                vkCmdCopyBufferToImage(s_cmd, s_ring, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                                TimingEnd(timed);
+                            }
                         FullBarrier();
                         SubmitIfStarving();
                     }
@@ -4408,7 +4574,11 @@ void main()
                             s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileLayout, 0, AddSharedParts(w, 2), w);
                             vkCmdPushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
                             uint32_t groupsX = fi.convert != 0 || fi.bpbLog2 >= 2 ? lbw : levelRowWords;
-                            vkCmdDispatch(s_cmd, (groupsX + 7) / 8, (lbh + 7) / 8, 1);
+                            {
+                                int timed = TimingBegin("texture_compute");
+                                vkCmdDispatch(s_cmd, (groupsX + 7) / 8, (lbh + 7) / 8, 1);
+                                TimingEnd(timed);
+                            }
                             FullBarrier();
                             VkBufferImageCopy region{};
                             region.bufferOffset = staging;
@@ -4416,7 +4586,11 @@ void main()
                             region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 };
                             region.imageExtent = { lw, lh, 1 };
                             if (!(s_exp & 16))  // NFSMW_GPU_EXP bit 16: no staging copy (upload cost experiment)
-                                vkCmdCopyBufferToImage(s_cmd, s_ring, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                                {
+                                    int timed = TimingBegin("transfer");
+                                    vkCmdCopyBufferToImage(s_cmd, s_ring, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                                    TimingEnd(timed);
+                                }
                             FullBarrier();
                         }
                     }
@@ -5274,7 +5448,11 @@ void main()
             mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
             VkBufferCopy copy{ rangeBase, 0, rangeBytes };
-            vkCmdCopyBuffer(s_cmd, s_shared, p.buffer, 1, &copy);
+            {
+                int timed = TimingBegin("transfer");
+                vkCmdCopyBuffer(s_cmd, s_shared, p.buffer, 1, &copy);
+                TimingEnd(timed);
+            }
             mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
             vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
@@ -5717,6 +5895,8 @@ void main()
                     s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
                     vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
                     uint32_t perWord = bl >= 2 ? 1 : (4 >> bl);
+                    int timedResolve = TimingBegin(depthSource ? "resolve_depth" : "resolve_color",
+                        rc.width, rc.height, rc.destBase, format, rangeBytes);
                     if (!(s_exp & 2))
                         vkCmdDispatch(s_cmd, (coalesced || wordOrder) ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
                             (coalesced || wordOrder) ? (rc.height + 1) / 2 : (rc.height + 7) / 8, 1);
@@ -5724,6 +5904,7 @@ void main()
                         FullBarrier();  // (above 1x: as before)
                     else
                         ResolveBarrier(rangeBase, rangeBytes, fused ? fused->guestStart : 0);
+                    TimingEnd(timedResolve);
                     if (s_logShadowMap && depthSource && pitch == 1600 && bl == 2)
                         ShadowMapProbeRecord(rangeBase, rangeBytes, rc, r, source->base);
                     SubmitIfStarving();
@@ -5806,7 +5987,11 @@ void main()
                         if (at != ~VkDeviceSize(0))
                         {
                             FullBarrier(); VkBufferCopy copyRegion{ base, at, bytes };
-                            vkCmdCopyBuffer(s_cmd, s_shared, s_ring, 1, &copyRegion);
+                            {
+                                int timed = TimingBegin("transfer");
+                                vkCmdCopyBuffer(s_cmd, s_shared, s_ring, 1, &copyRegion);
+                                TimingEnd(timed);
+                            }
                             VkMemoryBarrier host{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
                             host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
                             vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr, 0, nullptr);
@@ -6204,14 +6389,22 @@ void main()
                 vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledStorePipeline);
                 s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledStoreLayout, 0, 3, w);
                 vkCmdPushConstants(s_cmd, s_scaledStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-                vkCmdDispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
+                {
+                    int timed = TimingBegin("texture_compute");
+                    vkCmdDispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
+                    TimingEnd(timed);
+                }
                 ComputeBarrier();
                 return;
             }
             vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledUntilePipeline);
             s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledUntileLayout, 0, 3, w);
             vkCmdPushConstants(s_cmd, s_scaledUntileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            vkCmdDispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
+            {
+                int timed = TimingBegin("scaled_texture_compute", t.width, t.height);
+                vkCmdDispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
+                TimingEnd(timed);
+            }
             FullBarrier();
             if (!t.uploaded)
                 ToGeneral(t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, 1);
@@ -6219,7 +6412,11 @@ void main()
             region.bufferRowLength = t.width;
             region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             region.imageExtent = { t.width, t.height, 1 };
-            vkCmdCopyBufferToImage(s_cmd, s_scaled.scratch, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            {
+                int timed = TimingBegin("transfer");
+                vkCmdCopyBufferToImage(s_cmd, s_scaled.scratch, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                TimingEnd(timed);
+            }
             FullBarrier();
         }
 
@@ -6252,7 +6449,11 @@ void main()
                 vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledFillPipeline);
                 s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledFillLayout, 0, AddSharedParts(w, 3), w);
                 vkCmdPushConstants(s_cmd, s_scaledFillLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-                vkCmdDispatch(s_cmd, (count * 1024 + 63) / 64, 1, 1);
+                {
+                    int timed = TimingBegin("scaled_memory_fill");
+                    vkCmdDispatch(s_cmd, (count * 1024 + 63) / 64, 1, 1);
+                    TimingEnd(timed);
+                }
                 FullBarrier();
             }
         }
@@ -7204,6 +7405,22 @@ void main()
                     fprintf(stderr, "[renderer] submission GPU timestamps unavailable\n");
                 }
             }
+            const char* passTiming = std::getenv("SB_GPU_PASS_TIMING");
+#ifdef __ANDROID__
+            s_passTimingEnabled = !passTiming || passTiming[0] != '0';
+#else
+            s_passTimingEnabled = passTiming && passTiming[0] == '1';
+#endif
+            if (s_passTimingEnabled && s_timestampBits)
+            {
+                qpci.queryCount = gpu::timing::MaxRegions * 2;
+                for (auto& slot : s_timedSlots)
+                    if (vkCreateQueryPool(s_dev, &qpci, nullptr, &slot.pool) != VK_SUCCESS)
+                        slot.pool = VK_NULL_HANDLE;
+            }
+            fprintf(stderr, "[gpu-pass] sampling %s; %u timestamp bits, %u/%u slot pools; one frame per 120 complex frames, up to 120 samples\n",
+                s_passTimingEnabled ? "ON" : "OFF", s_timestampBits,
+                unsigned(std::count_if(std::begin(s_timedSlots), std::end(s_timedSlots), [](const auto& slot) { return slot.pool != VK_NULL_HANDLE; })), kSlots);
             if (s_profileFrame >= 0 || s_visual.enabled())
             {
                 uint32_t count = 0; vkGetPhysicalDeviceQueueFamilyProperties(s_vk->physical, &count, nullptr);
@@ -8980,6 +9197,14 @@ void main()
                     scissor.extent.height, scissor.offset.x, scissor.offset.y);
             }
         }
+        if (s_timedPass >= 0)
+        {
+            auto& timed = s_timedSlots[s_slot].regions[s_timedPass];
+            ++timed.draws;
+            timed.vs = s_vs->hash; timed.ps = s_ps->hash;
+            timed.depthOnlyDraws += s_ps->hash == kDepthOnlyPsHash;
+            timed.alphaDraws += pc.alphaTest != 7u;
+        }
         if (useIndices)
         {
             vkCmdBindIndexBuffer(s_cmd, s_ring, indexOffset, indices16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
@@ -9026,6 +9251,7 @@ void main()
             {
                 const gpu::bars::Rect& r = barPlan.rects[i];
                 setScissor(VkRect2D{ { r.x0, r.y0 }, { uint32_t(r.x1 - r.x0), uint32_t(r.y1 - r.y0) } });
+                if (s_timedPass >= 0) ++s_timedSlots[s_slot].regions[s_timedPass].draws;
                 if (useIndices)
                     vkCmdDrawIndexed(s_cmd, vertexCount, 1, 0, 0, 0);
                 else
@@ -9305,7 +9531,11 @@ void main()
         vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontPipeline);
         s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontLayout, 0, AddSharedParts(w, 4), w);
         vkCmdPushConstants(s_cmd, s_frontLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(s_cmd, (outW + 7) / 8, (outH + 7) / 8, 1);
+        {
+            int timed = TimingBegin("front_compute", outW, outH);
+            vkCmdDispatch(s_cmd, (outW + 7) / 8, (outH + 7) / 8, 1);
+            TimingEnd(timed);
+        }
         GuardGpu(pc.base, frontBytes, false, "front buffer");
         FullBarrier();
         SubmitRecorded(7);  // the presenter's blit comes later in queue order
@@ -9372,7 +9602,11 @@ void main()
             region.bufferOffset = at;
             region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             region.imageExtent = { width, height, 1 };
-            vkCmdCopyImageToBuffer(s_cmd, front.image, VK_IMAGE_LAYOUT_GENERAL, s_ring, 1, &region);
+            {
+                int timed = TimingBegin("transfer");
+                vkCmdCopyImageToBuffer(s_cmd, front.image, VK_IMAGE_LAYOUT_GENERAL, s_ring, 1, &region);
+                TimingEnd(timed);
+            }
             Flush();
             if (FILE* f = fopen(checkPath.c_str(), "wb"))
             {
@@ -9408,6 +9642,7 @@ void main()
         const auto sampleNow = std::chrono::steady_clock::now();
         if (frame > 1) samples.Add(std::chrono::duration<double, std::milli>(sampleNow - previous).count());
         previous = sampleNow;
+        s_timingSampledInWindow += s_passTimingSample;
         complexFrames += s_stats.draws - lastDraws >= 1500;
         lastDraws = s_stats.draws;
         mixed |= firstLevel != s_passBarrier;
@@ -9426,12 +9661,12 @@ void main()
                 std::ofstream out(csv, std::ios::app);
                 if (out)
                 {
-                    if (!rows) out << "end_frame,barrier,transition,complex_frames,samples,cp_swap_mean_ms,cp_swap_p50_ms,cp_swap_p95_ms,cp_swap_p99_ms,gpu_completed_ms_per_sample,passes,resolves,submits\n";
-                    out << std::format("{},{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{},{},{}\n",
+                    if (!rows) out << "end_frame,barrier,transition,complex_frames,samples,cp_swap_mean_ms,cp_swap_p50_ms,cp_swap_p95_ms,cp_swap_p99_ms,gpu_completed_ms_per_sample,passes,resolves,submits,sampled_frames\n";
+                    out << std::format("{},{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{},{},{},{}\n",
                         frame, firstLevel, transition ? 1 : 0, complexFrames, samples.count,
                         samples.count ? samples.sum / samples.count : 0, samples.Percentile(.5), samples.Percentile(.95), samples.Percentile(.99),
                         samples.count && s_timestamps ? double(gpuNow - gpuStart) / 1e6 / samples.count : -1,
-                        s_stats.passes - passesStart, s_stats.resolves - resolvesStart, s_stats.submits - submitsStart);
+                        s_stats.passes - passesStart, s_stats.resolves - resolvesStart, s_stats.submits - submitsStart, s_timingSampledInWindow);
                 }
                 ++rows;
             }
@@ -9439,7 +9674,7 @@ void main()
                 (unsigned long long)frame, firstLevel, int(transition), (unsigned long long)complexFrames,
                 samples.Percentile(.5), samples.Percentile(.95), samples.Percentile(.99));
             lastWindowLevel = firstLevel;
-            samples = {}; complexFrames = 0; mixed = false;
+            samples = {}; complexFrames = 0; mixed = false; s_timingSampledInWindow = 0;
             gpuStart = gpuNow; passesStart = s_stats.passes; resolvesStart = s_stats.resolves; submitsStart = s_stats.submits;
             // Next window's actual level is set below, before its first draw.
             firstLevel = UINT32_MAX;
@@ -9473,7 +9708,22 @@ void main()
             log.now = frame >= log.first && frame <= log.last;
             writewatch::SetWriterFrame(frame);
         }
+        static uint64_t timingLastDraws = 0;
+        s_passTimingSample = s_passTimingEnabled && s_passTimingSchedule.Next(s_stats.draws - timingLastDraws);
+        timingLastDraws = s_stats.draws;
+        s_passTimingFrame = frame + 1;
+        if (s_passTimingSample)
+            fprintf(stderr, "[gpu-pass] armed frame %llu sample %u (timing markers may perturb this frame)\n",
+                (unsigned long long)s_passTimingFrame, s_passTimingSchedule.samples);
         s_frame = frame;
+        static int loggedAsync = -1;
+        int async = int(settings::GetBool(settings::Id::AsyncShaders));
+        if (async != loggedAsync)
+        {
+            fprintf(stderr, "[shader-policy] frame %llu async %s; %u workers, budget %lld us; loading setup still waits in full\n",
+                (unsigned long long)frame, async ? "ON" : "OFF", s_pipelineThreads, (long long)s_pipelineWaitUs);
+            loggedAsync = async;
+        }
         if (s_zpdOn)
             ZpdOnSwap(frame);
         if (s_logShadowMap)

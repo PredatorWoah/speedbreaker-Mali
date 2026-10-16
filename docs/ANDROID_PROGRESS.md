@@ -309,3 +309,29 @@ Next test: one install, same 720p / Frame Rate 60 Quick Race, warm a minute,
 then GPU Scheduling Compare for four minutes, second race and background/resume.
 Return one local capture_performance.sh archive and observed FPS/power.
 Conservative reverts scheduling only; 0.1.7 is the full rollback.
+
+
+## 0.1.9 device result and 0.1.10 measurement correction — October 16, 2026
+
+0.1.9 optimized signed APK completed from clean 7cc2e0e, code 10, package and
+certificate unchanged. APK SHA256 b684df46c5f14f0e5ce718a327e7162faae9e12a8849d45d769847dce333c0fe;
+native Build ID 10a055a301dc4135cf892c233421b8c72cc53132. All 56,146 generated
+mapping symbols linked; host regressions, 32 optimized SPIR-V variants and APK
+integrity/signing passed. No proven speed claim accompanied the build.
+
+Juan reports performance still poor and confirms pausing works. His private
+Oct 16 11:22 capture confirms work reduction active, 720p internal scale,
+~35 ms median completed GPU time and ~28 FPS in complex windows. The prior
+aggregate-only capture missed individual operation timing; that was insufficient
+for the planned diagnosis. No equivalent baseline/off control was captured.
+
+A second source/log review found 3,492 actual swapchain creations from persistent
+rotation-related SUBOPTIMAL, each policy rebuild draining the GPU. 0.1.10 removes
+that trigger on Android while preserving resize/OUT_OF_DATE/surface recovery.
+It adds bounded automatic per-slot, per-pass/resolve/transfer timestamps, explicit
+sample/availability/overflow metadata, shader policy/compile/wait/skip evidence,
+and cumulative surface-health counters. No readbacks, extra GPU waits or quality
+reduction. Existing asynchronous-shader preference and loading waits remain.
+Collector verifies current pass output, snapshots settings/version/thermal state,
+and automatically presses Home for a ten-second background check after done.
+See ANDROID_PERFORMANCE_0110.md for invariants, limits and falsification tests.
