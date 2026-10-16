@@ -31,6 +31,9 @@
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
+#ifdef __ANDROID__
+#include <platform/android/gpu_driver.h>
+#endif
 
 #include <algorithm>
 #include <condition_variable>
@@ -1731,6 +1734,9 @@ void main()
 
     bool Initialize()
     {
+#ifdef __ANDROID__
+        if (!platform::android::InitializeVulkanLoader()) return false;
+#endif
         if (const char* h = std::getenv("NFSMW_HEADLESS"); h && h[0] == '1')
             return false;
 #if defined(__APPLE__) && TARGET_OS_IOS
@@ -1792,9 +1798,13 @@ void main()
         platform::ios::WatchKeyboards(s_window);
 #endif
 
+#ifdef __ANDROID__
+        std::vector<const char*> exts{VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME};
+#else
         Uint32 extCount = 0;
         const char* const* sdlExts = SDL_Vulkan_GetInstanceExtensions(&extCount);
         std::vector<const char*> exts(sdlExts, sdlExts + extCount);
+#endif
         exts.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
         // Portability enumeration is the Vulkan loader's (it lists MoltenVK
         // on macOS only when asked). iOS links MoltenVK itself, without a
@@ -1819,7 +1829,14 @@ void main()
         ici.ppEnabledExtensionNames = exts.data();
         if (!Check(vkCreateInstance(&ici, nullptr, &s_instance), "vkCreateInstance"))
             return false;
+#ifdef __ANDROID__
+        volkLoadInstance(s_instance);
+#endif
+#ifdef __ANDROID__
+        if (!platform::android::CreateVulkanSurface(s_window, s_instance, &s_surface))
+#else
         if (!SDL_Vulkan_CreateSurface(s_window, s_instance, nullptr, &s_surface))
+#endif
         {
             fprintf(stderr, "[video] SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
             return false;
@@ -2038,6 +2055,10 @@ void main()
         dci.ppEnabledExtensionNames = devExts.data();
         if (!Check(vkCreateDevice(s_physical, &dci, nullptr, &s_device), "vkCreateDevice"))
             return false;
+#ifdef __ANDROID__
+        volkLoadDevice(s_device);
+        platform::android::ReportVulkanDriver(s_physical);
+#endif
         vkGetDeviceQueue(s_device, s_queueFamily, 0, &s_queue);
         if (s_presentTiming)
             s_waitForPresent = (PFN_vkWaitForPresentKHR)vkGetDeviceProcAddr(s_device, "vkWaitForPresentKHR");
@@ -2750,7 +2771,7 @@ void main()
             DestroySwapchain();
             if (s_surface) vkDestroySurfaceKHR(s_instance, s_surface, nullptr);
             s_surface = VK_NULL_HANDLE;
-            if (!SDL_Vulkan_CreateSurface(s_window, s_instance, nullptr, &s_surface))
+            if (!platform::android::CreateVulkanSurface(s_window, s_instance, &s_surface))
             {
                 fprintf(stderr, "[video] Android surface not ready: %s\n", SDL_GetError());
                 s_androidSurfaceStale.store(true, std::memory_order_release);

@@ -7,6 +7,10 @@ configure_file("${SB_ROOT}/tools/XenonRecomp/XenonUtils/ppc_context.h" "${CHECK_
 file(GLOB_RECURSE CHECK_SOURCES CONFIGURE_DEPENDS "${SB_ROOT}/runtime/*.cpp")
 list(FILTER CHECK_SOURCES EXCLUDE REGEX "/thirdparty/|/platform/android/diagnostics\\.cpp$")
 add_library(runtime-compile-check OBJECT ${CHECK_SOURCES})
+# Check the same dispatch declarations as the full custom-driver runtime.
+target_compile_definitions(runtime-compile-check PRIVATE VK_NO_PROTOTYPES VK_USE_PLATFORM_ANDROID_KHR IMGUI_IMPL_VULKAN_USE_VOLK)
+target_compile_options(runtime-compile-check PRIVATE -include volk.h)
+target_include_directories(runtime-compile-check PRIVATE "${SB_ROOT}/tools/volk" "${SB_ROOT}/tools/libadrenotools/include")
 find_package(glslang REQUIRED CONFIG PATHS "${SB_ROOT}/tools/android-arm64/lib/cmake/glslang" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
 find_package(Vulkan REQUIRED)
 target_link_libraries(runtime-compile-check PRIVATE SDL3::SDL3 glslang::glslang Vulkan::Vulkan)

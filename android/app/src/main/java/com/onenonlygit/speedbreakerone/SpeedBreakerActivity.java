@@ -71,6 +71,18 @@ public final class SpeedBreakerActivity extends SDLActivity {
         catch (RuntimeException ignored) { }
     }
 
+    // A new launch must start with fresh native globals and one Vulkan loader.
+    // Home/background only pauses/stops the Activity and does not call this.
+    @Override protected void onDestroy() {
+        super.onDestroy();
+        android.os.Process.killProcess(android.os.Process.myPid());
+    }
+
+    public String gpuDriverDirectory() { String s=getIntent().getStringExtra("driver_dir"); return s==null?"":s; }
+    public String gpuDriverLibrary() { String s=getIntent().getStringExtra("driver_lib"); return s==null?"":s; }
+    public String gpuDriverName() { String s=getIntent().getStringExtra("driver_name"); return s==null?"System":s; }
+    public String gpuHookDirectory() { return getApplicationInfo().nativeLibraryDir; }
+
     @Override protected void onActivityResult(int request, int result, Intent data) {
         if (request != DISC_REQUEST) { super.onActivityResult(request, result, data); return; }
         if (result != RESULT_OK || data == null || data.getData() == null) {

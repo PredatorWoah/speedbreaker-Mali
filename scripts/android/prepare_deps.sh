@@ -29,6 +29,10 @@ checkout_pinned() {
     fi
     git -C "$directory" checkout --detach "$revision"
 }
+# Rootless driver loading and matching global Vulkan dispatch (source only).
+checkout_pinned "$ROOT/tools/libadrenotools" https://github.com/bylaws/libadrenotools.git 8fae8ce254dfc1344527e05301e43f37dea2df80
+git -C "$ROOT/tools/libadrenotools" submodule update --init --recursive
+checkout_pinned "$ROOT/tools/volk" https://github.com/zeux/volk.git 43c29e655cb8117fd9cfb65ad9cefe2d40965102
 checkout_pinned "$ROOT/tools/glslang-android/External/spirv-tools" \
     https://github.com/KhronosGroup/SPIRV-Tools.git 4d2f0b40bfe290dea6c6904dafdf7fd8328ba346
 checkout_pinned "$ROOT/tools/glslang-android/External/spirv-tools/external/spirv-headers" \

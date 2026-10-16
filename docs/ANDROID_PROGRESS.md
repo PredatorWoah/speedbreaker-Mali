@@ -366,3 +366,23 @@ not a hot game shader, Adreno cycle test or FPS claim. Full implementation plan,
 reference/settings audit, safeguards and acceptance criteria are in
 ANDROID_60FPS_INVESTIGATION.md. No production renderer change or new APK from
 this investigation; 0.1.10 remains the retained device baseline.
+
+## Android 0.1.11 implementation — shader/depth trials and Turnip selector
+
+Implemented the first authorized renderer changes on android/rp6-bringup:
+generation-safe instruction predicate sharing within EXEC and conservative
+no-color fragment-stage elimination, with true position-only vertex outputs.
+Independent restart controls retain the old paths. Alpha/kill/depth/memexport
+cases retain fragment effects; native raster/depth/stencil and casters stay.
+
+Added an Android launch-screen Turnip ZIP import/selection and System recovery
+option, isolated from the :game Vulkan process. Rootless libadrenotools loading
+and hidden Volk dispatch cover runtime, ImGui and direct Android surfaces.
+Startup probes actual Turnip identity and falls back on loader/probe failure;
+actual driver details and requested/eligible depth-stage and geometry/snapshot
+counts are included in diagnostics. No custom driver is redistributed.
+
+44 host suites, Java archive boundaries, release Java compilation and 94 optimized
+synthetic SPIR-V variants pass. Full ARM64 link succeeds. Device gains/Turnip
+compatibility remain untested; hardware vertex-input conversion remains later.
+See ANDROID_PERFORMANCE_0111.md for invariants, hypotheses, rollback and next test.

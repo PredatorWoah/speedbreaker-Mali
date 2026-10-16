@@ -86,3 +86,17 @@ That project's application code declares GPL-3.0; its ReXGlue SDK declares
 BSD-3-Clause. Sources: app/src/nfsmw_nativo_dibujos.cpp and
 docs/native-renderer.md. SpeedBreaker retains its own runtime and translator;
 no game data, generated shaders or third-party runtime binaries are incorporated.
+
+
+### Android custom Vulkan drivers (0.1.11)
+
+- **libadrenotools** and **liblinkernsbypass**, Copyright (c) 2021 Billy Laws,
+  BSD-2-Clause. https://github.com/bylaws/libadrenotools at
+  8fae8ce254dfc1344527e05301e43f37dea2df80 and its pinned submodule.
+- **volk**, Copyright (c) 2018-2025 Arseny Kapoulkine, MIT.
+  https://github.com/zeux/volk at 43c29e655cb8117fd9cfb65ad9cefe2d40965102.
+
+Full notices ship in the APK's assets/licenses. Users import their own Turnip
+bundles; no custom driver binary is redistributed by this project.
+Predicate coalescing and safe depth-stage reduction follow the reference audit
+above, implemented in SpeedBreaker's existing translator and pipeline builder.

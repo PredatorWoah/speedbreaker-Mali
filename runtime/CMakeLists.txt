@@ -70,6 +70,18 @@ if(IOS)
 else()
     find_package(Vulkan REQUIRED)
 endif()
+if(ANDROID)
+    set(VOLK_STATIC_DEFINES "VK_USE_PLATFORM_ANDROID_KHR")
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../tools/volk ${CMAKE_BINARY_DIR}/volk)
+    set_target_properties(volk PROPERTIES C_VISIBILITY_PRESET hidden)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../tools/libadrenotools ${CMAKE_BINARY_DIR}/adrenotools)
+    # Every application and ImGui call must use the selected loader's dispatch.
+    set(SB_VULKAN_TARGET volk)
+    target_link_libraries(SpeedBreaker PRIVATE adrenotools)
+    add_dependencies(SpeedBreaker main_hook hook_impl file_redirect_hook gsl_alloc_hook)
+else()
+    set(SB_VULKAN_TARGET Vulkan::Vulkan)
+endif()
 find_package(glslang REQUIRED CONFIG)
 # FFmpeg for XMA audio: the minimal static build that scripts/setup_tools.sh
 # makes in tools/ffmpeg-xma (with patches/ffmpeg applied: no sample hold-back
@@ -83,7 +95,7 @@ set(IMGUI ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/imgui)
 add_library(imgui STATIC ${IMGUI}/imgui.cpp ${IMGUI}/imgui_draw.cpp ${IMGUI}/imgui_tables.cpp ${IMGUI}/imgui_widgets.cpp
     ${IMGUI}/backends/imgui_impl_sdl3.cpp ${IMGUI}/backends/imgui_impl_vulkan.cpp)
 target_include_directories(imgui PUBLIC ${IMGUI} ${IMGUI}/backends)
-target_link_libraries(imgui PUBLIC SDL3::SDL3 Vulkan::Vulkan)
+target_link_libraries(imgui PUBLIC SDL3::SDL3 ${SB_VULKAN_TARGET})
 # The UI font, compiled in as a byte array (generated/ui_font.inc).
 file(READ ${IMGUI}/fonts/Roboto-Medium.ttf UI_FONT_HEX HEX)
 string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," UI_FONT_BYTES "${UI_FONT_HEX}")
@@ -145,7 +157,7 @@ add_custom_target(nfsmw_build_info
     VERBATIM)
 add_dependencies(SpeedBreaker nfsmw_build_info)
 
-target_link_libraries(SpeedBreaker PRIVATE NfsmwRecompLib XenonUtilsLite o1heap imgui SDL3::SDL3 Vulkan::Vulkan glslang::glslang glslang::glslang-default-resource-limits ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY})
+target_link_libraries(SpeedBreaker PRIVATE NfsmwRecompLib XenonUtilsLite o1heap imgui SDL3::SDL3 ${SB_VULKAN_TARGET} glslang::glslang glslang::glslang-default-resource-limits ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY})
 # glslang before 15 (the Steam Frame's 14) keeps the C API's SPIR-V
 # generation in its own library.
 if(TARGET glslang::SPIRV)
@@ -193,4 +205,11 @@ if(APPLE AND NOT IOS)
     else()
         message(STATUS "No MoltenVK at ${SB_MOLTENVK}: the game in the build folder takes the Vulkan loader's own drivers (-DSB_MOLTENVK=<libMoltenVK.dylib> names one)")
     endif()
+endif()
+
+if(ANDROID)
+    foreach(target SpeedBreaker imgui)
+        target_compile_definitions(${target} PRIVATE VK_NO_PROTOTYPES VK_USE_PLATFORM_ANDROID_KHR IMGUI_IMPL_VULKAN_USE_VOLK)
+        target_compile_options(${target} PRIVATE -include volk.h)
+    endforeach()
 endif()

@@ -4,6 +4,17 @@ What changed in each SpeedBreaker release, newest first. Each release's notes on
 its entry here, and the game shows the entry once, the first time a new version starts (offline:
 it's built into the game).
 
+## v0.1.11 (2026-10-16)
+
+- Android GPU driver launch selector: import ARM64 Turnip ZIPs, retain multiple
+  drivers, restore System, resume or explicitly restart the game.
+- Generation-safe shader predicate coalescing and safe no-color depth-stage
+  reduction, with independent restart rollback controls in Advanced.
+- Position-only depth vertex outputs; alpha-tested casters and shader side
+  effects retained. Pass timing includes stage eligibility and geometry counts.
+- Custom loader dispatch covers rendering, UI and Android surface recreation;
+  probe failures fall back to System and logs identify the actual Vulkan driver.
+
 ## v0.1.10 (Android GPU measurements and presentation fix)
 
 - Stop rebuilding usable Android swapchains repeatedly for persistent SUBOPTIMAL

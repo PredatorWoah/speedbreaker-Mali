@@ -3,8 +3,10 @@
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-feature android:name="android.hardware.gamepad" android:required="false" />
     <application android:label="@string/app_name" android:allowBackup="false" android:hasCode="true" android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen" android:extractNativeLibs="true">
-        <activity android:name=".SpeedBreakerActivity" android:exported="true" android:screenOrientation="landscape" android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|uiMode|navigation|density" android:launchMode="singleTask">
+        <activity android:name=".LauncherActivity" android:exported="true" android:screenOrientation="landscape">
             <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+        </activity>
+        <activity android:name=".SpeedBreakerActivity" android:process=":game" android:taskAffinity="com.onenonlygit.speedbreakerone.game" android:exported="false" android:screenOrientation="landscape" android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|uiMode|navigation|density" android:launchMode="singleTask">
         </activity>
     </application>
 </manifest>

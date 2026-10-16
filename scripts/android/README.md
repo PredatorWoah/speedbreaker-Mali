@@ -189,3 +189,34 @@ scripts/android/capture_visual_fidelity.sh
 
 Start Quick Race; the script waits for a new completed capture or bounded timeout
 and packages diagnostics/logcat/exit/memory reports. Never run it in cloud Work.
+
+
+## 0.1.11 driver selection and renderer trials
+
+The launch screen selects System or imported ARM64 Turnip ZIPs (flat bundle,
+meta.json with libraryName/name and optional minApi). Import copies the driver
+into internal app storage; no root or storage-wide permission is used. Resume
+retains a running game's driver. Restart game applies the current selection and
+explicitly warns about unsaved race progress. A separate :game process keeps the
+selector accessible after a bad driver crashes. System remains the initial choice.
+
+All Android runtime and ImGui Vulkan entry points use Volk dispatch, initialized
+from the chosen libadrenotools/system loader before any Vulkan object. Android
+surfaces use that same dispatch, including resume. The custom probe verifies
+Mesa Turnip identity; failed loading/probing falls back to System. Native crashes
+inside a driver cannot be caught safely: reopen the selector and select System.
+Actual driver ID/name/info and fallback reasons appear in [driver] log lines.
+
+Dependencies are source-pinned by prepare_deps.sh. Native libraries MUST be
+extracted (useLegacyPackaging=true). If packaging a separate sbNativeDir, include
+libmain.so, libSDL3.so, libc++_shared.so, libmain_hook.so, libhook_impl.so,
+libfile_redirect_hook.so and libgsl_alloc_hook.so. Never distribute a driver ZIP
+or forget its separate license when sharing a driver yourself.
+
+Advanced > Shader Predicate Coalescing and Depth Stage Reduction are independent
+restart controls, initially ON on Android. Work Reduction remains independent;
+Asynchronous Shaders retains your existing preference. Run capture_performance.sh
+for the new eligibility, vertex/index and snapshot counters alongside pass times.
+Indexed element counts are submitted indices, not unique vertex invocations;
+no_fragment_requested_draws can include the fragment fallback (logged separately).
+Hardware vertex input conversion and sky reordering are not included in 0.1.11.
