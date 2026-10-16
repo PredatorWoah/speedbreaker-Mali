@@ -18,6 +18,7 @@
 #include <report/zip.h>
 #include "depth24_glsl.h"
 #include "depth_only.h"
+#include "depth_stage.h"
 #include "early_depth.h"
 #include "android_schedule.h"
 #include "performance_window.h"
@@ -671,11 +672,13 @@ namespace gpu::renderer
         struct TimedRegion
         {
             const char* kind = "unknown";
-            uint64_t frame = 0, vs = 0, ps = 0;
+            uint64_t frame = 0, vs = 0, ps = 0, firstVs = 0, firstPs = 0;
             uint32_t width = 0, height = 0, base = 0, format = 0;
             uint32_t depthBase = 0, colorMask = 0, draws = 0, depthOnlyDraws = 0;
             uint32_t loadMask = 0, storeMask = 0, alphaDraws = 0;
-            uint64_t bytes = 0;
+            uint64_t bytes = 0, vertices = 0, indices = 0;
+            uint32_t noFragmentDraws = 0, eligibleDepthDraws = 0, snapshotDraws = 0, snapshotRanges = 0;
+            uint64_t snapshotBytes = 0;
         };
         struct TimedSlot
         {
@@ -752,7 +755,7 @@ namespace gpu::renderer
                 auto path = GetUserPath() / "logs" / ("gpu-passes-" + std::to_string(std::time(nullptr)) + ".csv");
                 std::error_code error; std::filesystem::create_directories(path.parent_path(), error);
                 FILE* out = fopen(path.c_str(), "w");
-                if (out) fputs("frame,submission,slot,region,kind,status,gpu_us,gap_before_us,width,height,base,format,depth_base,color_mask,draws,depth_only_draws,last_vs_hash,last_ps_hash,bytes,dropped_regions,submission_gpu_us,attachment_load_mask,attachment_store_mask,alpha_test_draws\n", out);
+                if (out) fputs("frame,submission,slot,region,kind,status,gpu_us,gap_before_us,width,height,base,format,depth_base,color_mask,draws,depth_only_draws,last_vs_hash,last_ps_hash,bytes,dropped_regions,submission_gpu_us,attachment_load_mask,attachment_store_mask,alpha_test_draws,no_fragment_requested_draws,eligible_no_fragment_draws,nonindexed_vertices,index_elements,first_vs_hash,first_ps_hash,snapshot_draws,snapshot_upload_ranges,snapshot_upload_bytes\n", out);
                 fprintf(stderr, "[gpu-pass] output %s (%s); ordered GPU intervals, sampled frames may be perturbed; no readbacks or waits\n",
                     path.string().c_str(), out ? "ready" : "FAILED");
                 return out;
@@ -769,12 +772,16 @@ namespace gpu::renderer
                 if (us < 0) ++unavailable; else total += us;
                 if (csv && rows < 40000)
                 {
-                    fprintf(csv, "%llu,%llu,%u,%u,%s,%d,%.3f,%.3f,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%016llx,%llu,%u,%.3f,%u,%u,%u\n",
+                    fprintf(csv, "%llu,%llu,%u,%u,%s,%d,%.3f,%.3f,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%016llx,%llu,%u,%.3f,%u,%u,%u,%u,%u,%llu,%llu,%016llx,%016llx,%u,%u,%llu\n",
                         (unsigned long long)region.frame, (unsigned long long)submission, index, i, region.kind,
                         ready ? 0 : int(status == VK_SUCCESS ? VK_NOT_READY : status), us, gap,
                         region.width, region.height, region.base, region.format, region.depthBase, region.colorMask,
                         region.draws, region.depthOnlyDraws, (unsigned long long)region.vs, (unsigned long long)region.ps,
-                        (unsigned long long)region.bytes, slot.ledger.dropped, submissionUs, region.loadMask, region.storeMask, region.alphaDraws);
+                        (unsigned long long)region.bytes, slot.ledger.dropped, submissionUs, region.loadMask, region.storeMask, region.alphaDraws,
+                        region.noFragmentDraws, region.eligibleDepthDraws,
+                        (unsigned long long)region.vertices, (unsigned long long)region.indices,
+                        (unsigned long long)region.firstVs, (unsigned long long)region.firstPs,
+                        region.snapshotDraws, region.snapshotRanges, (unsigned long long)region.snapshotBytes);
                     ++rows;
                 }
                 last = ts[2]; lastReady = ready;
@@ -1497,6 +1504,7 @@ namespace gpu::renderer
         // get this empty one instead of the guest's bound one, left over from
         // earlier draws. NFSMW_DEPTH_ONLY_PS=1 runs the bound one, as up to
         // v0.1.2 (A/B only).
+        bool s_depthStageReduction = false;
         constexpr uint64_t kDepthOnlyPsHash = 0xDE97400000000001ull;  // (a guest shader hashing to it: a 2^-64 chance)
         const bool s_depthOnlyGuestPs = [] { const char* v = std::getenv("NFSMW_DEPTH_ONLY_PS"); return v && v[0] == '1'; }();
 
@@ -1790,14 +1798,14 @@ namespace gpu::renderer
             return std::format("#define VERTEX_PRIMITIVE_MODE {}\n", primitiveMode);
         }
 
-        VkShaderModule VertexModule(Shader& vs, uint32_t primitiveMode, bool legacySpirv = false)
+        VkShaderModule VertexModule(Shader& vs, uint32_t primitiveMode, bool legacySpirv = false, bool positionOnly = false)
         {
-            uint32_t key = primitiveMode | (legacySpirv ? 4u : 0u);
+            uint32_t key = primitiveMode | (legacySpirv ? 4u : 0u) | (positionOnly ? 8u : 0u);
             std::lock_guard lock(vs.compileMutex);
             if (auto it = vs.vertices.find(key); it != vs.vertices.end())
                 return it->second;
             std::string log;
-            auto spirv = CompileGlsl(vs.info.glsl, GLSLANG_STAGE_VERTEX, log, VertexPreamble(primitiveMode), legacySpirv);
+            auto spirv = CompileGlsl(vs.info.glsl, GLSLANG_STAGE_VERTEX, log, VertexPreamble(primitiveMode) + (positionOnly ? "#define POSITION_ONLY\n" : ""), legacySpirv);
             VkShaderModule module = VK_NULL_HANDLE;
             if (spirv.empty())
                 fprintf(stderr, "[renderer] vs_%016llx (primitive %u): GLSL compile failed:\n%s\n",
@@ -2840,7 +2848,8 @@ namespace gpu::renderer
                     if (ec) ok = false;
                 }
             };
-            shader(vs, GLSLANG_STAGE_VERTEX, VertexPreamble(key.primitiveMode), ".vert");
+            shader(vs, GLSLANG_STAGE_VERTEX, VertexPreamble(key.primitiveMode) +
+                ((s_depthStageReduction && (key.raster & 128u)) ? "#define POSITION_ONLY\n" : ""), ".vert");
             shader(ps, GLSLANG_STAGE_FRAGMENT, PixelPreamble(outputs, inputs, (key.raster >> 5) & 1, (key.raster >> 6) & 1), ".frag");
             auto state = std::format("result={}\nvs={:016x}\nps={:016x}\ntopology={}\nrestart={}\ncolorFormats={},{},{},{}\ndepthFormat={}\nraster={:08x}\ndepthControl={:08x}\ncolorMask={:08x}\noutputs={:x}\ninputs={:x}\nblend={:08x},{:08x},{:08x},{:08x}\n",
                 int(result), key.vs, key.ps, key.topology, key.restart,
@@ -2859,7 +2868,9 @@ namespace gpu::renderer
         // locked modules and the (internally synchronized) pipeline cache.
         VkPipeline BuildPipeline(const PipelineKey& key, VkPipelineLayout layout, Shader& vs, Shader& ps)
         {
-            VkShaderModule vsModule = VertexModule(vs, key.primitiveMode);
+            const bool noFragment = (key.raster & 128u) != 0;
+            const bool positionOnly = s_depthStageReduction && noFragment;
+            VkShaderModule vsModule = VertexModule(vs, key.primitiveMode, false, positionOnly);
             if (!vsModule)
                 return VK_NULL_HANDLE;
             VkPipelineShaderStageCreateInfo stages[2]{};
@@ -2867,11 +2878,10 @@ namespace gpu::renderer
                 vsModule, "main", nullptr };
             uint32_t outputs = 0;
             for (int i = 0; i < 4; i++)
-                if (key.colorFormats[i] != 0)
+                if (key.colorFormats[i] != 0 && (!s_depthStageReduction || key.colorMask != 0))
                     outputs |= 1u << i;
             uint32_t psRegs = std::min(16u, ps.info.registerCount);
-            uint32_t inputs = vs.info.interpolatorMask & ((1u << psRegs) - 1);
-            const bool noFragment = (key.raster & 128u) != 0;
+            uint32_t inputs = positionOnly ? 0u : vs.info.interpolatorMask & ((1u << psRegs) - 1);
             VkShaderModule psModule = noFragment ? VK_NULL_HANDLE : PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1, false, (key.raster >> 6) & 1);
             if (!noFragment && !psModule)
                 return VK_NULL_HANDLE;
@@ -2998,7 +3008,7 @@ namespace gpu::renderer
                     (unsigned long long)key.vs, (unsigned long long)key.ps);
                 if (pipeline) vkDestroyPipeline(s_dev, pipeline, nullptr);
                 pipeline = VK_NULL_HANDLE;
-                stages[0].module = VertexModule(vs, key.primitiveMode, true);
+                stages[0].module = VertexModule(vs, key.primitiveMode, true, positionOnly);
                 stages[1].module = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1, true, (key.raster >> 6) & 1);
                 if (stages[0].module && stages[1].module)
                 {
@@ -7314,6 +7324,10 @@ void main()
     bool Initialize(const uint32_t* regs)
     {
         gpu::g_workReductionEnabled = settings::GetBool(settings::Id::GpuWorkReduction);
+        gpu::g_predicateCoalescingEnabled = settings::GetBool(settings::Id::PredicateCoalescing);
+        s_depthStageReduction = settings::GetBool(settings::Id::DepthStageReduction);
+        fprintf(stderr, "[renderer] predicate coalescing=%d depth stage reduction=%d\n",
+            gpu::g_predicateCoalescingEnabled, s_depthStageReduction);
         fprintf(stderr, "[renderer] GPU work reduction %s (early depth, texture reciprocals, 1x resolve lanes)\n",
             gpu::g_workReductionEnabled ? "on" : "off");
         s_vk = video::GetVulkan();
@@ -7566,6 +7580,17 @@ void main()
             if (!slot->info.ok)
                 fprintf(stderr, "[renderer] %s_%016llx: translation failed: %s\n", type == 0 ? "vs" : "ps",
                     (unsigned long long)h, slot->info.error.c_str());
+#ifdef __ANDROID__
+            static uint32_t metadataRows = 0;
+            if (slot->info.ok && metadataRows++ < 512) {
+                const auto& info = slot->info;
+                fprintf(stderr, "[shader-meta] %s_%016llx regs=%u interpolators=%04x colors=%x kill=%d depth_export=%d memexport=%d vfetch=%08x textures=%08x/%08x/%08x predicated_instructions=%u instruction_predicate_blocks=%u\n",
+                    type == 0 ? "vs" : "ps", (unsigned long long)h, info.registerCount,
+                    info.interpolatorMask, info.colorTargetMask, info.usesKill, info.writesDepth, info.usesMemExport,
+                    info.vertexFetchMask, info.texture2DMask, info.texture3DMask, info.textureCubeMask,
+                    info.predicatedInstructions, info.predicateBlocks);
+            }
+#endif
             // Compiled to SPIR-V with its first pipeline, on a pipeline worker.
         }
         if (e)
@@ -7967,7 +7992,10 @@ void main()
                 s_ps->info.writesDepth, s_ps->info.usesMemExport, !s_zpdOpen.Empty()))
             key.raster |= 64u;
 
-        if (gpu::g_workReductionEnabled && key.ps == kDepthOnlyPsHash && key.colorMask == 0)
+        if (gpu::CanOmitFragmentStage(key.colorMask, alphaTest, s_ps->info.usesKill,
+                s_ps->info.writesDepth, s_ps->info.usesMemExport, s_vs->info.usesMemExport) &&
+            (s_depthStageReduction ||
+             (gpu::g_workReductionEnabled && key.ps == kDepthOnlyPsHash)))
             key.raster |= 128u;  // Native depth/stencil, with no fragment shader stage.
 
         bool pipelinePending;
@@ -9200,7 +9228,14 @@ void main()
         if (s_timedPass >= 0)
         {
             auto& timed = s_timedSlots[s_slot].regions[s_timedPass];
+            if (!timed.draws) { timed.firstVs = s_vs->hash; timed.firstPs = s_ps->hash; }
             ++timed.draws;
+            timed.noFragmentDraws += (key.raster & 128u) != 0;
+            timed.eligibleDepthDraws += gpu::CanOmitFragmentStage(key.colorMask, alphaTest,
+                s_ps->info.usesKill, s_ps->info.writesDepth, s_ps->info.usesMemExport, s_vs->info.usesMemExport);
+            if (useIndices) timed.indices += vertexCount; else timed.vertices += vertexCount;
+            timed.snapshotDraws += copyCount != 0;
+            timed.snapshotRanges += copyCount; timed.snapshotBytes += copyBytes;
             timed.vs = s_vs->hash; timed.ps = s_ps->hash;
             timed.depthOnlyDraws += s_ps->hash == kDepthOnlyPsHash;
             timed.alphaDraws += pc.alphaTest != 7u;
@@ -9251,7 +9286,17 @@ void main()
             {
                 const gpu::bars::Rect& r = barPlan.rects[i];
                 setScissor(VkRect2D{ { r.x0, r.y0 }, { uint32_t(r.x1 - r.x0), uint32_t(r.y1 - r.y0) } });
-                if (s_timedPass >= 0) ++s_timedSlots[s_slot].regions[s_timedPass].draws;
+                if (s_timedPass >= 0) {
+                    auto& timed = s_timedSlots[s_slot].regions[s_timedPass];
+                    ++timed.draws;
+                    timed.snapshotDraws += copyCount != 0;
+                    timed.noFragmentDraws += (key.raster & 128u) != 0;
+                    timed.eligibleDepthDraws += gpu::CanOmitFragmentStage(key.colorMask, alphaTest,
+                        s_ps->info.usesKill, s_ps->info.writesDepth, s_ps->info.usesMemExport, s_vs->info.usesMemExport);
+                    if (useIndices) timed.indices += vertexCount; else timed.vertices += vertexCount;
+                    timed.depthOnlyDraws += s_ps->hash == kDepthOnlyPsHash;
+                    timed.alphaDraws += pc.alphaTest != 7u;
+                }
                 if (useIndices)
                     vkCmdDrawIndexed(s_cmd, vertexCount, 1, 0, 0, 0);
                 else

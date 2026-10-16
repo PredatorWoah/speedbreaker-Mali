@@ -177,3 +177,6 @@ sb_test(android_schedule_test)
 
 # GPU work-reduction safety boundaries and Android focus/background ordering.
 sb_test(gpu_work_reduction_test)
+
+sb_test(depth_stage_test)
+sb_test(shader_predicate_test SOURCES ${RT}/gpu/shader_translator.cpp ${RT}/gpu/xenos/ucode.cpp)

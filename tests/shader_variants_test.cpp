@@ -76,6 +76,8 @@ int main(int argc, char** argv)
             source.insert(pos + 1, "#define VERTEX_PRIMITIVE_MODE " + std::to_string(mode) + "\n");
             out << source;
             assert(out.good());
+            source.insert(source.find('\n') + 1, "#define POSITION_ONLY\n");
+            std::ofstream(std::filesystem::path(argv[1]) / ("position" + std::to_string(mode) + ".vert")) << source;
         }
         auto source = ps.glsl;
         source.insert(source.find('\n') + 1, "#define OUT0 1\n");
