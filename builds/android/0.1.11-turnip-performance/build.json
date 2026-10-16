@@ -1,0 +1,38 @@
+{
+  "version": "0.1.11",
+  "version_code": 12,
+  "source_commit": "53fcdf587c91aea76cfdd077735ed23a134109b2",
+  "build_id": "fce54df293c9c7a1768e34a73e86b465393d7607",
+  "mapping_count": 56736,
+  "apk_sha256": "b04e0640b2022d7937b031370cf2fb5c5f452fb1d18c840e9f093676402e3045",
+  "apk_size_bytes": 21090242,
+  "certificate_sha256": "29ebbb37c610217ff00755e3731df6a1db46eda4cec45555157704ab545902bf",
+  "packaged_libraries": [
+    "lib/arm64-v8a/libSDL3.so",
+    "lib/arm64-v8a/libc++_shared.so",
+    "lib/arm64-v8a/libfile_redirect_hook.so",
+    "lib/arm64-v8a/libgsl_alloc_hook.so",
+    "lib/arm64-v8a/libhook_impl.so",
+    "lib/arm64-v8a/libmain.so",
+    "lib/arm64-v8a/libmain_hook.so"
+  ],
+  "host_suites": 44,
+  "shader_modules_validated": 94,
+  "device_execution": false,
+  "library_file_id": "libfile_b94d32e1658081919f2530caa9f9fec7",
+  "apk_filename": "SpeedBreaker-One-arm64-0.1.11-turnip-performance.apk",
+  "ndk": "28.2.13676358",
+  "abi": "arm64-v8a",
+  "configuration": "RelWithDebInfo (-O2)",
+  "renderer_options": {
+    "predicate_coalescing": true,
+    "depth_stage_reduction": true
+  },
+  "default_driver": "System",
+  "turnip_device_execution": false,
+  "dependencies": {
+    "libadrenotools": "8fae8ce254dfc1344527e05301e43f37dea2df80",
+    "liblinkernsbypass": "aa3975893d83ef1bc84c321ec60c65fbf1287887",
+    "volk": "43c29e655cb8117fd9cfb65ad9cefe2d40965102"
+  }
+}

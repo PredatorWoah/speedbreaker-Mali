@@ -386,3 +386,15 @@ counts are included in diagnostics. No custom driver is redistributed.
 synthetic SPIR-V variants pass. Full ARM64 link succeeds. Device gains/Turnip
 compatibility remain untested; hardware vertex-input conversion remains later.
 See ANDROID_PERFORMANCE_0111.md for invariants, hypotheses, rollback and next test.
+
+### 0.1.11 signed APK completed
+
+Clean source 53fcdf5, Android/native 0.1.11 code 12. Full optimized
+ARM64 runtime and all 56,736 mapping entries verified. Seven packaged libraries
+match staging, including four driver hooks; Vulkan dispatch symbols are hidden
+and no direct system-libvulkan import remains. Signature/certificate, ZIP,
+alignment, manifest/version/ABI/debug access and notices pass.
+APK SHA256 b04e0640b2022d7937b031370cf2fb5c5f452fb1d18c840e9f093676402e3045;
+native Build ID fce54df293c9c7a1768e34a73e86b465393d7607.
+Retained 0.1.10 checksum unchanged. Build record under
+builds/android/0.1.11-turnip-performance/. No RP6 execution or gain verified.
