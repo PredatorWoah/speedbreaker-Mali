@@ -346,3 +346,23 @@ ZIP, alignment, version/ABI/debug access and retained v2 certificate pass.
 APK SHA256 f2e359ccf87c6f25216ace118e3905386d1d1bbdd65a02c5e4ce37b366d8371e;
 native Build ID 540ce9a82e58fcc24d1a932c2020ea336276174b. Build record under
 builds/android/0.1.10-android-gpu-timing/. No RP6 execution or gain verified.
+
+
+## 0.1.10 RP6 measurements and 60 FPS investigation — October 16
+
+Device capture validates pass sampling (24 frames, 1,145 rows, no missing or
+dropped queries), stable single swapchain creation and Home suspension. Warmed
+GPU cost remains ~33.6 ms per aggregate sample; no controlled old/new delta.
+Color rendering ~25.9 ms, depth-only ~5.0 ms, resolves ~3.5 ms per sampled frame.
+Detailed fixed-size pass analysis and native reference audit point to vertex
+fetch/input, shader predicate control flow, safe depth-only stage elimination
+and guarded overdraw work. CPU hitch-subset core times also approach the budget.
+
+Confirmed an offline compiler issue: nine separate same-predicate sample blocks
+remain nine branches after our optimizer; one shared block gives one branch,
+retaining all nine samples. Eight Vulkan 1.1/1.2 probe modules compile/validate.
+Reproduction script scripts/analysis/probe_predicate_codegen.py is synthetic,
+not a hot game shader, Adreno cycle test or FPS claim. Full implementation plan,
+reference/settings audit, safeguards and acceptance criteria are in
+ANDROID_60FPS_INVESTIGATION.md. No production renderer change or new APK from
+this investigation; 0.1.10 remains the retained device baseline.

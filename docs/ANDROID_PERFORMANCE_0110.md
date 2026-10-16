@@ -101,3 +101,14 @@ Next device test: one install, warm same Quick Race, drive two minutes, repeat
 with async off if desired, then type done. Return the archive plus FPS/GPU/hitch
 observations. Require GPU-pass CSV rows and [surface-health] stable creation
 counts before declaring measurement complete. Preserve 0.1.9 as rollback.
+
+
+## RP6 result received October 16
+
+24 sampled frames / 1,145 operation rows, zero unavailable/overflow. Actual
+per-slot timings work. Surface creation count stays one despite >4,400 persistent
+reports; repeated reconstruction is fixed. Focus loss then suspension/pause/stop
+is captured. Async remained on. Warming hitch reports rarely contain pipeline
+work. Aggregate complex-window GPU median remains 33.6 ms; no matched speed delta.
+See ANDROID_60FPS_INVESTIGATION.md for pass attribution, compiler probes and a
+ranked implementation plan. No additional APK was produced for that investigation.
