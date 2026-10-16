@@ -67,6 +67,8 @@ namespace settings
         PerformanceOverlay,
         GpuScheduling,
         GpuWorkReduction,
+        PredicateCoalescing,
+        DepthStageReduction,
         Count
     };
     constexpr size_t kCount = size_t(Id::Count);

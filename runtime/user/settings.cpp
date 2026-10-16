@@ -226,6 +226,14 @@ namespace settings
               .table = "advanced", .key = "gpu_work_reduction", .label = "GPU Work Reduction",
               .description = "Reduce graphics overhead while retaining image quality. Restart after changing this setting to compare with the previous rendering paths.",
               .env = "SB_GPU_WORK_REDUCTION", .defaultValue = kGpuWorkDefault },
+            { .id = Id::PredicateCoalescing, .category = Category::Advanced, .type = Type::Bool, .apply = Apply::Restart, .hidden = kGpuSchedulingHidden,
+              .table = "advanced", .key = "predicate_coalescing", .label = "Shader Predicate Coalescing",
+              .description = "Combine repeated shader conditions without changing samples or arithmetic. Restart to compare.",
+              .env = "SB_PREDICATE_COALESCING", .defaultValue = kGpuWorkDefault },
+            { .id = Id::DepthStageReduction, .category = Category::Advanced, .type = Type::Bool, .apply = Apply::Restart, .hidden = kGpuSchedulingHidden,
+              .table = "advanced", .key = "depth_stage_reduction", .label = "Depth Stage Reduction",
+              .description = "Remove unused shader outputs and safe fragment stages from depth draws. Keeps alpha-tested casters. Restart to compare.",
+              .env = "SB_DEPTH_STAGE_REDUCTION", .defaultValue = kGpuWorkDefault },
         };
         static_assert(std::size(kOptions) == kCount, "one row per settings::Id");
 

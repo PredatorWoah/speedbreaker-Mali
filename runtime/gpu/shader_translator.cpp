@@ -18,6 +18,7 @@
 namespace gpu
 {
     bool g_workReductionEnabled = true;
+    bool g_predicateCoalescingEnabled = true;
 
     using namespace xe::gpu;
     using namespace xe::gpu::ucode;
@@ -143,6 +144,30 @@ float xmul(float a, float b)
             TranslatedShader out;
             std::string body;
             int indent = 1;
+            int openPredicate = -1;
+
+            void ClosePredicate()
+            {
+                if (openPredicate < 0) return;
+                --indent;
+                Line("}");
+                openPredicate = -1;
+            }
+
+            void Predicate(bool enabled, bool condition)
+            {
+                out.predicatedInstructions += enabled;
+                int desired = enabled ? int(condition) : -1;
+                if (!g_predicateCoalescingEnabled || openPredicate != desired)
+                    ClosePredicate();
+                if (desired >= 0 && openPredicate < 0)
+                {
+                    Line(std::format("if (p0 == {}) {{", condition ? "true" : "false"));
+                    ++indent;
+                    ++out.predicateBlocks;
+                    openPredicate = desired;
+                }
+            }
             bool usesRelativeRegisters = false;
             uint32_t maxRegister = 0;
 
@@ -428,11 +453,7 @@ float xmul(float a, float b)
                 if (!vecNeeded && !scaNeeded && !zeroMask && !oneMask)
                     return;
 
-                if (op.is_predicated())
-                {
-                    Line(std::format("if (p0 == {}) {{", op.predicate_condition() ? "true" : "false"));
-                    indent++;
-                }
+                Predicate(op.is_predicated(), op.predicate_condition());
                 // Both operations read the registers as they were before the
                 // instruction: compute into temporaries, then store.
                 Line("{");
@@ -481,11 +502,7 @@ float xmul(float a, float b)
                 }
                 indent--;
                 Line("}");
-                if (op.is_predicated())
-                {
-                    indent--;
-                    Line("}");
-                }
+                if (!g_predicateCoalescingEnabled || vinfo.changed_state || sinfo.changed_state) ClosePredicate();
             }
 
             // Destination swizzle for fetches: 3 bits per component.
@@ -511,11 +528,7 @@ float xmul(float a, float b)
                 out.vertexFetchMask |= 1u << (slot / 3);
                 out.vertexFetchConstants[slot / 32] |= 1u << (slot % 32);
 
-                if (op.is_predicated())
-                {
-                    Line(std::format("if (p0 == {}) {{", op.predicate_condition() ? "true" : "false"));
-                    indent++;
-                }
+                Predicate(op.is_predicated(), op.predicate_condition());
                 Line("{");
                 indent++;
                 std::string index = Reg(full.src(), full.is_src_relative()) + "." + kComp[full.src_swizzle() & 3];
@@ -624,17 +637,14 @@ float xmul(float a, float b)
                 StoreFetchResult(op.dest(), op.is_dest_relative(), op.dest_swizzle(), "vdata");
                 indent--;
                 Line("}");
-                if (op.is_predicated())
-                {
-                    indent--;
-                    Line("}");
-                }
+                if (!g_predicateCoalescingEnabled) ClosePredicate();
             }
 
             void TextureFetch(const TextureFetchInstruction& op)
             {
                 if (op.opcode() == FetchOpcode::kSetTextureLod)
                 {
+                    ClosePredicate();
                     Line("texLod = " + Reg(op.src(), op.is_src_relative()) + "." + kComp[op.src_swizzle() & 3] + ";");
                     return;
                 }
@@ -644,11 +654,7 @@ float xmul(float a, float b)
                     return;
                 }
                 uint32_t slot = op.fetch_constant_index();
-                if (op.is_predicated())
-                {
-                    Line(std::format("if (p0 == {}) {{", op.predicate_condition() ? "true" : "false"));
-                    indent++;
-                }
+                Predicate(op.is_predicated(), op.predicate_condition());
                 Line("{");
                 indent++;
                 std::string src = Reg(op.src(), op.is_src_relative());
@@ -713,11 +719,7 @@ float xmul(float a, float b)
                 StoreFetchResult(op.dest(), op.is_dest_relative(), op.dest_swizzle(), "tdata");
                 indent--;
                 Line("}");
-                if (op.is_predicated())
-                {
-                    indent--;
-                    Line("}");
-                }
+                if (!g_predicateCoalescingEnabled) ClosePredicate();
             }
 
             template<typename T>
@@ -730,6 +732,7 @@ float xmul(float a, float b)
                     if (size_t(exec.address() + k) * 3 + 3 > dwords)
                     {
                         Error("instruction address outside the shader");
+                        ClosePredicate();
                         return;
                     }
                     if (seq & 1)
@@ -745,6 +748,8 @@ float xmul(float a, float b)
                         Alu(*reinterpret_cast<const AluInstruction*>(op));
                     }
                 }
+                // Never carry an instruction predicate through an EXEC/CF edge.
+                ClosePredicate();
             }
 
             void Translate()
@@ -1069,7 +1074,7 @@ vec3 cubeDirection(vec3 c)
             // one costs vertex output bandwidth (a lot on tile-based GPUs).
             for (uint32_t i = 0; i < 16; i++)
                 if (result.interpolatorMask & (1u << i))
-                    g += std::format("layout(location = {0}) out vec4 o_i{0};\n", i);
+                    g += std::format("#ifndef POSITION_ONLY\nlayout(location = {0}) out vec4 o_i{0};\n#endif\n", i);
             g += "vec4 o_interpT[16];\n";
             g += "out gl_PerVertex { invariant vec4 gl_Position; float gl_PointSize; };\n";
         }
@@ -1252,8 +1257,8 @@ void main()
             for (uint32_t i = 0; i < 16; i++)
                 if (result.interpolatorMask & (1u << i))
                 {
-                    outs += std::format("    o_i{0} = it[{0}];\n", i);
-                    directOuts += std::format("    o_i{0} = o_interpT[{0}];\n", i);
+                    outs += std::format("#ifndef POSITION_ONLY\n    o_i{0} = it[{0}];\n#endif\n", i);
+                    directOuts += std::format("#ifndef POSITION_ONLY\n    o_i{0} = o_interpT[{0}];\n#endif\n", i);
                 }
             size_t at = g.find("@@VS_OUTPUTS@@");
             g.replace(at, strlen("@@VS_OUTPUTS@@"), outs);
