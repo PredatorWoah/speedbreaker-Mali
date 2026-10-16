@@ -335,3 +335,14 @@ reduction. Existing asynchronous-shader preference and loading waits remain.
 Collector verifies current pass output, snapshots settings/version/thermal state,
 and automatically presses Home for a ten-second background check after done.
 See ANDROID_PERFORMANCE_0110.md for invariants, limits and falsification tests.
+
+
+### 0.1.10 signed APK completed
+
+Clean compiled source 56d3fb6, Android/native 0.1.10 code 11. Full optimized ARM64
+runtime, all 56,736 mapping entries (56,146 sub_* game functions plus register
+helpers), new diagnostic markers and packaged library byte identity verified.
+ZIP, alignment, version/ABI/debug access and retained v2 certificate pass.
+APK SHA256 f2e359ccf87c6f25216ace118e3905386d1d1bbdd65a02c5e4ce37b366d8371e;
+native Build ID 540ce9a82e58fcc24d1a932c2020ea336276174b. Build record under
+builds/android/0.1.10-android-gpu-timing/. No RP6 execution or gain verified.
