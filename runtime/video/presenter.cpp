@@ -173,11 +173,20 @@ namespace video
         // watched after a resume, a size event or a new swapchain,
         // SUBOPTIMAL/OUT_OF_DATE followed, SDL's view fitted back to its
         // window on iOS, and no portrait swapchain on a landscape iPhone.
+#ifdef __ANDROID__
+        SwapchainPolicy s_swapPolicy{ AndroidSwapchainRules([] {
+            const char* v = std::getenv("SB_ANDROID_SUBOPTIMAL_REBUILD");
+            return v && v[0] == '1';
+        }()) };
+#else
         SwapchainPolicy s_swapPolicy;
+#endif
         // What the next CreateSwapchain is for (its log line), and how many
         // rebuilds at an unchanged size have been logged.
         const char* s_swapReason = nullptr;
         int s_sameSizeLogged = 0;
+        uint64_t s_swapCreations = 0, s_suboptimalReports = 0;
+        double s_swapRebuildMs = 0;
         // Bug-report screenshots waiting for the next frame drawn (CaptureFrame).
         std::mutex s_captureMutex;
         std::vector<std::promise<CapturedFrame>> s_captureRequests;
@@ -667,6 +676,7 @@ namespace video
             info.clipped = VK_TRUE;
             if (!Check(vkCreateSwapchainKHR(s_device, &info, nullptr, &s_swapchain), "vkCreateSwapchainKHR"))
                 return false;
+            ++s_swapCreations;
             {
                 // Once per change: the V-Sync setting's effect, in the log.
                 static int logged = -1;
@@ -2650,11 +2660,13 @@ void main()
             }
             else if (d.action == SwapAction::Recreate)
             {
+                auto started = std::chrono::steady_clock::now();
                 WaitIdle();
                 DestroySwapchain();
                 s_swapReason = d.reason;
                 CreateSwapchain();  // at ChooseExtent of the surface then (d.extent, unless it moved since)
                 s_swapReason = nullptr;
+                s_swapRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
             }
         }
     }
@@ -2873,7 +2885,10 @@ void main()
         // Either is for the next frame's CheckSwapchain, which runs before
         // its acquire (one decision a frame: the policy counts in frames).
         if (acquire == VK_SUBOPTIMAL_KHR)
+        {
+            ++s_suboptimalReports;
             s_swapPolicy.Reported(SurfaceResult::Suboptimal);  // this frame is drawn and presented anyway
+        }
         if (acquire == VK_ERROR_OUT_OF_DATE_KHR)
         {
             s_swapPolicy.Reported(SurfaceResult::OutOfDate);
@@ -3385,7 +3400,20 @@ void main()
 #endif
         // The next frame's CheckSwapchain builds again (before its acquire).
         if (present == VK_ERROR_OUT_OF_DATE_KHR || present == VK_SUBOPTIMAL_KHR)
+        {
+            s_suboptimalReports += present == VK_SUBOPTIMAL_KHR;
             s_swapPolicy.Reported(present == VK_ERROR_OUT_OF_DATE_KHR ? SurfaceResult::OutOfDate : SurfaceResult::Suboptimal);
+        }
+#ifdef __ANDROID__
+        static auto lastSurfaceLog = std::chrono::steady_clock::now();
+        if (auto now = std::chrono::steady_clock::now(); now - lastSurfaceLog >= std::chrono::seconds(5))
+        {
+            fprintf(stderr, "[surface-health] creates %llu suboptimal_reports %llu policy_rebuild_ms %.3f follow_suboptimal %d (cumulative)\n",
+                (unsigned long long)s_swapCreations, (unsigned long long)s_suboptimalReports, s_swapRebuildMs,
+                int(s_swapPolicy.Rules().followSuboptimal));
+            lastSurfaceLog = now;
+        }
+#endif
         s_frameIndex = (s_frameIndex + 1) % FRAMES_IN_FLIGHT;
         return true;
     }

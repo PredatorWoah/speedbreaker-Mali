@@ -111,6 +111,16 @@ namespace video
         uint32_t repairPatience = 180;    // a view that won't fit: after this many frames the swapchain follows its layer anyway
     };
 
+    // Android deliberately leaves landscape rotation to the compositor.
+    // The resulting SUBOPTIMAL is persistent, not an unusable swapchain.
+    // Extent changes and OUT_OF_DATE still recreate normally.
+    inline SwapchainRules AndroidSwapchainRules(bool rebuildSuboptimal = false)
+    {
+        SwapchainRules rules;
+        rules.followSuboptimal = rebuildSuboptimal;
+        return rules;
+    }
+
     class SwapchainPolicy
     {
     public:

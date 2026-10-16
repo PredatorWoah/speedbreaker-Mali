@@ -465,8 +465,32 @@ static void Ui(float ww, float wh, Extent fb, float wantW, float wantH, float wa
     // The UI's own scale follows the display's height (ui.cpp UpdateScale).
 }
 
+static void AndroidPersistentSuboptimal()
+{
+    Screen s(AndroidSwapchainRules());
+    s.policy.Created(s.swapchain);
+    for (int i = 0; i < 10000; ++i)
+    {
+        s.policy.Reported(SurfaceResult::Suboptimal);
+        s.Frame();
+    }
+    CHECK(s.recreates == 0, "Android rotation SUBOPTIMAL: %d unnecessary recreates", s.recreates);
+    s.surface = { 1920, 1080 };
+    s.Run(61); // periodic extent check still catches a real resize
+    CHECK(s.recreates == 1 && s.swapchain == s.surface, "Android did not follow real resize");
+    s.policy.Reported(SurfaceResult::OutOfDate);
+    s.Frame();
+    CHECK(s.recreates == 2, "Android ignored OUT_OF_DATE");
+    s.Suspend(); s.surface = { 1280, 720 }; s.policy.SizeChanged(); s.Run(100);
+    CHECK(s.recreates == 2, "Android recreated while inactive");
+    s.Resume(); s.Frame();
+    CHECK(s.recreates == 3 && s.swapchain == s.surface, "Android failed to recover after resume");
+    CHECK(AndroidSwapchainRules(true).followSuboptimal, "Android rollback unavailable");
+}
+
 int main()
 {
+    AndroidPersistentSuboptimal();
     printf("ChooseExtent:\n");
     Choose(kLandscape, Orientation::Landscape, true, kLandscape, false);
     Choose(kPortrait, Orientation::Landscape, true, kLandscape, true);
