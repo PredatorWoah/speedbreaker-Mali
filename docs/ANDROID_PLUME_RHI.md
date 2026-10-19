@@ -1,5 +1,19 @@
 # Plume Vulkan implementation — Android 0.1.12
 
+## Native draw/image core — unshipped source checkpoint
+
+The core now has an explicit native draw entry, host shader/target handles,
+semantic image clears/copies, canonical readback and direct RGBA8 presentation.
+Native initialization has no CP register array and skips the legacy EDRAM resolve
+and front-buffer conversion pipelines. Existing Legacy/Plume rendering remains.
+
+50 host suites and six Release plus six Debug/ASan GPU/Legacy tests pass; the
+Android ARM64 runtime compiles and links. GPU tests validate the shared image
+commands, not the complete native renderer entry or game execution. See
+`ANDROID_NATIVE_RENDERER.md` for scope, invariants, evidence and exact gaps.
+Game calls, resource aliases/locks and native fence/query ownership are still
+unconnected. **Full native gameplay is incomplete; no new APK is packaged.**
+
 ## 0.1.15 native resource development checkpoint
 
 Game shader constructors and declaration patching now create immutable host

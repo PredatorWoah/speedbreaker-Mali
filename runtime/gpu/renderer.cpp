@@ -19,6 +19,8 @@
 #include "pipeline_cache_header.h"
 #include "shader_translator.h"
 #include "game_shader.h"
+#include "native_draw_state.h"
+#include "native_image_commands.h"
 #include "zpd_report.h"
 #include "visual_capture.h"
 #include <report/zip.h>
@@ -72,6 +74,19 @@ namespace gpu::renderer
         const video::VulkanContext* s_vk = nullptr;
         VkDevice s_dev = VK_NULL_HANDLE;
         const uint32_t* s_regs = nullptr;
+        const native_render::Draw* s_nativeDraw = nullptr;
+        bool s_nativeMode = false;
+        std::thread::id s_nativeOwner;
+        const uint32_t* StateWords(uint32_t index, uint32_t count = 1)
+        {
+            if (s_nativeDraw) return s_nativeDraw->state.Words(index, count);
+            if (!s_regs) throw std::logic_error("renderer state unavailable");
+            return s_regs + index;
+        }
+        uint32_t StateWord(uint32_t index)
+        {
+            return s_nativeDraw ? s_nativeDraw->state.Word(index) : *StateWords(index);
+        }
         PFN_vkCmdPushDescriptorSetKHR s_pushDescriptorSet = nullptr;
         Stats s_stats{};
         // NFSMW_GPU_EXP bitmask, for performance experiments: 1 skip draw
@@ -118,7 +133,8 @@ namespace gpu::renderer
         float RegF(uint32_t index)
         {
             float f;
-            memcpy(&f, &s_regs[index], 4);
+            const uint32_t value = StateWord(index);
+            memcpy(&f, &value, 4);
             return f;
         }
 
@@ -126,7 +142,7 @@ namespace gpu::renderer
         T Reg()
         {
             T t;
-            t.value = s_regs[T::register_index];
+            t.value = StateWord(T::register_index);
             return t;
         }
 
@@ -134,7 +150,7 @@ namespace gpu::renderer
         T RegAt(uint32_t index)
         {
             T t;
-            t.value = s_regs[index];
+            t.value = StateWord(index);
             return t;
         }
 
@@ -1525,6 +1541,7 @@ namespace gpu::renderer
             std::unordered_map<uint32_t, VkShaderModule> variants;
         };
         std::unordered_map<uint64_t, std::unique_ptr<Shader>> s_shaders;
+        std::unordered_map<uint64_t, std::unique_ptr<Shader>> s_nativeShaders;
         Shader* s_vs = nullptr;
         Shader* s_ps = nullptr;
 
@@ -1971,6 +1988,7 @@ namespace gpu::renderer
             VkFormat vkFormat;
             bool blendable;
             Image image;
+            std::unordered_map<uint32_t,VkImageView> nativeViews;
             VkImageView sampleView = VK_NULL_HANDLE;  // depth aspect only, for resolves
             // NFSMW_UNTILED_AREA: in the last frame untiled draws drew it (until
             // the next one's first), whether one was cut short of the
@@ -2208,7 +2226,7 @@ namespace gpu::renderer
 
         // A new target, at the current scale if its pitch is a scaled one,
         // cleared to zero (new EDRAM contents).
-        std::unique_ptr<RenderTarget> CreateTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch, bool wide)
+        std::unique_ptr<RenderTarget> CreateTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch, bool wide, uint32_t nativeHeight = 0)
         {
             // Height: whatever fits in EDRAM (2048 tiles of 80x16 32-bit
             // samples) from this base, capped at the 2048-line maximum.
@@ -2222,8 +2240,8 @@ namespace gpu::renderer
             rt->depth = depth;
             rt->wide = wide;
             rt->guestWidth = wide ? kUntiledWidth : pitch;
-            rt->guestHeight = rows;
-            if (ScaledPitch(pitch))
+            rt->guestHeight = nativeHeight ? nativeHeight : rows;
+            if (!nativeHeight && ScaledPitch(pitch))
                 rt->scale = s_renderScale;
             // (Rounded up: a pitch that isn't whole blocks at 1.5x still
             // has room for its last host column.)
@@ -2271,8 +2289,8 @@ namespace gpu::renderer
             TimingEnd(clearTiming);
             FullBarrier();
 
-            fprintf(stderr, "[renderer] EDRAM target: base %u %s format %u pitch %u -> %ux%u%s\n",
-                base, depth ? "depth" : "color", format, pitch, rt->guestWidth, rt->guestHeight,
+            fprintf(stderr, "[renderer] %s target: base %u %s format %u pitch %u -> %ux%u%s\n",
+                nativeHeight ? "native" : "EDRAM", base, depth ? "depth" : "color", format, pitch, rt->guestWidth, rt->guestHeight,
                 !rt->scale.IsOne() ? std::format(" (host {}x{})", rt->width, rt->height).c_str() : "");
             return rt;
         }
@@ -2282,6 +2300,8 @@ namespace gpu::renderer
             if (rt.sampleView && rt.sampleView != rt.image.view)
                 vkDestroyImageView(s_dev, rt.sampleView, nullptr);
             rt.sampleView = VK_NULL_HANDLE;
+            for (auto [swizzle,view] : rt.nativeViews) vkDestroyImageView(s_dev,view,nullptr);
+            rt.nativeViews.clear();
             DestroyImage(rt.image);
         }
 
@@ -2298,6 +2318,30 @@ namespace gpu::renderer
             if (!slot)
                 slot = CreateTarget(base, format, depth, pitch, wide);
             hit = { key, slot.get() };
+            return slot.get();
+        }
+
+        // Native handles include the game object's allocation generation. There
+        // is no EDRAM address in this cache, and a handle's description cannot
+        // change until explicitly destroyed after its submissions retire.
+        std::unordered_map<native_render::Handle, std::unique_ptr<RenderTarget>> s_nativeTargets;
+        RenderTarget* GetNativeTarget(const native_render::TargetDesc& desc)
+        {
+            if (!desc.handle) return nullptr;
+            if (!desc.width || !desc.height || desc.width > 16384 || desc.height > 16384)
+                throw std::invalid_argument("invalid native target extent");
+            VkPhysicalDeviceProperties properties;
+            vkGetPhysicalDeviceProperties(s_vk->physical,&properties);
+            if (desc.width>properties.limits.maxImageDimension2D || desc.height>properties.limits.maxImageDimension2D)
+                throw std::invalid_argument("native target exceeds device image limit");
+            if (desc.depth && desc.format>1) throw std::invalid_argument("invalid native depth format");
+            if (!desc.depth && !(desc.format<=7 || desc.format==10 || desc.format==12 || desc.format==14 || desc.format==15))
+                throw std::invalid_argument("invalid native color format");
+            auto& slot = s_nativeTargets[desc.handle];
+            if (!slot) slot = CreateTarget(0, desc.format, desc.depth, desc.width, false, desc.height);
+            if (slot->guestWidth != desc.width || slot->guestHeight != desc.height ||
+                slot->format != desc.format || slot->depth != desc.depth)
+                throw std::logic_error("native target handle reused with a different description");
             return slot.get();
         }
 
@@ -2739,7 +2783,7 @@ namespace gpu::renderer
                 for (uint32_t bits = vsMasks[d]; bits && why < 0; bits &= bits - 1)
                 {
                     xenos::xe_gpu_texture_fetch_t f;
-                    memcpy(&f, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + uint32_t(__builtin_ctz(bits)) * 6], sizeof(f));
+                    memcpy(&f, StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + uint32_t(__builtin_ctz(bits)) * 6), sizeof(f));
                     if (std::find(s_vertexPendingTextures.begin(), s_vertexPendingTextures.end(), (f.base_address << 12) & 0x1FFFFFFF) !=
                         s_vertexPendingTextures.end())
                         why = 2;
@@ -2747,7 +2791,7 @@ namespace gpu::renderer
             for (uint32_t word = 0; word < 3 && why < 0; word++)
                 for (uint32_t bits = s_vs->info.vertexFetchConstants[word]; bits && why < 0; bits &= bits - 1)
                 {
-                    const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + (word * 32 + uint32_t(__builtin_ctz(bits))) * 2];
+                    const uint32_t* vf = StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + (word * 32 + uint32_t(__builtin_ctz(bits))) * 2);
                     if (pending(vf[0] & 0x1FFFFFFC, ((vf[1] >> 2) & 0xFFFFFF) * 4))
                         why = 0;
                 }
@@ -3266,6 +3310,10 @@ namespace gpu::renderer
 
         Rect GuestScissor()
         {
+            if (s_nativeDraw) {
+                const auto& r=s_nativeDraw->state.scissor;
+                return {r.x0,r.y0,r.x1,r.y1};
+            }
             auto tl = Reg<reg::PA_SC_WINDOW_SCISSOR_TL>();
             auto br = Reg<reg::PA_SC_WINDOW_SCISSOR_BR>();
             Rect r{ int32_t(tl.tl_x), int32_t(tl.tl_y), int32_t(br.br_x), int32_t(br.br_y) };
@@ -4216,6 +4264,37 @@ void main()
         // tiled 2D slice, 4 KB-aligned (Xenia's GetGuestTextureLayout).
         enum class TexDim { k2D, k3D, kCube };
 
+        VkImageView NativeSampledView(uint32_t slot, TexDim dim, VkSampler& sampler)
+        {
+            if (slot >= 32 || dim != TexDim::k2D)
+                throw std::invalid_argument("native sampled target currently requires 2D view");
+            auto handle=s_nativeDraw->state.textures[slot];
+            auto it=s_nativeTargets.find(handle);
+            if (it==s_nativeTargets.end()) throw std::logic_error("unknown native sampled image");
+            auto& target=*it->second;
+            // End attachment writes before sampling, preserving ordered GPU
+            // residency without a tiled guest-memory store or re-upload.
+            if (s_passActive && (s_passDepth==&target ||
+                std::find(s_passColor,s_passColor+4,&target)!=s_passColor+4)) EndPass();
+            FlushPendingClears(&target);
+            xenos::xe_gpu_texture_fetch_t fetch;
+            memcpy(&fetch,StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0+slot*6,6),sizeof(fetch));
+            sampler=GetSampler(fetch,0);
+            auto& view=target.nativeViews[fetch.swizzle];
+            if (!view) {
+                auto component=[](uint32_t c) { return c<4 ? VkComponentSwizzle(VK_COMPONENT_SWIZZLE_R+c) :
+                    c==4 ? VK_COMPONENT_SWIZZLE_ZERO : c==5 ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_IDENTITY; };
+                VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                info.image=target.image.image;info.viewType=VK_IMAGE_VIEW_TYPE_2D;info.format=target.vkFormat;
+                info.components={component(fetch.swizzle&7),component((fetch.swizzle>>3)&7),
+                    component((fetch.swizzle>>6)&7),component((fetch.swizzle>>9)&7)};
+                info.subresourceRange={target.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+                Check(vkCreateImageView(s_dev,&info,nullptr,&view),"vkCreateImageView(native sampled target)");
+                s_textureViewExtents[view]={target.width,target.height};
+            }
+            return view;
+        }
+
         // What a lookup's result depends on beyond the fetch constant (for
         // the lookup cache below). `texture`: null when it isn't kept (a
         // placeholder, a scaled texture).
@@ -4231,7 +4310,7 @@ void main()
         {
             const bool cube = dim == TexDim::kCube, volume = dim == TexDim::k3D;
             xenos::xe_gpu_texture_fetch_t f;
-            memcpy(&f, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6], sizeof(f));
+            memcpy(&f, StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6), sizeof(f));
             sampler = s_sampler;
             const VkImageView dummy = s_dummy[cube ? 2 : volume ? 1 : 0].view;
             if (f.type != xenos::FetchConstantType::kTexture)
@@ -4282,9 +4361,9 @@ void main()
             {
                 s_drawUsesLoggedTexture = true;
                 s_loggedTextureFetch = std::format("slot {} dim {} fetch {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}", slot, int(dim),
-                    s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6], s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6 + 1],
-                    s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6 + 2], s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6 + 3],
-                    s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6 + 4], s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6 + 5]);
+                    StateWord(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6), StateWord(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6 + 1),
+                    StateWord(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6 + 2), StateWord(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6 + 3),
+                    StateWord(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6 + 4), StateWord(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6 + 5));
             }
             uint32_t pitchAligned = 0, rowBytes = 0, size;
             if (f.tiled)
@@ -4760,10 +4839,12 @@ void main()
 
         VkImageView GetTexture(uint32_t slot, TexDim dim, VkSampler& sampler)
         {
+            if (s_nativeDraw && slot<32 && s_nativeDraw->state.textures[slot])
+                return NativeSampledView(slot,dim,sampler);
             TextureCache& c = *s_textureCache;
             if (!c.on)
                 return LookupTexture(slot, dim, sampler, nullptr);
-            const uint32_t* fetch = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6];
+            const uint32_t* fetch = StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6);
             TextureCacheEntry& e = c.slots[uint32_t(dim)][slot & 31];
             const bool drawScaled = s_drawScaled && s_scaled.enabled;
             const uint64_t epoch = writewatch::WriteEpoch();
@@ -5232,7 +5313,7 @@ void main()
             VkClearAttachment ca{};
             if (rt->depth)
             {
-                uint32_t v = s_regs[XE_GPU_REG_RB_DEPTH_CLEAR];
+                uint32_t v = StateWord(XE_GPU_REG_RB_DEPTH_CLEAR);
                 ca.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
                 float depth;
                 if (xenos::DepthRenderTargetFormat(rt->format) == xenos::DepthRenderTargetFormat::kD24FS8)
@@ -5250,8 +5331,8 @@ void main()
             }
             else
             {
-                uint32_t lo = s_regs[XE_GPU_REG_RB_COLOR_CLEAR];
-                uint32_t hi = s_regs[XE_GPU_REG_RB_COLOR_CLEAR_LO];
+                uint32_t lo = StateWord(XE_GPU_REG_RB_COLOR_CLEAR);
+                uint32_t hi = StateWord(XE_GPU_REG_RB_COLOR_CLEAR_LO);
                 ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                 ca.colorAttachment = 0;
                 float* c = ca.clearValue.color.float32;
@@ -5559,8 +5640,8 @@ void main()
 
             // The rectangle comes from the three vertices in vertex fetch 0
             // (Direct3D 9 writes them with the CPU).
-            uint32_t fetch0 = s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
-            uint32_t fetch1 = s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_1];
+            uint32_t fetch0 = StateWord(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0);
+            uint32_t fetch1 = StateWord(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_1);
             uint32_t vertexAddress = fetch0 & 0x1FFFFFFC;
             uint32_t vertexEndian = fetch1 & 3;
             if ((fetch0 & 3) != 3 || ((fetch1 >> 2) & 0xFFFFFF) != 6)
@@ -5618,12 +5699,12 @@ void main()
                     "(fmt %u endian %u swap %u bias %d) | ctl %08X color %08X depth %08X clear c%08X d%08X\n",
                     r.x0, r.y0, r.x1, r.y1, wo.window_x_offset, wo.window_y_offset,
                     uint32_t(Reg<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable), copyControl.copy_src_select, pitch,
-                    uint32_t(surfaceInfo.msaa_samples), s_regs[XE_GPU_REG_RB_COPY_DEST_BASE],
+                    uint32_t(surfaceInfo.msaa_samples), StateWord(XE_GPU_REG_RB_COPY_DEST_BASE),
                     Reg<reg::RB_COPY_DEST_PITCH>().copy_dest_pitch, Reg<reg::RB_COPY_DEST_PITCH>().copy_dest_height,
-                    s_regs[XE_GPU_REG_RB_COPY_DEST_INFO], uint32_t(Reg<reg::RB_COPY_DEST_INFO>().copy_dest_format),
+                    StateWord(XE_GPU_REG_RB_COPY_DEST_INFO), uint32_t(Reg<reg::RB_COPY_DEST_INFO>().copy_dest_format),
                     uint32_t(Reg<reg::RB_COPY_DEST_INFO>().copy_dest_endian), uint32_t(Reg<reg::RB_COPY_DEST_INFO>().copy_dest_swap),
-                    int(Reg<reg::RB_COPY_DEST_INFO>().copy_dest_exp_bias), copyControl.value, s_regs[XE_GPU_REG_RB_COLOR_INFO],
-                    s_regs[XE_GPU_REG_RB_DEPTH_INFO], s_regs[XE_GPU_REG_RB_COLOR_CLEAR], s_regs[XE_GPU_REG_RB_DEPTH_CLEAR]);
+                    int(Reg<reg::RB_COPY_DEST_INFO>().copy_dest_exp_bias), copyControl.value, StateWord(XE_GPU_REG_RB_COLOR_INFO),
+                    StateWord(XE_GPU_REG_RB_DEPTH_INFO), StateWord(XE_GPU_REG_RB_COLOR_CLEAR), StateWord(XE_GPU_REG_RB_DEPTH_CLEAR));
                 if (logPitch >= 0)
                     for (int i = 0; i < 6; i++)
                     {
@@ -5650,7 +5731,7 @@ void main()
             // Copy.
             auto destInfo = Reg<reg::RB_COPY_DEST_INFO>();
             auto destPitch = Reg<reg::RB_COPY_DEST_PITCH>();
-            uint32_t destBase = s_regs[XE_GPU_REG_RB_COPY_DEST_BASE];
+            uint32_t destBase = StateWord(XE_GPU_REG_RB_COPY_DEST_BASE);
             uint32_t format = depthSource
                 ? (xenos::DepthRenderTargetFormat(Reg<reg::RB_DEPTH_INFO>().depth_format) == xenos::DepthRenderTargetFormat::kD24FS8 ? 23u : 22u)
                 : uint32_t(destInfo.copy_dest_format);
@@ -6576,7 +6657,8 @@ void main()
         // The front buffer as presented: 1x, and at host resolution when the
         // scaled resolve memory has it (two images: no stall when the game
         // switches between them, e.g. around movies).
-        Image s_front, s_frontScaled;
+        Image s_front, s_frontScaled, s_nativeFront;
+        uint32_t s_nativeFrontWidth=0, s_nativeFrontHeight=0;
         uint32_t s_frontWidth = 0, s_frontHeight = 0, s_frontScaledWidth = 0, s_frontScaledHeight = 0;
 
         // A front image the presenter may still show or be reading: taken
@@ -7361,8 +7443,9 @@ void main()
         }
     }
 
-    bool Initialize(const uint32_t* regs)
+    static bool InitializeImpl(const uint32_t* regs, bool native)
     {
+        if (s_vk) throw std::logic_error("cannot start a second renderer");
         gpu::g_workReductionEnabled = settings::GetBool(settings::Id::GpuWorkReduction);
         gpu::g_predicateCoalescingEnabled = settings::GetBool(settings::Id::PredicateCoalescing);
         s_depthStageReduction = settings::GetBool(settings::Id::DepthStageReduction);
@@ -7425,12 +7508,12 @@ void main()
             s_vk = nullptr;
             return false;
         }
-        bool requestPlume = settings::GetInt(settings::Id::RenderBackend) == 1;
+        bool requestPlume = native || settings::GetInt(settings::Id::RenderBackend) == 1;
 #ifdef __ANDROID__
         int backendOverride = platform::android::RendererBackendOverride();
-        if (backendOverride >= 0) requestPlume = backendOverride == 1;
+        if (!native && backendOverride >= 0) requestPlume = backendOverride == 1;
 #endif
-        if (!gpu::plume_rhi::Initialize(s_vk->instance, s_vk->physical, s_dev, s_vk->queueFamily, requestPlume)) return false;
+        if (!gpu::plume_rhi::Initialize(s_vk->instance, s_vk->physical, s_dev, s_vk->queueFamily, requestPlume)) { s_vk=nullptr;return false; }
         glslang_initialize_process();
         CreatePipelineCache();
 
@@ -7555,9 +7638,9 @@ void main()
         CreateRing();
         CreateSet0();
         CreateSamplerAndDummies();
-        CreateResolvePipeline();
-        CreateUntilePipeline();
-        {
+        if (!native) CreateResolvePipeline();
+        CreateUntilePipeline(); // Static game textures still use their original asset layout.
+        if (!native) {
             VkDescriptorSetLayoutBinding b[4] = {
                 { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
                 { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
@@ -7573,6 +7656,12 @@ void main()
             !s_shadowMode ? "imported" : s_shadowInVram ? "copied for the GPU, in VRAM" : "copied for the GPU, in host memory",
             (unsigned long long)(kSharedSize >> 20));
         return true;
+    }
+
+    bool Initialize(const uint32_t* regs)
+    {
+        if (!regs) throw std::invalid_argument("legacy renderer requires register state");
+        return InitializeImpl(regs,false);
     }
 
     bool Enabled()
@@ -7667,11 +7756,13 @@ void main()
     {
         if (!s_vk)
             return;
+        if (s_nativeMode && !s_nativeDraw) throw std::logic_error("PM4 draw on native renderer");
         reg::VGT_DRAW_INITIATOR initiator;
         initiator.value = initiatorValue;
         auto edramMode = Reg<reg::RB_MODECONTROL>().edram_mode;
         if (edramMode == xenos::EdramMode::kCopy)
         {
+            if (s_nativeDraw) throw std::logic_error("native draw cannot execute an EDRAM resolve");
             Resolve();
             return;
         }
@@ -7695,7 +7786,7 @@ void main()
             return skip(1, "no shaders loaded");
         if (!s_vs->info.ok || !s_ps->info.ok)
             return skip(2, "a shader failed to translate");
-        uint32_t count = initiator.num_indices;
+        uint32_t count = s_nativeDraw ? s_nativeDraw->count : initiator.num_indices;
         if (count == 0)
             return;
         if (initiator.source_select == xenos::SourceSelect::kImmediate)
@@ -7706,15 +7797,19 @@ void main()
 
         auto surface = Reg<reg::RB_SURFACE_INFO>();
         uint32_t pitch = surface.surface_pitch;
+        if (s_nativeDraw) {
+            pitch=s_nativeDraw->state.depth.width;
+            for (const auto& target : s_nativeDraw->state.colors) if (target.handle) { pitch=target.width;break; }
+        }
         if (pitch == 0)
             return skip(4, "zero surface pitch");
-        auto [tileShiftX, tileShiftY] = TileShift();
+        auto [tileShiftX, tileShiftY] = s_nativeDraw ? std::pair<int32_t,int32_t>{0,0} : TileShift();
         if (tileShiftX != 0 || tileShiftY != 0)
         {
             s_stats.tileSkips++;
             return;  // drawn with tile 0 (untiled rendering)
         }
-        const bool untiledPass = s_untiled && surface.msaa_samples != xenos::MsaaSamples::k1X &&
+        const bool untiledPass = !s_nativeDraw && s_untiled && surface.msaa_samples != xenos::MsaaSamples::k1X &&
             Reg<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable;
 
         // Render targets.
@@ -7731,7 +7826,8 @@ void main()
                 if (!(s_ps->info.colorTargetMask & (1u << i)) || mask == 0)
                     continue;
                 auto ci = RegAt<reg::RB_COLOR_INFO>(infoRegs[i]);
-                color[i] = GetTarget(ci.color_base, uint32_t(ci.color_format), false, pitch);
+                color[i] = s_nativeDraw ? GetNativeTarget(s_nativeDraw->state.colors[i]) :
+                    GetTarget(ci.color_base, uint32_t(ci.color_format), false, pitch);
                 writeMask |= mask << (4 * i);
             }
         }
@@ -7740,7 +7836,8 @@ void main()
         if (depthControl.z_enable || depthControl.stencil_enable)
         {
             auto di = Reg<reg::RB_DEPTH_INFO>();
-            depth = GetTarget(di.depth_base, uint32_t(di.depth_format), true, pitch);
+            depth = s_nativeDraw ? GetNativeTarget(s_nativeDraw->state.depth) :
+                GetTarget(di.depth_base, uint32_t(di.depth_format), true, pitch);
         }
         if (!depth && writeMask == 0)
             return;  // nothing visible (memexport-only draws are not supported yet)
@@ -7861,19 +7958,19 @@ void main()
                 fprintf(stderr, "[tiles] draw %llu: msaa %u pitch %u wo (%d,%d) woEn %u | window scissor (%u,%u)-(%u,%u) offDis %u | screen scissor (%d,%d)-(%d,%d) | color %08X depth %08X vp y %.1f+%.1f\n",
                     (unsigned long long)s_stats.draws, uint32_t(surface.msaa_samples), pitch, wo.window_x_offset, wo.window_y_offset,
                     uint32_t(Reg<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable), wtl.tl_x, wtl.tl_y, wbr.br_x, wbr.br_y,
-                    wtl.window_offset_disable, stl.tl_x, stl.tl_y, sbr.br_x, sbr.br_y, s_regs[XE_GPU_REG_RB_COLOR_INFO],
-                    s_regs[XE_GPU_REG_RB_DEPTH_INFO], RegF(XE_GPU_REG_PA_CL_VPORT_YOFFSET), RegF(XE_GPU_REG_PA_CL_VPORT_YSCALE));
+                    wtl.window_offset_disable, stl.tl_x, stl.tl_y, sbr.br_x, sbr.br_y, StateWord(XE_GPU_REG_RB_COLOR_INFO),
+                    StateWord(XE_GPU_REG_RB_DEPTH_INFO), RegF(XE_GPU_REG_PA_CL_VPORT_YOFFSET), RegF(XE_GPU_REG_PA_CL_VPORT_YSCALE));
             }
         }
 
         // Primitive assembly.
         auto modeCntl = Reg<reg::PA_SU_SC_MODE_CNTL>();
-        auto dmaSize = RegAt<reg::VGT_DMA_SIZE>(0);
+        reg::VGT_DMA_SIZE dmaSize{};
         dmaSize.value = dmaSizeValue;
         IndexSource src{ initiator.source_select == xenos::SourceSelect::kDMA, dmaBase & 0x1FFFFFFF,
             initiator.index_size == xenos::IndexFormat::kInt32, uint32_t(dmaSize.swap_mode) };
         bool restartEnabled = modeCntl.multi_prim_ib_ena && src.indexed;
-        uint32_t resetIndex = s_regs[XE_GPU_REG_VGT_MULTI_PRIM_IB_RESET_INDX] & 0xFFFFFF;
+        uint32_t resetIndex = StateWord(XE_GPU_REG_VGT_MULTI_PRIM_IB_RESET_INDX) & 0xFFFFFF;
 
         DrawConstants pc{};
         VkPrimitiveTopology topology;
@@ -8029,7 +8126,7 @@ void main()
             if (!color[i])
                 continue;
             key.colorFormats[i] = color[i]->vkFormat;
-            uint32_t bc = s_regs[blendRegs[i]] & 0x1FFF1FFF;
+            uint32_t bc = StateWord(blendRegs[i]) & 0x1FFF1FFF;
             // (One, Zero, Add) for both colour and alpha is "blending off".
             if (bc != 0x00010001 && color[i]->blendable && !(adoptedColor & (1u << i)))
                 key.blend[i] = bc;
@@ -8122,7 +8219,7 @@ void main()
                     for (uint32_t bits = shader->info.vertexFetchConstants[word]; bits; bits &= bits - 1)
                     {
                         uint32_t constant = word * 32 + uint32_t(__builtin_ctz(bits));
-                        const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + constant * 2];
+                        const uint32_t* vf = StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + constant * 2);
                         Range r{ vf[0] & 0x1FFFFFFC, ((vf[1] >> 2) & 0xFFFFFF) * 4 };
                         r.size = std::min<uint32_t>(r.size, uint32_t(kSharedSize) - r.base);
                         if (r.size == 0 || std::any_of(copies, copies + copyCount, [&](const Range& c) { return c.base == r.base && c.size == r.size; }))
@@ -8156,7 +8253,7 @@ void main()
                 for (uint32_t bits = s_vs->info.vertexFetchConstants[word] | s_ps->info.vertexFetchConstants[word]; bits; bits &= bits - 1)
                 {
                     uint32_t constant = word * 32 + uint32_t(__builtin_ctz(bits));
-                    const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + constant * 2];
+                    const uint32_t* vf = StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + constant * 2);
                     uint32_t base = gpu::vertex_route::Base(vf[0]);
                     vertexRoutes[constant] = gpu::vertex_route::Build(base, gpu::vertex_route::Size(base, vf[1]), copies, copyCount);
                     if (vertexRoutes[constant] == gpu::vertex_route::kFallback) ++s_vertexRouteStats.fallback;
@@ -8188,7 +8285,7 @@ void main()
                     for (uint32_t bits = s_vs->info.vertexFetchConstants[word]; bits; bits &= bits - 1)
                     {
                         uint32_t c = word * 32 + uint32_t(__builtin_ctz(bits));
-                        const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + c * 2];
+                        const uint32_t* vf = StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + c * 2);
                         fprintf(stderr, " [%u: %08X %08X]", c, vf[0], vf[1]);
                         uint32_t words = std::min<uint32_t>((vf[1] >> 2) & 0xFFFFFF, 128);
                         for (uint32_t i = 0; i < words; i++)
@@ -8235,7 +8332,7 @@ void main()
                 constantsOffset = at;
                 uint8_t* c = s_ringHost + at;
                 auto copyStage = [&](const Shader* packed, uint32_t base) {
-                    const uint32_t* src = &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + base * 4];
+                    const uint32_t* src = StateWords(XE_GPU_REG_SHADER_CONSTANT_000_X + base * 4);
                     if (!packed)
                     {
                         memcpy(c + base * 16, src, 256 * 16);
@@ -8250,9 +8347,9 @@ void main()
                 copyStage(constLayoutPs, 256);  // pc.psConstBase
                 s_lastConstLayoutVs = constLayoutVs;
                 s_lastConstLayoutPs = constLayoutPs;
-                memcpy(c + 512 * 16, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 48 * 16);
-                memcpy(c + 560 * 16, &s_regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 2 * 16);
-                memcpy(c + 562 * 16, &s_regs[XE_GPU_REG_SHADER_CONSTANT_LOOP_00], 8 * 16);
+                memcpy(c + 512 * 16, StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 192), 48 * 16);
+                memcpy(c + 560 * 16, StateWords(XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031, 8), 2 * 16);
+                memcpy(c + 562 * 16, StateWords(XE_GPU_REG_SHADER_CONSTANT_LOOP_00, 32), 8 * 16);
                 memset(c + 570 * 16, 0, 4 * 16);
                 memcpy(c + kTextureReciprocalOffset, textureReciprocal, sizeof(textureReciprocal));
                 memcpy(lastTextureReciprocal, textureReciprocal, sizeof(textureReciprocal));
@@ -8335,10 +8432,10 @@ void main()
             nativeGeometry=true;
             for(uint32_t i=0;i<s_vs->info.nativeAttributes.size();++i) {
                 const auto& a=s_vs->info.nativeAttributes[i];
-                const uint32_t* vf=&s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0+a.constant*2];
+                const uint32_t* vf=StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0+a.constant*2);
                 if(a.stride>s_nativeMaxStride || !s_nativeFormats[a.words-1] ||
                     !gpu::native_vertex::Plan(a,vf[0],vf[1],copies,copyCount,first,last,
-                        s_regs[XE_GPU_REG_VGT_INDX_OFFSET],nativeOffsets[i],&nativeShared[i]) ||
+                        StateWord(XE_GPU_REG_VGT_INDX_OFFSET),nativeOffsets[i],&nativeShared[i]) ||
                     (nativeShared[i] && (writewatch::GpuWritePending(gpu::vertex_route::Base(vf[0]),gpu::vertex_route::Size(gpu::vertex_route::Base(vf[0]),vf[1])) ||
                         writewatch::AnyGpuOwned(gpu::vertex_route::Base(vf[0]),gpu::vertex_route::Size(gpu::vertex_route::Base(vf[0]),vf[1]))))) { nativeGeometry=false;break; }
             }
@@ -8592,8 +8689,8 @@ void main()
                 // vertices are ePolys (32 bytes: x, y, z, colour, uv0, uv1;
                 // written at 0x82445DC8) at vertex fetch constant 95.
                 float c[16];
-                memcpy(c, &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X], sizeof(c));
-                const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 95 * 2];
+                memcpy(c, StateWords(XE_GPU_REG_SHADER_CONSTANT_000_X), sizeof(c));
+                const uint32_t* vf = StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 95 * 2);
                 if (std::fabs(c[0] - feX) <= feX * 1e-5f && c[1] == 0.0f && c[2] == 0.0f &&
                     c[12] == 0.0f && c[13] == 0.0f && c[14] == 0.0f && c[15] == 1.0f && ((vf[0] & 3) == 3))
                 {
@@ -8682,7 +8779,7 @@ void main()
                     if (scan)
                     {
                         const uint32_t base = vf[0] & 0x1FFFFFFC, endian = vf[1] & 3;
-                        const uint32_t words = (vf[1] >> 2) & 0xFFFFFF, first = s_regs[XE_GPU_REG_VGT_INDX_OFFSET];
+                        const uint32_t words = (vf[1] >> 2) & 0xFFFFFF, first = StateWord(XE_GPU_REG_VGT_INDX_OFFSET);
                         for (uint32_t v0 = 0; v0 < count && valid && (fullWidth || measureY); v0 += per)
                         {
                             float lo = 1e30f, hi = -1e30f, loY = 1e30f, hiY = -1e30f;
@@ -8885,11 +8982,11 @@ void main()
                     // nothing inside the band changes.
                     // NFSMW_BAR_FILL=0 turns it off (an A/B switch).
                     static const bool barFill = [] { const char* v = std::getenv("NFSMW_BAR_FILL"); return !(v && v[0] == '0'); }();
-                    const uint32_t blend0 = s_regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF1FFF;
+                    const uint32_t blend0 = StateWord(XE_GPU_REG_RB_BLENDCONTROL0) & 0x1FFF1FFF;
                     if (barFill)
                     {
                         xenos::xe_gpu_texture_fetch_t t0;
-                        memcpy(&t0, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(t0));
+                        memcpy(&t0, StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0), sizeof(t0));
                         const gpu::bars::Draw draw{ .prim = prim,
                             .count = count,
                             .c = c,
@@ -8910,7 +9007,7 @@ void main()
                             .scissor = { scissor.offset.x, scissor.offset.y, scissor.offset.x + int32_t(scissor.extent.width),
                                 scissor.offset.y + int32_t(scissor.extent.height) } };
                         const uint32_t base = vf[0] & 0x1FFFFFFC, endian = vf[1] & 3;
-                        const uint32_t words = (vf[1] >> 2) & 0xFFFFFF, first = s_regs[XE_GPU_REG_VGT_INDX_OFFSET];
+                        const uint32_t words = (vf[1] >> 2) & 0xFFFFFF, first = StateWord(XE_GPU_REG_VGT_INDX_OFFSET);
                         auto read = [&](uint32_t k, uint32_t j, uint32_t& word) {
                             const uint32_t v = src.Get(k) + first;  // an ePoly: 8 words
                             if ((v + 1) * 8 > words)
@@ -8964,7 +9061,7 @@ void main()
                         if (logFrontEnd && s_frame != last && s_frame != last + 1)
                         {
                             xenos::xe_gpu_texture_fetch_t t0;
-                            memcpy(&t0, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(t0));
+                            memcpy(&t0, StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0), sizeof(t0));
                             fprintf(stderr, "[frontend] edge bars: matching from frame %llu: %s x %.3f..%.3f y %.3f..%.3f colour %08X blend %08X t0 %08X %ux%u, %u rect(s)\n",
                                 (unsigned long long)s_frame, backdrop ? "backdrop" : blackout ? "black frame" : kind == uint32_t(gpu::bars::Fill::RightBar) ? "right bar" : "left bar",
                                 box.x0, box.x1, box.y0, box.y1, barPlan.argb, blend0, (uint32_t(t0.base_address) << 12) & 0x1FFFFFFFu,
@@ -8998,7 +9095,7 @@ void main()
                             continue;
                         auto fetch = [](uint32_t n) {
                             xenos::xe_gpu_texture_fetch_t f;
-                            memcpy(&f, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6], sizeof(f));
+                            memcpy(&f, StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6), sizeof(f));
                             return f;
                         };
                         const xenos::xe_gpu_texture_fetch_t f0 = fetch(0), f1 = fetch(1);
@@ -9091,7 +9188,7 @@ void main()
                                 if (cover && (s_ps->info.texture2DMask & (1u << n)))
                                 {
                                     xenos::xe_gpu_texture_fetch_t f;
-                                    memcpy(&f, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6], sizeof(f));
+                                    memcpy(&f, StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6), sizeof(f));
                                     textures += std::format(" t{} {:08X} {}x{}", n, (uint32_t(f.base_address) << 12) & 0x1FFFFFFFu,
                                         uint32_t(f.size_2d.width) + 1, uint32_t(f.size_2d.height) + 1);
                                 }
@@ -9114,14 +9211,14 @@ void main()
             auto finiteValue = [](float value) { return std::isfinite(value) ? value : 0.0f; };
             std::string line = std::format("{{\"frame\":{},\"draw\":{},\"vs\":\"{:016x}\",\"ps\":\"{:016x}\",\"target\":[{},{}],\"viewport_transform\":[{},{},{},{},{},{}],\"scissor\":[{},{},{},{}],\"depth_control\":{},\"blend\":[{},{},{},{}],\"color_mask\":{},\"clip\":{},\"fetch\":[",
                 s_visual.frame, s_visual.draws, s_vs->hash, s_ps->hash, targetW, targetH,
-                finiteValue(sx), finiteValue(sy), finiteValue(sz), finiteValue(ox), finiteValue(oy), finiteValue(oz), x0, y0, x1, y1, s_regs[XE_GPU_REG_RB_DEPTHCONTROL],
-                s_regs[XE_GPU_REG_RB_BLENDCONTROL0], s_regs[XE_GPU_REG_RB_BLENDCONTROL1], s_regs[XE_GPU_REG_RB_BLENDCONTROL2], s_regs[XE_GPU_REG_RB_BLENDCONTROL3],
-                s_regs[XE_GPU_REG_RB_COLOR_MASK], s_regs[XE_GPU_REG_PA_CL_CLIP_CNTL]);
+                finiteValue(sx), finiteValue(sy), finiteValue(sz), finiteValue(ox), finiteValue(oy), finiteValue(oz), x0, y0, x1, y1, StateWord(XE_GPU_REG_RB_DEPTHCONTROL),
+                StateWord(XE_GPU_REG_RB_BLENDCONTROL0), StateWord(XE_GPU_REG_RB_BLENDCONTROL1), StateWord(XE_GPU_REG_RB_BLENDCONTROL2), StateWord(XE_GPU_REG_RB_BLENDCONTROL3),
+                StateWord(XE_GPU_REG_RB_COLOR_MASK), StateWord(XE_GPU_REG_PA_CL_CLIP_CNTL));
             bool comma = false;
             for (uint32_t n = 0; n < 32; ++n)
                 if ((s_ps->info.texture2DMask | s_ps->info.texture3DMask | s_ps->info.textureCubeMask) & (1u << n))
                 {
-                    const uint32_t* f = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6];
+                    const uint32_t* f = StateWords(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6);
                     if (comma) line += ","; comma = true;
                     line += std::format("{{\"slot\":{},\"words\":[{},{},{},{},{},{}]}}", n, f[0], f[1], f[2], f[3], f[4], f[5]);
                     s_visual.sampled.insert(f[1] & 0x1FFFF000u);
@@ -9135,7 +9232,7 @@ void main()
                 for (unsigned index = 0; index < 256 && recorded < 32; ++index)
                     if (info.constRelative || (info.constUsed[index / 64] & (1ull << (index % 64))))
                     {
-                        const uint32_t* c = &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (stage * 256 + index) * 4];
+                        const uint32_t* c = StateWords(XE_GPU_REG_SHADER_CONSTANT_000_X + (stage * 256 + index) * 4);
                         if (comma) line += ","; comma = true;
                         line += std::format("{{\"stage\":{},\"index\":{},\"bits\":[{},{},{},{}]}}", stage, index, c[0], c[1], c[2], c[3]);
                         ++recorded;
@@ -9152,7 +9249,7 @@ void main()
                 targetW, targetH, sx, sy, ox, oy, x0, y0, x1, y1, vte.value & 0xFFF, s_vs->hash, s_ps->hash);
             for (uint32_t n = 0; n < 32; n++)
                 if ((s_ps->info.texture2DMask | s_ps->info.texture3DMask | s_ps->info.textureCubeMask) & (1u << n))
-                    line += std::format(" {}:{:08X}", n, (s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6 + 1] & 0x1FFFF000u));
+                    line += std::format(" {}:{:08X}", n, (StateWord(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6 + 1) & 0x1FFFF000u));
             if (barPlan.rectCount)
                 line += std::format(" +edge {} fill x{}", barPlan.fill == gpu::bars::Fill::Backdrop ? "backdrop"
                     : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame" : "bar", barPlan.rectCount);
@@ -9171,7 +9268,7 @@ void main()
         }
         pc.vsConstBase = 0;
         pc.psConstBase = 256;
-        pc.indexOffset = s_regs[XE_GPU_REG_VGT_INDX_OFFSET];
+        pc.indexOffset = StateWord(XE_GPU_REG_VGT_INDX_OFFSET);
         auto colorControl = Reg<reg::RB_COLORCONTROL>();
         pc.alphaTest = colorControl.alpha_test_enable ? uint32_t(colorControl.alpha_func) : 7u;
         pc.alphaRef = RegF(XE_GPU_REG_RB_ALPHA_REF);
@@ -9449,6 +9546,223 @@ void main()
             s_submitAfterDraw = false;
             SubmitRecorded(8);
         }
+    }
+
+    namespace {
+        void CheckNativeOwner()
+        {
+            if (!s_nativeMode || s_nativeOwner != std::this_thread::get_id())
+                throw std::logic_error("native operation outside renderer owner thread");
+        }
+        Shader* NativeShader(const std::shared_ptr<const game_shader::Resource>& resource, ShaderStage stage)
+        {
+            if (!resource) return nullptr;
+            if (!resource->id || resource->stage != stage || !resource->translated.ok)
+                throw std::invalid_argument("invalid native shader resource");
+            auto& shader = s_nativeShaders[resource->id];
+            if (!shader) {
+                shader = std::make_unique<Shader>();
+                shader->stage = stage;
+                shader->hash = game_shader::Hash(stage == ShaderStage::Vertex ? 0 : 1, resource->guestWords);
+                shader->info = resource->translated;
+            }
+            return shader.get();
+        }
+        void CheckNativeRect(const RenderTarget& target, uint32_t x, uint32_t y, uint32_t width, uint32_t height)
+        {
+            if (x > target.width || y > target.height || width > target.width-x || height > target.height-y)
+                throw std::out_of_range("native image rectangle");
+        }
+    }
+
+    bool InitializeNative()
+    {
+        if (s_vk) throw std::logic_error("cannot start a second renderer");
+        // Shares the presenter's existing device/loader, like Legacy/Plume.
+        // nullptr deliberately leaves no emulated register file available.
+        if (!InitializeImpl(nullptr,true)) return false;
+        if (!plume_rhi::Enabled()) throw std::logic_error("native renderer requires Plume Vulkan");
+        s_nativeOwner = std::this_thread::get_id();
+        s_nativeMode = true;
+        game_shader::PublishTranslationReady(true);
+        return true;
+    }
+
+    void NativeDraw(const native_render::Draw& draw)
+    {
+        CheckNativeOwner();
+        if (s_nativeDraw) throw std::logic_error("nested native draw");
+        if (draw.primitive > 63 || draw.endian > 3)
+            throw std::invalid_argument("invalid native draw arguments");
+        // Include all attached targets even when a shader/color mask currently
+        // does not write them. Targets are lazily allocated on this owner.
+        for (const auto& target : draw.state.colors) {
+            if (target.handle && target.depth) throw std::invalid_argument("depth target bound as color");
+            GetNativeTarget(target);
+        }
+        if (draw.state.depth.handle && !draw.state.depth.depth)
+            throw std::invalid_argument("color target bound as depth");
+        GetNativeTarget(draw.state.depth);
+        for (auto handle : draw.state.textures) {
+            if (!handle) continue;
+            if (!s_nativeTargets.contains(handle)) throw std::invalid_argument("unknown native sampled-image handle");
+            if (draw.state.depth.handle==handle || std::any_of(draw.state.colors.begin(),draw.state.colors.end(),
+                [=](const auto& target) { return target.handle==handle; }))
+                throw std::invalid_argument("native attachment feedback requires an explicit copy");
+        }
+        const auto mode=reg::RB_MODECONTROL{draw.state.rb_modecontrol}.edram_mode;
+        if (mode!=xenos::EdramMode::kColorDepth && mode!=xenos::EdramMode::kDepthOnly)
+            throw std::invalid_argument("native draw requires a graphics mode");
+        if (!draw.state.vertex || (mode==xenos::EdramMode::kColorDepth && !draw.state.pixel))
+            throw std::invalid_argument("native draw missing shader resource");
+        if (draw.state.vertex->translated.usesMemExport || (draw.state.pixel && draw.state.pixel->translated.usesMemExport))
+            throw std::invalid_argument("native memexport ownership not implemented");
+        if (mode==xenos::EdramMode::kColorDepth) for (uint32_t i=0;i<4;++i)
+            if ((draw.state.pixel->translated.colorTargetMask&(1u<<i)) &&
+                ((draw.state.rb_color_mask>>(i*4))&15) && !draw.state.colors[i].handle)
+                throw std::invalid_argument("native draw missing written color attachment");
+        s_vs = NativeShader(draw.state.vertex, ShaderStage::Vertex);
+        s_ps = NativeShader(draw.state.pixel, ShaderStage::Pixel);
+        struct Scope {
+            explicit Scope(const native_render::Draw& draw) { s_nativeDraw = &draw; }
+            ~Scope() { s_nativeDraw = nullptr; }
+        } scope(draw);
+        g_constantsDirty.store(true, std::memory_order_relaxed);
+        reg::VGT_DRAW_INITIATOR initiator{};
+        initiator.prim_type = xenos::PrimitiveType(draw.primitive);
+        initiator.source_select = draw.indexed ? xenos::SourceSelect::kDMA : xenos::SourceSelect::kAutoIndex;
+        initiator.index_size = draw.indices32 ? xenos::IndexFormat::kInt32 : xenos::IndexFormat::kInt16;
+        reg::VGT_DMA_SIZE dma{};
+        dma.swap_mode = xenos::Endian(draw.endian);
+        Draw(initiator.value, draw.indexBase, dma.value);
+    }
+
+    void NativeClear(const native_render::TargetDesc& desc, int32_t x, int32_t y,
+        uint32_t width, uint32_t height, const float color[4], float depth,
+        uint32_t stencil, bool clearDepth, bool clearStencil)
+    {
+        CheckNativeOwner();
+        auto* target = GetNativeTarget(desc);
+        if (!target || x < 0 || y < 0) throw std::invalid_argument("invalid native clear target/offset");
+        CheckNativeRect(*target, uint32_t(x), uint32_t(y), width, height);
+        if (!width || !height || (desc.depth && !clearDepth && !clearStencil)) return;
+        if (!desc.depth && !color) throw std::invalid_argument("missing native clear color");
+        RenderTarget* colors[4] = {desc.depth ? nullptr : target};
+        VkRect2D area{{x,y},{width,height}};
+        BeginPass(colors, desc.depth ? target : nullptr, area);
+        native_render::RecordClear(s_cmd,{target->image.image,target->vkFormat,target->width,target->height,target->depth},
+            uint32_t(x),uint32_t(y),width,height,color,std::clamp(depth,0.0f,1.0f),stencil,clearDepth,clearStencil);
+    }
+
+    void NativeCopy(const native_render::TargetDesc& source, const native_render::TargetDesc& dest,
+        uint32_t sourceX, uint32_t sourceY, uint32_t destX, uint32_t destY, uint32_t width, uint32_t height)
+    {
+        CheckNativeOwner();
+        if (!source.handle || !dest.handle || source.handle == dest.handle ||
+            source.depth != dest.depth || source.format != dest.format)
+            throw std::invalid_argument("native copy requires distinct compatible images");
+        auto* src = GetNativeTarget(source);
+        auto* dst = GetNativeTarget(dest);
+        CheckNativeRect(*src,sourceX,sourceY,width,height);
+        CheckNativeRect(*dst,destX,destY,width,height);
+        if (!width || !height) return;
+        FlushPendingClears(src);
+        FlushPendingClears(dst);
+        EndPass(); Begin(); FullBarrier();
+        int timing=TimingBegin("native_image_copy",width,height,0,source.format);
+        native_render::RecordCopy(s_cmd,{src->image.image,src->vkFormat,src->width,src->height,src->depth},
+            {dst->image.image,dst->vkFormat,dst->width,dst->height,dst->depth},
+            sourceX,sourceY,destX,destY,width,height);
+        TimingEnd(timing); FullBarrier();
+    }
+
+    void NativeDestroyTarget(uint64_t handle)
+    {
+        CheckNativeOwner();
+        auto it=s_nativeTargets.find(handle);
+        if (it==s_nativeTargets.end()) return;
+        FlushPendingClears(it->second.get());
+        // Correct retirement first; replace with submission-owned deferred
+        // deletion once game object lifetime hooks are connected.
+        Flush();
+        for (auto [swizzle,view] : it->second->nativeViews) s_textureViewExtents.erase(view);
+        for (auto& color : s_passColor) if (color==it->second.get()) color=nullptr;
+        if (s_passDepth==it->second.get()) s_passDepth=nullptr;
+        DestroyTarget(*it->second);
+        s_nativeTargets.erase(it);
+        ++s_stateEpoch;
+    }
+
+    std::vector<uint8_t> NativeReadback(const native_render::TargetDesc& desc,
+        uint32_t x, uint32_t y, uint32_t width, uint32_t height, bool stencil)
+    {
+        CheckNativeOwner();
+        auto* target=GetNativeTarget(desc);
+        if (!target || (stencil && !target->depth)) throw std::invalid_argument("invalid native readback target/aspect");
+        CheckNativeRect(*target,x,y,width,height);
+        if (!width || !height) return {};
+        native_render::ImageRegion region{target->image.image,target->vkFormat,target->width,target->height,target->depth};
+        const uint32_t bytesPerPixel=native_render::ReadbackBytesPerPixel(region,stencil);
+        const uint64_t size=uint64_t(width)*height*bytesPerPixel;
+        if (size>64*1024*1024) throw std::length_error("native readback exceeds 64 MiB budget");
+        std::vector<uint8_t> result(size_t(size),0);
+        // A dedicated, bounded allocation prevents the draw upload ring from
+        // being recycled while CPU readback consumes this submission.
+        struct Readback {
+            VkBuffer buffer=VK_NULL_HANDLE;
+            VkDeviceMemory memory=VK_NULL_HANDLE;
+            void* mapped=nullptr;
+            ~Readback() {
+                if(mapped) vkUnmapMemory(s_dev,memory);
+                if(buffer) vkDestroyBuffer(s_dev,buffer,nullptr);
+                if(memory) vkFreeMemory(s_dev,memory,nullptr);
+            }
+        } read;
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};info.size=result.size();info.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        Check(vkCreateBuffer(s_dev,&info,nullptr,&read.buffer),"vkCreateBuffer(native readback)");
+        VkMemoryRequirements requirements;vkGetBufferMemoryRequirements(s_dev,read.buffer,&requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};allocation.allocationSize=requirements.size;
+        allocation.memoryTypeIndex=FindMemoryType(requirements.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+        Check(vkAllocateMemory(s_dev,&allocation,nullptr,&read.memory),"vkAllocateMemory(native readback)");
+        Check(vkBindBufferMemory(s_dev,read.buffer,read.memory,0),"vkBindBufferMemory(native readback)");
+        Check(vkMapMemory(s_dev,read.memory,0,VK_WHOLE_SIZE,0,&read.mapped),"vkMapMemory(native readback)");
+        FlushPendingClears(target);EndPass();Begin();FullBarrier();
+        int timing=TimingBegin("native_cpu_readback",width,height,0,desc.format);
+        native_render::RecordReadback(s_cmd,region,read.buffer,result.size(),x,y,width,height,stencil);
+        VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};host.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;host.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(s_cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&host,0,nullptr,0,nullptr);
+        TimingEnd(timing);Flush();
+        // Invalidate even on coherent heaps: valid there too, and correctly
+        // handles devices whose host-visible readback heap isn't coherent.
+        VkMappedMemoryRange mapped{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};mapped.memory=read.memory;mapped.size=VK_WHOLE_SIZE;
+        Check(vkInvalidateMappedMemoryRanges(s_dev,1,&mapped),"vkInvalidateMappedMemoryRanges(native readback)");
+        memcpy(result.data(),read.mapped,result.size());
+        return result;
+    }
+
+    bool NativePresent(const native_render::TargetDesc& desc, uint32_t width, uint32_t height)
+    {
+        CheckNativeOwner();
+        auto* source=GetNativeTarget(desc);
+        if (!source || source->depth || source->vkFormat!=VK_FORMAT_R8G8B8A8_UNORM || !width || !height)
+            throw std::invalid_argument("native presentation currently requires RGBA8 color");
+        CheckNativeRect(*source,0,0,width,height);
+        if (s_nativeFrontWidth!=width || s_nativeFrontHeight!=height) {
+            DestroyFrontImage(s_nativeFront,s_nativeFrontWidth,s_nativeFrontHeight);
+            s_nativeFront=CreateImage(VK_IMAGE_TYPE_2D,VK_FORMAT_R8G8B8A8_UNORM,{width,height,1},1,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_IMAGE_VIEW_TYPE_2D,VK_IMAGE_ASPECT_COLOR_BIT);
+            Begin();ToGeneral(s_nativeFront.image,VK_IMAGE_ASPECT_COLOR_BIT,1);
+            s_nativeFrontWidth=width;s_nativeFrontHeight=height;
+        }
+        FlushPendingClears(source);EndPass();Begin();
+        FullBarrier(); // includes the presenter's previous read on the shared queue
+        int timing=TimingBegin("native_front_copy",width,height,0,desc.format);
+        native_render::RecordCopy(s_cmd,{source->image.image,source->vkFormat,source->width,source->height,false},
+            {s_nativeFront.image,VK_FORMAT_R8G8B8A8_UNORM,width,height,false},0,0,0,0,width,height);
+        TimingEnd(timing);FullBarrier();SubmitRecorded(7);
+        video::SubmitFrontImage(s_nativeFront.image,width,height,width,height);
+        return true;
     }
 
     void Submit()
@@ -10316,13 +10630,14 @@ void main()
             m.targets += rt->image.bytes;
             m.targetCount++;
         }
+        for (const auto& [key, rt] : s_nativeTargets) { m.targets += rt->image.bytes; m.targetCount++; }
         for (const auto& [key, t] : s_textures)
         {
             m.textures += t->image.bytes;
             m.textureCount++;
         }
         m.scaled = s_scaled.poolBytes + s_scaled.tableBytes + s_scaled.scratchBytes;
-        m.front = s_front.bytes + s_frontScaled.bytes;
+        m.front = s_front.bytes + s_frontScaled.bytes + s_nativeFront.bytes;
         auto own = [&m](const Image& image) {
             if (image.memory && !image.block)
             {
@@ -10332,9 +10647,11 @@ void main()
         };
         for (const auto& [key, rt] : s_targets)
             own(rt->image);
+        for (const auto& [key, rt] : s_nativeTargets)
+            own(rt->image);
         for (const auto& [key, t] : s_textures)
             own(t->image);
-        for (const Image* image : { &s_front, &s_frontScaled, &s_dummy[0], &s_dummy[1], &s_dummy[2], &s_dummyStorage })
+        for (const Image* image : { &s_front, &s_frontScaled, &s_nativeFront, &s_dummy[0], &s_dummy[1], &s_dummy[2], &s_dummyStorage })
             own(*image);
         for (const auto& block : s_blocks)
         {

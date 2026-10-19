@@ -1,6 +1,7 @@
 // SpeedBreaker One. GPL-3.0-or-later. Synthetic shaders only, no game assets.
 #include <plume_vulkan.h>
 #include <gpu/plume_backend.h>
+#include <gpu/native_image_commands.h>
 #include <array>
 #include <cassert>
 #include <cstring>
@@ -20,10 +21,10 @@ static std::vector<uint32_t> Read(const std::string& f) {
     std::ifstream in(f,std::ios::binary|std::ios::ate);assert(in); auto n=in.tellg(); assert(n>0 && n%4==0);
     std::vector<uint32_t> b(size_t(n)/4);in.seekg(0);in.read(reinterpret_cast<char*>(b.data()),n);assert(in);return b;
 }
-static void ImageBarrier(VkCommandBuffer cmd,VkImage image,VkImageLayout old,VkImageLayout next,VkAccessFlags src,VkAccessFlags dst) {
+static void ImageBarrier(VkCommandBuffer cmd,VkImage image,VkImageLayout old,VkImageLayout next,VkAccessFlags src,VkAccessFlags dst,VkImageAspectFlags aspect=VK_IMAGE_ASPECT_COLOR_BIT) {
     VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};b.image=image;b.oldLayout=old;b.newLayout=next;
     b.srcAccessMask=src;b.dstAccessMask=dst;b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
-    b.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+    b.subresourceRange={aspect,0,1,0,1};
     vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&b);
 }
 static void HostBarrier(VkCommandBuffer cmd,VkAccessFlags access,VkPipelineStageFlags stage) {
@@ -194,6 +195,65 @@ int main(int argc,char** argv) {
         }
         auto* pixel=static_cast<const uint8_t*>(expected);assert(pixel[(4*16+4)*4]==64 && pixel[0]==0 && pixel[3]==255);reads[0]->unmap();
         vkDestroyPipeline(native,dynamicPipeline,nullptr);
+        // The exact native image command helpers used by renderer.cpp:
+        // partial semantic clears, image-resident copies, independent depth
+        // and stencil aspects, unequal target dimensions and bounds rejection.
+        for (bool depth : {false,true}) {
+            namespace nr=gpu::native_render;
+            const auto format=depth ? RenderFormat::D32_FLOAT_S8_UINT : RenderFormat::R8G8B8A8_UNORM;
+            auto src=depth ? device->createTexture(RenderTextureDesc::DepthTarget(16,16,format)) : device->createTexture(RenderTextureDesc::ColorTarget(16,16,format));
+            auto dst=depth ? device->createTexture(RenderTextureDesc::DepthTarget(18,20,format)) : device->createTexture(RenderTextureDesc::ColorTarget(18,20,format));
+            auto* a=static_cast<VulkanTexture*>(src.get());auto* b=static_cast<VulkanTexture*>(dst.get());
+            const VkImageAspectFlags aspect=depth ? VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+            const VkFormat vkFormat=depth ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_R8G8B8A8_UNORM;
+            nr::ImageRegion source{a->vk,vkFormat,16,16,depth},dest{b->vk,vkFormat,18,20,depth};
+            auto output=device->createBuffer(RenderBufferDesc::ReadbackBuffer(18*20*4));
+            auto stencilOutput=device->createBuffer(RenderBufferDesc::ReadbackBuffer(18*20));
+            Check(vkResetCommandBuffer(cmd,0));VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};Check(vkBeginCommandBuffer(cmd,&begin));rhi::BeginRecording(cmd);
+            ImageBarrier(cmd,a->vk,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_GENERAL,0,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,aspect);
+            ImageBarrier(cmd,b->vk,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_GENERAL,0,VK_ACCESS_TRANSFER_WRITE_BIT,aspect);
+            VkRenderingAttachmentInfoKHR attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};attachment.imageView=a->imageView;attachment.imageLayout=VK_IMAGE_LAYOUT_GENERAL;attachment.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;attachment.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
+            if(depth) attachment.clearValue.depthStencil={0.75f,17};else attachment.clearValue.color.float32[3]=1;
+            VkRenderingInfoKHR rendering{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};rendering.renderArea.extent={16,16};rendering.layerCount=1;
+            if(depth) rendering.pDepthAttachment=rendering.pStencilAttachment=&attachment;
+            else {rendering.colorAttachmentCount=1;rendering.pColorAttachments=&attachment;}
+            rhi::BeginRendering(cmd,&rendering,vkCmdBeginRenderingKHR);
+            nr::RecordClear(cmd,source,2,3,8,9,value,0.25f,91);
+            if(depth) {
+                nr::RecordClear(cmd,source,4,5,2,2,nullptr,0.5f,0,true,false);
+                nr::RecordClear(cmd,source,6,7,2,2,nullptr,0.0f,7,false,true);
+            }
+            bool rejected=false;try {nr::RecordClear(cmd,source,UINT32_MAX,0,2,2,value,0,0);}catch(const std::out_of_range&){rejected=true;}assert(rejected);
+            rhi::EndRendering(cmd,vkCmdEndRenderingKHR);
+            VkImageSubresourceRange range{aspect,0,1,0,1};
+            if(depth) {VkClearDepthStencilValue clear{1,0};vkCmdClearDepthStencilImage(cmd,b->vk,VK_IMAGE_LAYOUT_GENERAL,&clear,1,&range);}
+            else {VkClearColorValue clear{};clear.float32[3]=1;vkCmdClearColorImage(cmd,b->vk,VK_IMAGE_LAYOUT_GENERAL,&clear,1,&range);}
+            ImageBarrier(cmd,a->vk,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT,aspect);
+            ImageBarrier(cmd,b->vk,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,aspect);
+            nr::RecordCopy(cmd,source,dest,2,3,5,6,8,9);
+            rejected=false;try {nr::RecordCopy(cmd,source,dest,0,0,17,0,2,2);}catch(const std::out_of_range&){rejected=true;}assert(rejected);
+            rejected=false;try {nr::RecordCopy(cmd,source,source,0,0,0,0,2,2);}catch(const std::invalid_argument&){rejected=true;}assert(rejected);
+            ImageBarrier(cmd,b->vk,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT,aspect);
+            nr::RecordReadback(cmd,dest,static_cast<VulkanBuffer*>(output.get())->vk,18*20*4,0,0,18,20);
+            if(depth) nr::RecordReadback(cmd,dest,static_cast<VulkanBuffer*>(stencilOutput.get())->vk,18*20,0,0,18,20,true);
+            rejected=false;try {nr::RecordReadback(cmd,dest,static_cast<VulkanBuffer*>(output.get())->vk,1,0,0,18,20);}catch(const std::invalid_argument&){rejected=true;}assert(rejected);
+            HostBarrier(cmd,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);Check(vkEndCommandBuffer(cmd));submit();
+            auto* data=static_cast<const uint8_t*>(output->map());auto* stencil=static_cast<const uint8_t*>(stencilOutput->map());
+            for(unsigned y=0;y<20;++y)for(unsigned x=0;x<18;++x) {
+                const bool inside=x>=5 && x<13 && y>=6 && y<15;const auto pixel=y*18+x;
+                if(depth) {
+                    const bool depthOnly=x>=7 && x<9 && y>=8 && y<10;
+                    const bool stencilOnly=x>=9 && x<11 && y>=10 && y<12;
+                    float actual;std::memcpy(&actual,data+pixel*4,4);
+                    assert(actual==(inside ? (depthOnly ? 0.5f : 0.25f) : 1.0f));
+                    assert(stencil[pixel]==(inside ? (stencilOnly ? 7 : 91) : 0));
+                } else {
+                    assert(data[pixel*4]==(inside ? 64 : 0));assert(data[pixel*4+1]==(inside ? 128 : 0));
+                    assert(data[pixel*4+2]==(inside ? 191 : 0));assert(data[pixel*4+3]==255);
+                }
+            }
+            output->unmap();stencilOutput->unmap();
+        }
         // Native image ownership uses Plume/VMA, including mutable formats.
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};imageInfo.imageType=VK_IMAGE_TYPE_2D;imageInfo.extent={16,16,1};imageInfo.mipLevels=imageInfo.arrayLayers=1;imageInfo.format=VK_FORMAT_R8G8B8A8_UNORM;imageInfo.samples=VK_SAMPLE_COUNT_1_BIT;imageInfo.usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_STORAGE_BIT;imageInfo.flags=VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
         std::shared_ptr<rhi::ImageAllocation> owner;VkImage nativeImage;VkDeviceSize bytes=0;if (requested) { Check(rhi::AllocateImage(imageInfo,nativeImage,bytes,owner));assert(nativeImage && bytes);owner.reset(); }
@@ -216,10 +276,10 @@ int main(int argc,char** argv) {
     }
     }
     const auto c=rhi::GetCounters();
-    if (requested) assert(c.passes==6 && c.indexedDraws==6 && c.dispatches==2 && c.images==1);
+    if (requested) assert(c.passes==8 && c.indexedDraws==6 && c.dispatches==2 && c.images==1);
     else assert(c.passes==0 && c.indexedDraws==0 && c.dispatches==0 && c.images==0);
     rhi::Shutdown(); fixture.reset(); // Must leave native device and dispatch alive.
     assert(vkGetInstanceProcAddr==gipa);Check(vkDeviceWaitIdle(native));
     vkDestroyFence(native,fence,nullptr);vkDestroyCommandPool(native,pool,nullptr);vkDestroyDevice(native,nullptr);vkDestroyDebugUtilsMessengerEXT(instance,messenger,nullptr);vkDestroyInstance(instance,nullptr);
-    assert(errors==0);std::cout<<"Plume classic/offscreen and raw/dynamic parity, indexed draw, 257 compute words, ownership and shared dispatch passed; validation errors=0\n";
+    assert(errors==0);std::cout<<"Plume classic/offscreen and raw/dynamic parity, indexed draw, 257 compute words, native partial clears/copies/depth/stencil, ownership and shared dispatch passed; validation errors=0\n";
 }

@@ -24,6 +24,11 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/route.comp.spv
     COMMAND ${SB_SPIRV_VAL} --target-env vulkan1.2 ${CMAKE_CURRENT_BINARY_DIR}/route.comp.spv
     DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/route.comp)
 list(APPEND SHADERS ${CMAKE_CURRENT_BINARY_DIR}/route.comp.spv)
+add_executable(native_draw_state_fixture ../native_draw_state_test.cpp ../../runtime/gpu/game_shader.cpp
+    ../../runtime/gpu/shader_translator.cpp ../../runtime/gpu/xenos/ucode.cpp)
+target_include_directories(native_draw_state_fixture PRIVATE ../../runtime)
+target_compile_options(native_draw_state_fixture PRIVATE -UNDEBUG)
+add_test(NAME native_draw_state COMMAND native_draw_state_fixture)
 add_executable(game_shader_fixture ../game_shader_test.cpp ../../runtime/gpu/game_shader.cpp
     ../../runtime/gpu/shader_translator.cpp ../../runtime/gpu/xenos/ucode.cpp)
 target_include_directories(game_shader_fixture PRIVATE ../../runtime)

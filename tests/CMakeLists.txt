@@ -15,6 +15,7 @@ function(sb_test name)
     add_test(NAME ${name} COMMAND ${name} ${T_ARGS})
 endfunction()
 
+sb_test(native_draw_state_test SOURCES ${RT}/gpu/game_shader.cpp ${RT}/gpu/shader_translator.cpp ${RT}/gpu/xenos/ucode.cpp)
 sb_test(native_vertex_test SOURCES ${RT}/gpu/shader_translator.cpp ${RT}/gpu/xenos/ucode.cpp)
 sb_test(game_shader_test SOURCES ${RT}/gpu/game_shader.cpp ${RT}/gpu/shader_translator.cpp ${RT}/gpu/xenos/ucode.cpp)
 sb_test(vertex_route_test)

@@ -217,3 +217,99 @@ the result matches the built patched source byte for byte. Full Android OFF
 link was not repeated; adapter compile-OFF and runtime Legacy GPU tests pass.
 This is offline validation, with no RP6 gameplay, visual or FPS result. Existing
 APKs remain separately saved. No ADB/device access or shader/disc uploads occurred.
+
+## Native draw and image core — source checkpoint, October 19, 2026
+
+Baseline `a81839b`, last packaged APK 0.1.15 (unchanged, SHA256 rechecked).
+This checkpoint has **no new APK or selectable native game backend**. It is
+implementation work toward the requested native deliverable, not completion.
+The running game still enters through PM4 and the existing compatibility path.
+
+Implemented in the shared rendering core:
+
+- `InitializeNative()` shares the presenter's device/loader, forces Plume,
+  supplies no CP register array, and does not create the legacy EDRAM resolve
+  or guest-memory front-buffer conversion pipelines. No second Vulkan device.
+- `NativeDraw()` takes an immutable CPU state snapshot, host shader resources,
+  explicit target descriptors/handles and full-width draw arguments. It reuses
+  the existing shader/pipeline/geometry implementation and Plume recording.
+  `StateWord/StateWords` read named native fields/constant arrays on this entry,
+  while retaining the exact legacy register-array path for existing rendering.
+  Native calls cannot invoke copy-mode EDRAM resolves or the tile-skip heuristic.
+- `native_draw_state.h` captures verified USA `825A3EC8` CPU D3D mirrors, not a
+  decoded GPU packet. Constants/fetch/bool/loop values are copied and immutable
+  after submission. Separately emitted window offsets/scissors have no mirror
+  address: they are deliberately not guessed. The caller supplies semantic
+  scissor and the full native target dimensions. D3D pipeline encodings remain
+  inputs to the shared pipeline conversion; this is not a new register file.
+- Native images have a separate cache keyed by opaque allocation-generation
+  handles and exact width/height/format, rather than EDRAM addresses or an
+  EDRAM-derived height. Reusing a live handle with another description fails.
+  Allocation continues through the existing Plume image owner. Destruction
+  waits for GPU retirement, removes sampled views and invalidates bound state.
+- Native semantic partial clears, same-format image copies, separate depth and
+  stencil copies, 2D sampled views and explicit CPU readback are implemented.
+  Copies stay image-resident: no tiled guest-memory store followed by re-upload.
+  The command helpers are shared with actual Vulkan GPU tests. CPU readback
+  returns canonical GPU format bytes and handles noncoherent mapped memory;
+  guest endian/format/tiling conversion and lock interception remain necessary.
+- `NativePresent()` copies RGBA8 directly to a presenter-owned front image on
+  the shared queue, without the compatibility front-buffer compute conversion.
+  Other presentation formats, cube/mip native images, format-converting resolves,
+  attachment feedback and memexport are not implemented by this entry.
+- Renderer owner-thread checks protect the new entry points. They require an
+  ordered native worker; they are not safe to call directly from game hooks.
+  Legacy initialization and draw entry remain separate and buildable.
+
+### Invariants, alternatives and verification
+
+Architectural invariant: a native draw must have explicit shader/image resources
+and immutable state; no CP array, EDRAM address lookup, tiled resolve store or
+PM4 fallback may supply missing native work. Legitimate CPU consumers must still
+receive correct resource bytes. Zero-copy deletion of those stores without
+native lock/alias ownership would violate that invariant.
+
+Hypothesis A: image residency and explicit target extents will remove some of
+the previously measured resolve/memory/pass overhead. Hypothesis B: the expensive
+color work remains dominant even after those costs disappear. Current evidence
+proves neither performance claim. Exact image comparisons are the cheapest
+correctness discriminator; only subsequent matched RP6 racing timings can test
+performance. No new profiling tools or device capture were introduced.
+
+Verification actually run:
+
+- 50 standalone host suites pass, including CPU-mirror ABI offsets, immutable
+  snapshots, VS/PS constant boundaries, overflow rejection and unmapped fields.
+  SDL downmix remains outside this standalone harness.
+- Six Release GPU/Legacy tests pass with core and synchronization validation.
+  New color/depth/stencil tests use the same native command helpers as the
+  renderer. They test unequal image dimensions, offset partial copies,
+  depth-only/stencil-only clears, exact pixel values, undersized readback buffers,
+  out-of-range rectangles and self-copy rejection. Zero validation errors.
+- The same six tests pass in Debug with AddressSanitizer. LeakSanitizer remains
+  disabled due to process-inspection restrictions; this is not a leak check.
+- Optimized Android ARM64 native compilation and complete libmain link pass.
+  APK packaging/signing was deliberately not repeated for this incomplete path.
+- These GPU tests exercise the shared image commands and existing synthetic
+  Plume draws, **not the entire new `NativeDraw()` renderer entry**, game hooks,
+  native presentation handoff, or the readback allocation/lock lifecycle.
+  No RP6 execution, visual parity or FPS gain is claimed.
+
+### Required continuation
+
+1. Exercise the complete native renderer entry with a synthetic device/context,
+   translated shader resources and explicit targets; cover sampled target reads,
+   lifetime retirement, readback and presentation handoff, without a CP array.
+2. Connect verified USA draw/UP, clear, resolve and resource lifetime calls to an
+   ordered worker. Allocate generation handles from real game object creation;
+   do not synthesize identity from EDRAM base. Capture declaration-patched shader
+   variants and immutable geometry before guest memory reuse.
+3. Implement texture aliases, cubes/mips, conversion resolves, guest CPU locks
+   and buffer consumers. Use native readback/materialization only when required;
+   the current write-watch shadow alone cannot materialize an image-only write.
+4. Replace ring read-pointer/fence/event/query/presentation contracts, preserve
+   vblank/pause/audio and disable CP worker startup for the new backend. Validate
+   full gameplay coverage before exposing it or packaging the native deliverable.
+
+Rollback is the previous source commit; the existing launcher Legacy/Plume
+choices and all previously packaged APKs remain unchanged.
