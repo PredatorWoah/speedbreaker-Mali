@@ -444,3 +444,13 @@ Additional 0.1.12 user report: Mr Purple T26 runs and reaches the 50 FPS range,
 with some drops to 26 FPS. This updates the blanket absence of custom-driver
 execution evidence, not the stability of other previously crashing drivers.
 Keep driver choice fixed while comparing the new vertex-routing setting.
+
+### 0.1.13 signed APK completed
+
+Clean compiled source 64fe727, version 0.1.13 code 14. Optimized full Android
+ARM64 native link and signed packaging pass. Retained certificate, seven staged
+libraries, 56,736 mapping entries, ZIP/alignment/manifest and dispatch checks pass.
+APK SHA256 4f44ad2a2937bbb658d7c9a91e11f6fb783721d44a70bfc1728faf99eca71126;
+native Build ID 265d14231f67525a1051c7a08ebc9d45f50e8021.
+CI offscreen run 39274316020 passes. 0.1.12 APK checksum verified unchanged.
+Build record: builds/android/0.1.13-plume-vulkan/. No new device gain claimed.

@@ -71,7 +71,8 @@ and full-frame diagnostics remain active. No new capture/profiler is required.
   54 to 57 static conditional branches because the complete fallback remains.
   This is not a static-code-size win. Eligible runtime branches bypass the old
   four per-word searches; host SPIR-V counts do not establish Adreno cycle savings.
-- Android native build/signing results follow in the build record when complete.
+- Optimized Android ARM64 native link and signed release packaging pass. Compiled clean source `64fe727`; retained certificate, seven exact staged libraries, 56,736 game mappings, ZIP/alignment/manifest checks pass. Build record: `builds/android/0.1.13-plume-vulkan/`.
+- Clean GitHub Actions offscreen run [39274316020](https://github.com/onenonlygit/speedbreaker-one/actions/runs/39274316020) passes.
 
 No RP6 execution or speedup is claimed for 0.1.13. GPU coverage is software
 Vulkan on the host; it does not establish game visual parity.
