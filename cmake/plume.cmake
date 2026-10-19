@@ -11,8 +11,14 @@ FetchContent_Declare(sb_plume
     GIT_SUBMODULES_RECURSE TRUE
     PATCH_COMMAND ${CMAKE_COMMAND} -DSOURCE=<SOURCE_DIR>
         -DPATCH=${CMAKE_CURRENT_LIST_DIR}/../patches/plume/0001-shared-vulkan-interop.patch
+        -DPATCH2=${CMAKE_CURRENT_LIST_DIR}/../patches/plume/0002-borrowed-vulkan-buffer.patch
         -P ${CMAKE_CURRENT_LIST_DIR}/apply_plume_patch.cmake)
 FetchContent_MakeAvailable(sb_plume)
+# Also upgrade existing populated checkouts when the patch series grows.
+execute_process(COMMAND ${CMAKE_COMMAND} -DSOURCE=${sb_plume_SOURCE_DIR}
+    -DPATCH=${CMAKE_CURRENT_LIST_DIR}/../patches/plume/0001-shared-vulkan-interop.patch
+    -DPATCH2=${CMAKE_CURRENT_LIST_DIR}/../patches/plume/0002-borrowed-vulkan-buffer.patch
+    -P ${CMAKE_CURRENT_LIST_DIR}/apply_plume_patch.cmake COMMAND_ERROR_IS_FATAL ANY)
 # Plume's single translation unit normally defines VOLK_IMPLEMENTATION itself.
 # SpeedBreaker owns initialization from the selected libadrenotools/system handle.
 target_compile_definitions(plume PRIVATE PLUME_EXTERNAL_VOLK VMA_STATIC_VULKAN_FUNCTIONS=0)
