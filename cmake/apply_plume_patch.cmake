@@ -1,5 +1,5 @@
 find_program(GIT_EXECUTABLE git REQUIRED)
-foreach(PATCH IN ITEMS "${PATCH}" "${PATCH2}")
+foreach(PATCH IN ITEMS "${PATCH}" "${PATCH2}" "${PATCH3}")
 if(NOT PATCH)
     continue()
 endif()
