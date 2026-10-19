@@ -73,7 +73,7 @@ int main(int argc,char** argv) {
         auto pipeline=device->createGraphicsPipeline(graphics);assert(static_cast<VulkanGraphicsPipeline*>(pipeline.get())->vk);
         auto color=device->createTexture(RenderTextureDesc::ColorTarget(16,16,RenderFormat::R8G8B8A8_UNORM));
         const RenderTexture* attachment=color.get();auto framebuffer=device->createFramebuffer(RenderFramebufferDesc(&attachment,1));
-        std::array<std::unique_ptr<RenderBuffer>,3> reads;
+        std::array<std::unique_ptr<RenderBuffer>,7> reads;
         for(auto& read:reads) read=device->createBuffer(RenderBufferDesc::ReadbackBuffer(1024));
         const float value[4]={0.25f,0.5f,0.75f,1};RenderViewport viewport(0,0,16,16);RenderRect scissor(2,3,10,12);
         auto image=static_cast<VulkanTexture*>(color.get())->vk;
@@ -103,7 +103,24 @@ int main(int argc,char** argv) {
         VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};gp.pNext=&rendering;gp.stageCount=2;gp.pStages=stages;gp.layout=static_cast<VulkanPipelineLayout*>(layout.get())->vk;gp.pVertexInputState=&vi;gp.pInputAssemblyState=&ia;gp.pViewportState=&vp;gp.pRasterizationState=&rs;gp.pMultisampleState=&ms;gp.pColorBlendState=&cb;gp.pDynamicState=&ds;
         VkPipeline dynamicPipeline;Check(rhi::CreateGraphicsPipelines(native,VK_NULL_HANDLE,1,&gp,nullptr,&dynamicPipeline));
         auto index=device->createBuffer(RenderBufferDesc::IndexBuffer(6,RenderHeapType::UPLOAD));uint16_t indices[]={0,1,2};std::memcpy(index->map(),indices,6);index->unmap();
-        for(unsigned n=1;n<3;++n) {
+        auto vertexBuffer=device->createBuffer(RenderBufferDesc::UploadBuffer(80,RenderBufferFlag::VERTEX));
+        auto* host=static_cast<uint32_t*>(vertexBuffer->map());
+        for(unsigned i=0;i<20;++i)host[i]=0;
+        // Nonzero binding offset and vertex stride. Words are guest byte order.
+        for(unsigned vertex=0;vertex<3;++vertex) { host[4+vertex*4]=0x0000803f;host[5+vertex*4]=0x00000040;host[6+vertex*4]=0x00008040;host[7+vertex*4]=0x00000041; }
+        vertexBuffer->unmap();
+        for(unsigned n=1;n<7;++n) {
+            VkPipeline selected=dynamicPipeline;
+            VkShaderModule nativeShader=VK_NULL_HANDLE;
+            VkVertexInputBindingDescription binding{0,16,VK_VERTEX_INPUT_RATE_VERTEX};
+            const VkFormat inputFormats[]={VK_FORMAT_R32_UINT,VK_FORMAT_R32G32_UINT,VK_FORMAT_R32G32B32_UINT,VK_FORMAT_R32G32B32A32_UINT};
+            VkVertexInputAttributeDescription attribute{0,0,inputFormats[n>=3?n-3:0],0};
+            if(n>=3) {
+                auto binary=Read(folder+"/native"+std::to_string(n-2)+".vert.spv");
+                VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};sm.codeSize=binary.size()*4;sm.pCode=binary.data();Check(vkCreateShaderModule(native,&sm,nullptr,&nativeShader));
+                stages[0].module=nativeShader;vi.vertexBindingDescriptionCount=vi.vertexAttributeDescriptionCount=1;vi.pVertexBindingDescriptions=&binding;vi.pVertexAttributeDescriptions=&attribute;
+                Check(vkCreateGraphicsPipelines(native,VK_NULL_HANDLE,1,&gp,nullptr,&selected));
+            }
             Check(vkResetCommandBuffer(cmd,0));VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};Check(vkBeginCommandBuffer(cmd,&begin));rhi::BeginRecording(cmd);
             ImageBarrier(cmd,image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_ACCESS_TRANSFER_READ_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
             VkRenderingAttachmentInfoKHR colorInfo{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};colorInfo.imageView=static_cast<VulkanTexture*>(color.get())->imageView;colorInfo.imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;colorInfo.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;colorInfo.storeOp=VK_ATTACHMENT_STORE_OP_STORE;colorInfo.clearValue.color.float32[3]=1;
@@ -112,14 +129,17 @@ int main(int argc,char** argv) {
             if(n==1) {
                 vkCmdBeginRenderingKHR(cmd,&ri);vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,dynamicPipeline);vkCmdSetViewport(cmd,0,1,&nativeViewport);vkCmdSetScissor(cmd,0,1,&nativeScissor);vkCmdPushConstants(cmd,gp.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,16,value);vkCmdDraw(cmd,3,1,0,0);vkCmdEndRenderingKHR(cmd);
             } else {
-                rhi::BeginRendering(cmd,&ri,vkCmdBeginRenderingKHR);rhi::BindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,dynamicPipeline);rhi::SetViewport(cmd,0,1,&nativeViewport);rhi::SetScissor(cmd,0,1,&nativeScissor);rhi::PushConstants(cmd,gp.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,16,value);
+                rhi::BeginRendering(cmd,&ri,vkCmdBeginRenderingKHR);rhi::BindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,selected);
+                if(n>=3) { VkBuffer vb=static_cast<VulkanBuffer*>(vertexBuffer.get())->vk;VkDeviceSize at=16;rhi::BindVertexBuffers(cmd,0,1,&vb,&at); }
+                rhi::SetViewport(cmd,0,1,&nativeViewport);rhi::SetScissor(cmd,0,1,&nativeScissor);rhi::PushConstants(cmd,gp.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,16,value);
                 vkCmdBindIndexBuffer(cmd,static_cast<VulkanBuffer*>(index.get())->vk,0,VK_INDEX_TYPE_UINT16);rhi::DrawIndexed(cmd,3,1,0,0,0);rhi::EndRendering(cmd,vkCmdEndRenderingKHR);
             }
             ImageBarrier(cmd,image,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT);
             VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.imageExtent={16,16,1};vkCmdCopyImageToBuffer(cmd,image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,static_cast<VulkanBuffer*>(reads[n].get())->vk,1,&copy);HostBarrier(cmd,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);Check(vkEndCommandBuffer(cmd));submit();
+            if(nativeShader) {vkDestroyPipeline(native,selected,nullptr);vkDestroyShaderModule(native,nativeShader,nullptr);}
         }
         RenderRange readRange(0,1024);auto* expected=reads[0]->map(0,&readRange);assert(expected);
-        for(unsigned n=1;n<3;++n){auto* actual=reads[n]->map(0,&readRange);assert(!std::memcmp(expected,actual,1024));reads[n]->unmap();}
+        for(unsigned n=1;n<7;++n){auto* actual=reads[n]->map(0,&readRange);assert(!std::memcmp(expected,actual,1024));reads[n]->unmap();}
         auto* pixel=static_cast<const uint8_t*>(expected);assert(pixel[(4*16+4)*4]==64 && pixel[0]==0 && pixel[3]==255);reads[0]->unmap();
         vkDestroyPipeline(native,dynamicPipeline,nullptr);
         // Native image ownership uses Plume/VMA, including mutable formats.
@@ -144,7 +164,7 @@ int main(int argc,char** argv) {
     }
     }
     const auto c=rhi::GetCounters();
-    if (requested) assert(c.passes==1 && c.indexedDraws==1 && c.dispatches==2 && c.images==1);
+    if (requested) assert(c.passes==5 && c.indexedDraws==5 && c.dispatches==2 && c.images==1);
     else assert(c.passes==0 && c.indexedDraws==0 && c.dispatches==0 && c.images==0);
     rhi::Shutdown(); fixture.reset(); // Must leave native device and dispatch alive.
     assert(vkGetInstanceProcAddr==gipa);Check(vkDeviceWaitIdle(native));

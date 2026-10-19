@@ -40,6 +40,9 @@ int main(int argc, char** argv)
                 auto fetched=gpu::TranslateShader(gpu::ShaderStage::Vertex,words.data(),words.size());
                 assert(fetched.ok);
                 assert(fetched.vertexFetchConstants[0]==1u);
+                assert(fetched.nativeVertexEligible);
+                std::ofstream(std::filesystem::path(argv[1])/("nativefetch"+std::to_string(format)+(routing?"-routed.vert":"-legacy.vert")))
+                    << fetched.glsl.substr(0,fetched.glsl.find('\n')+1) << "#define NATIVE_VERTEX_INPUT\n#define VERTEX_PRIMITIVE_MODE 0\n" << fetched.glsl.substr(fetched.glsl.find('\n')+1);
                 if(routing) assert(fetched.glsl.find("uvec4 vwords = vertexWords")!=std::string::npos);
                 std::ofstream(std::filesystem::path(argv[1])/("fetch"+std::to_string(format)+(routing?"-routed.vert":"-legacy.vert")))<<fetched.glsl;
             }

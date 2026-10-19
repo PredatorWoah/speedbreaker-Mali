@@ -287,6 +287,10 @@ namespace gpu::renderer
         // XenosConstants (shader_translator.cpp): c[512], fetch[48], bools[2],
         // loops[8], drawInfo[4], each a vec4/uvec4.
         constexpr uint32_t kTextureReciprocalOffset = (512 + 48 + 2 + 8 + 4) * 16;
+        bool s_nativeVertexInput=false;
+        struct NativeVertexStats { uint64_t candidates=0,draws=0,attributes=0,indicesScanned=0,pending=0,prepareNs=0; } s_nativeVertexStats;
+        uint32_t s_nativeMaxAttributes=0, s_nativeMaxStride=0;
+        bool s_nativeFormats[4]={};
         struct VertexRouteStats { uint64_t draws=0, snapshots=0, shared=0, fallback=0, changes=0; } s_vertexRouteStats;
         constexpr uint32_t kVertexRoutesOffset = kTextureReciprocalOffset + 32 * 16;
         constexpr uint32_t kConstantsSize = kVertexRoutesOffset + 96 * sizeof(uint32_t);
@@ -699,7 +703,7 @@ namespace gpu::renderer
             uint32_t depthBase = 0, colorMask = 0, draws = 0, depthOnlyDraws = 0;
             uint32_t loadMask = 0, storeMask = 0, alphaDraws = 0;
             uint64_t bytes = 0, vertices = 0, indices = 0;
-            uint32_t noFragmentDraws = 0, eligibleDepthDraws = 0, snapshotDraws = 0, snapshotRanges = 0;
+            uint32_t noFragmentDraws = 0, eligibleDepthDraws = 0, snapshotDraws = 0, snapshotRanges = 0, nativeDraws = 0;
             uint64_t snapshotBytes = 0;
         };
         struct TimedSlot
@@ -777,7 +781,7 @@ namespace gpu::renderer
                 auto path = GetUserPath() / "logs" / ("gpu-passes-" + std::to_string(std::time(nullptr)) + ".csv");
                 std::error_code error; std::filesystem::create_directories(path.parent_path(), error);
                 FILE* out = fopen(path.c_str(), "w");
-                if (out) fputs("frame,submission,slot,region,kind,status,gpu_us,gap_before_us,width,height,base,format,depth_base,color_mask,draws,depth_only_draws,last_vs_hash,last_ps_hash,bytes,dropped_regions,submission_gpu_us,attachment_load_mask,attachment_store_mask,alpha_test_draws,no_fragment_requested_draws,eligible_no_fragment_draws,nonindexed_vertices,index_elements,first_vs_hash,first_ps_hash,snapshot_draws,snapshot_upload_ranges,snapshot_upload_bytes\n", out);
+                if (out) fputs("frame,submission,slot,region,kind,status,gpu_us,gap_before_us,width,height,base,format,depth_base,color_mask,draws,depth_only_draws,last_vs_hash,last_ps_hash,bytes,dropped_regions,submission_gpu_us,attachment_load_mask,attachment_store_mask,alpha_test_draws,no_fragment_requested_draws,eligible_no_fragment_draws,nonindexed_vertices,index_elements,first_vs_hash,first_ps_hash,snapshot_draws,snapshot_upload_ranges,snapshot_upload_bytes,native_geometry_draws\n", out);
                 fprintf(stderr, "[gpu-pass] output %s (%s); ordered GPU intervals, sampled frames may be perturbed; no readbacks or waits\n",
                     path.string().c_str(), out ? "ready" : "FAILED");
                 return out;
@@ -794,7 +798,7 @@ namespace gpu::renderer
                 if (us < 0) ++unavailable; else total += us;
                 if (csv && rows < 40000)
                 {
-                    fprintf(csv, "%llu,%llu,%u,%u,%s,%d,%.3f,%.3f,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%016llx,%llu,%u,%.3f,%u,%u,%u,%u,%u,%llu,%llu,%016llx,%016llx,%u,%u,%llu\n",
+                    fprintf(csv, "%llu,%llu,%u,%u,%s,%d,%.3f,%.3f,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%016llx,%llu,%u,%.3f,%u,%u,%u,%u,%u,%llu,%llu,%016llx,%016llx,%u,%u,%llu,%u\n",
                         (unsigned long long)region.frame, (unsigned long long)submission, index, i, region.kind,
                         ready ? 0 : int(status == VK_SUCCESS ? VK_NOT_READY : status), us, gap,
                         region.width, region.height, region.base, region.format, region.depthBase, region.colorMask,
@@ -803,7 +807,7 @@ namespace gpu::renderer
                         region.noFragmentDraws, region.eligibleDepthDraws,
                         (unsigned long long)region.vertices, (unsigned long long)region.indices,
                         (unsigned long long)region.firstVs, (unsigned long long)region.firstPs,
-                        region.snapshotDraws, region.snapshotRanges, (unsigned long long)region.snapshotBytes);
+                        region.snapshotDraws, region.snapshotRanges, (unsigned long long)region.snapshotBytes,region.nativeDraws);
                     ++rows;
                 }
                 last = ts[2]; lastReady = ready;
@@ -1400,7 +1404,7 @@ namespace gpu::renderer
             }
             s_narrowPassEnds++;
             s_barrierCounts.passEnds++;
-            NarrowBarrier(VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+            NarrowBarrier(VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                     VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
         }
@@ -1816,19 +1820,19 @@ namespace gpu::renderer
         // A pixel shader variant: colour outputs only for bound attachments
         // (Metal rejects others), inputs only for interpolators the vertex
         // shader writes, and the alpha test compiled in only when enabled.
-        std::string VertexPreamble(uint32_t primitiveMode)
+        std::string VertexPreamble(uint32_t primitiveMode, bool nativeInput=false)
         {
-            return std::format("#define VERTEX_PRIMITIVE_MODE {}\n", primitiveMode);
+            return std::format("#define VERTEX_PRIMITIVE_MODE {}\n", primitiveMode) + (nativeInput ? "#define NATIVE_VERTEX_INPUT\n" : "");
         }
 
-        VkShaderModule VertexModule(Shader& vs, uint32_t primitiveMode, bool legacySpirv = false, bool positionOnly = false)
+        VkShaderModule VertexModule(Shader& vs, uint32_t primitiveMode, bool legacySpirv = false, bool positionOnly = false, bool nativeInput = false)
         {
-            uint32_t key = primitiveMode | (legacySpirv ? 4u : 0u) | (positionOnly ? 8u : 0u);
+            uint32_t key = (nativeInput ? 16u : 0u) | primitiveMode | (legacySpirv ? 4u : 0u) | (positionOnly ? 8u : 0u);
             std::lock_guard lock(vs.compileMutex);
             if (auto it = vs.vertices.find(key); it != vs.vertices.end())
                 return it->second;
             std::string log;
-            auto spirv = CompileGlsl(vs.info.glsl, GLSLANG_STAGE_VERTEX, log, VertexPreamble(primitiveMode) + (positionOnly ? "#define POSITION_ONLY\n" : ""), legacySpirv);
+            auto spirv = CompileGlsl(vs.info.glsl, GLSLANG_STAGE_VERTEX, log, VertexPreamble(primitiveMode,nativeInput) + (positionOnly ? "#define POSITION_ONLY\n" : ""), legacySpirv);
             VkShaderModule module = VK_NULL_HANDLE;
             if (spirv.empty())
                 fprintf(stderr, "[renderer] vs_%016llx (primitive %u): GLSL compile failed:\n%s\n",
@@ -2775,6 +2779,7 @@ namespace gpu::renderer
             uint32_t depthControl;   // RB_DEPTHCONTROL (0 without a depth target, or one attached for the pass only)
             uint32_t raster;         // cull | front CW << 2 | depth clamp << 3 | depth bias << 4
             uint32_t primitiveMode;  // vertex expansion: 0 ordinary, 1 rectangle, 2 quad
+            uint32_t nativeInput;    // hardware attributes; immutable shader layout
 
             bool operator==(const PipelineKey& o) const { return memcmp(this, &o, sizeof(*this)) == 0; }
         };
@@ -2871,7 +2876,7 @@ namespace gpu::renderer
                     if (ec) ok = false;
                 }
             };
-            shader(vs, GLSLANG_STAGE_VERTEX, VertexPreamble(key.primitiveMode) +
+            shader(vs, GLSLANG_STAGE_VERTEX, VertexPreamble(key.primitiveMode,key.nativeInput!=0) +
                 ((s_depthStageReduction && (key.raster & 128u)) ? "#define POSITION_ONLY\n" : ""), ".vert");
             shader(ps, GLSLANG_STAGE_FRAGMENT, PixelPreamble(outputs, inputs, (key.raster >> 5) & 1, (key.raster >> 6) & 1), ".frag");
             auto state = std::format("result={}\nvs={:016x}\nps={:016x}\ntopology={}\nrestart={}\ncolorFormats={},{},{},{}\ndepthFormat={}\nraster={:08x}\ndepthControl={:08x}\ncolorMask={:08x}\noutputs={:x}\ninputs={:x}\nblend={:08x},{:08x},{:08x},{:08x}\n",
@@ -2893,7 +2898,7 @@ namespace gpu::renderer
         {
             const bool noFragment = (key.raster & 128u) != 0;
             const bool positionOnly = s_depthStageReduction && noFragment;
-            VkShaderModule vsModule = VertexModule(vs, key.primitiveMode, false, positionOnly);
+            VkShaderModule vsModule = VertexModule(vs, key.primitiveMode, false, positionOnly,key.nativeInput!=0);
             if (!vsModule)
                 return VK_NULL_HANDLE;
             VkPipelineShaderStageCreateInfo stages[2]{};
@@ -2912,6 +2917,18 @@ namespace gpu::renderer
                 psModule, "main", nullptr };
 
             VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+            std::vector<VkVertexInputBindingDescription> vertexBindings;
+            std::vector<VkVertexInputAttributeDescription> vertexAttributes;
+            if(key.nativeInput) {
+                const VkFormat formats[]={VK_FORMAT_R32_UINT,VK_FORMAT_R32G32_UINT,VK_FORMAT_R32G32B32_UINT,VK_FORMAT_R32G32B32A32_UINT};
+                for(uint32_t i=0;i<vs.info.nativeAttributes.size();++i) {
+                    const auto& a=vs.info.nativeAttributes[i];
+                    vertexBindings.push_back({i,a.stride,VK_VERTEX_INPUT_RATE_VERTEX});
+                    vertexAttributes.push_back({i,i,formats[a.words-1],0});
+                }
+                vi.vertexBindingDescriptionCount=uint32_t(vertexBindings.size());vi.pVertexBindingDescriptions=vertexBindings.data();
+                vi.vertexAttributeDescriptionCount=uint32_t(vertexAttributes.size());vi.pVertexAttributeDescriptions=vertexAttributes.data();
+            }
             VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
             ia.topology = VkPrimitiveTopology(key.topology);
             ia.primitiveRestartEnable = key.restart;
@@ -3031,7 +3048,7 @@ namespace gpu::renderer
                     (unsigned long long)key.vs, (unsigned long long)key.ps);
                 if (pipeline) vkDestroyPipeline(s_dev, pipeline, nullptr);
                 pipeline = VK_NULL_HANDLE;
-                stages[0].module = VertexModule(vs, key.primitiveMode, true, positionOnly);
+                stages[0].module = VertexModule(vs, key.primitiveMode, true, positionOnly,key.nativeInput!=0);
                 stages[1].module = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1, true, (key.raster >> 6) & 1);
                 if (stages[0].module && stages[1].module)
                 {
@@ -3131,7 +3148,7 @@ namespace gpu::renderer
 
         // The pipeline for `key`; VK_NULL_HANDLE with `pending` set while a
         // worker still compiles it (the caller skips the draw).
-        VkPipeline GetPipeline(const PipelineKey& key, VkPipelineLayout layout, bool& pending)
+        VkPipeline GetPipeline(const PipelineKey& key, VkPipelineLayout layout, bool& pending, bool optional=false)
         {
             pending = false;
             static PipelineKey lastKey{};
@@ -3195,7 +3212,7 @@ namespace gpu::renderer
                 // is spent, draws just check. A per-draw wait made a pipeline
                 // used by 13 draws cost 47 ms a frame while it compiled.
                 auto waitStart = std::chrono::steady_clock::now();
-                if (!settings::GetBool(settings::Id::AsyncShaders) || s_frame < s_waitPipelinesUntil)
+                if (!optional && (!settings::GetBool(settings::Id::AsyncShaders) || s_frame < s_waitPipelinesUntil))
                 {
                     job->forcedWait |= s_frame < s_waitPipelinesUntil;
                     job->cv.wait(lock, [&] { return job->done; });
@@ -3207,7 +3224,7 @@ namespace gpu::renderer
                     // only checked afterwards, not waited for every frame
                     // (that cost 3 ms a frame for as long as it compiled).
                     auto start = std::chrono::steady_clock::now();
-                    int64_t budget = job->outlasted ? 0 : std::max<int64_t>(s_pipelineWaitLeftUs, 0);
+                    int64_t budget = (optional || job->outlasted) ? 0 : std::max<int64_t>(s_pipelineWaitLeftUs, 0);
                     bool ready = job->cv.wait_for(lock, std::chrono::microseconds(budget), [&] { return job->done; });
                     s_pipelineWaitLeftUs -= std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
                     if (!ready && budget > 0)
@@ -3215,8 +3232,7 @@ namespace gpu::renderer
                     if (!ready)
                     {
                         pending = true;
-                        s_pipelineSkips++;
-                        ++job->skips;
+                        if(!optional) { s_pipelineSkips++; ++job->skips; }
                         job->waitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
                         return VK_NULL_HANDLE;
                     }
@@ -6789,7 +6805,7 @@ void main()
             VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
             bci.pNext = &embci;
             bci.size = kSharedSize;
-            bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             Check(vkCreateBuffer(s_dev, &bci, nullptr, &s_shared), "vkCreateBuffer(shared)");
             VkMemoryRequirements req;
             vkGetBufferMemoryRequirements(s_dev, s_shared, &req);
@@ -6824,7 +6840,7 @@ void main()
         {
             VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
             bci.size = kSharedSize;
-            bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             VkBuffer buffer = VK_NULL_HANDLE;
             Check(vkCreateBuffer(s_dev, &bci, nullptr, &buffer), "vkCreateBuffer(shadow)");
             vkGetBufferMemoryRequirements(s_dev, buffer, &req);
@@ -6983,7 +6999,7 @@ void main()
         {
             VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
             bci.size = kRingSize;
-            bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
             Check(vkCreateBuffer(s_dev, &bci, nullptr, &s_ring), "vkCreateBuffer(ring)");
             VkMemoryRequirements req;
             vkGetBufferMemoryRequirements(s_dev, s_ring, &req);
@@ -7350,6 +7366,7 @@ void main()
         gpu::g_predicateCoalescingEnabled = settings::GetBool(settings::Id::PredicateCoalescing);
         s_depthStageReduction = settings::GetBool(settings::Id::DepthStageReduction);
         gpu::g_vertexRoutingEnabled = settings::GetBool(settings::Id::VertexMemoryRouting);
+        s_nativeVertexInput = settings::GetBool(settings::Id::NativeVertexInput);
         fprintf(stderr, "[renderer] vertex memory routing=%d\n", gpu::g_vertexRoutingEnabled);
         fprintf(stderr, "[renderer] predicate coalescing=%d depth stage reduction=%d\n",
             gpu::g_predicateCoalescingEnabled, s_depthStageReduction);
@@ -7359,6 +7376,15 @@ void main()
         if (!s_vk)
             return false;
         s_dev = s_vk->device;
+        {
+            VkPhysicalDeviceProperties props;vkGetPhysicalDeviceProperties(s_vk->physical,&props);
+            s_nativeMaxAttributes=std::min({16u,props.limits.maxVertexInputAttributes,props.limits.maxVertexInputBindings});
+            s_nativeMaxStride=props.limits.maxVertexInputBindingStride;
+            const VkFormat formats[]={VK_FORMAT_R32_UINT,VK_FORMAT_R32G32_UINT,VK_FORMAT_R32G32B32_UINT,VK_FORMAT_R32G32B32A32_UINT};
+            for(unsigned i=0;i<4;++i) { VkFormatProperties f;vkGetPhysicalDeviceFormatProperties(s_vk->physical,formats[i],&f);s_nativeFormats[i]=(f.bufferFeatures&VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)!=0; }
+            fprintf(stderr,"[native-geometry] hardware input enabled=%d max_attributes=%u max_stride=%u\n",s_nativeVertexInput,s_nativeMaxAttributes,s_nativeMaxStride);
+        }
+
         s_regs = regs;
         {
             VkPhysicalDeviceProperties props;
@@ -8276,6 +8302,46 @@ void main()
                 }
             }
             break;
+        }
+
+        uint32_t nativeOffsets[16] = {};
+        bool nativeShared[16] = {};
+        bool nativeGeometry=false;
+        if(s_nativeVertexInput && s_vs->info.nativeVertexEligible && !s_vs->info.usesMemExport && !s_ps->info.usesMemExport &&
+            key.primitiveMode==0 && !restart && (g_eagerWrites || s_shadowMode) && !s_vs->info.nativeAttributes.empty() &&
+            s_vs->info.nativeAttributes.size()<=s_nativeMaxAttributes) {
+            ++s_nativeVertexStats.candidates;
+            auto nativePrepareStart=std::chrono::steady_clock::now();
+            uint32_t first=0,last=vertexCount-1;
+            if(useIndices) {
+                first=UINT32_MAX;last=0;
+                for(uint32_t i=0;i<vertexCount;++i) {
+                    uint32_t v;
+                    if(!directIndices) v=indices[i];
+                    else if(indices16) { uint16_t x;memcpy(&x,s_ringHost+indexOffset+size_t(i)*2,2);v=x; }
+                    else memcpy(&v,s_ringHost+indexOffset+size_t(i)*4,4);
+                    first=std::min(first,v);last=std::max(last,v);
+                }
+                s_nativeVertexStats.indicesScanned+=vertexCount;
+            }
+            nativeGeometry=true;
+            for(uint32_t i=0;i<s_vs->info.nativeAttributes.size();++i) {
+                const auto& a=s_vs->info.nativeAttributes[i];
+                const uint32_t* vf=&s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0+a.constant*2];
+                if(a.stride>s_nativeMaxStride || !s_nativeFormats[a.words-1] ||
+                    !gpu::native_vertex::Plan(a,vf[0],vf[1],copies,copyCount,first,last,
+                        s_regs[XE_GPU_REG_VGT_INDX_OFFSET],nativeOffsets[i],&nativeShared[i]) ||
+                    (nativeShared[i] && (writewatch::GpuWritePending(gpu::vertex_route::Base(vf[0]),gpu::vertex_route::Size(gpu::vertex_route::Base(vf[0]),vf[1])) ||
+                        writewatch::AnyGpuOwned(gpu::vertex_route::Base(vf[0]),gpu::vertex_route::Size(gpu::vertex_route::Base(vf[0]),vf[1]))))) { nativeGeometry=false;break; }
+            }
+            s_nativeVertexStats.prepareNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-nativePrepareStart).count();
+            if(nativeGeometry) {
+                PipelineKey nativeKey=key;nativeKey.nativeInput=1;
+                bool pending=false;
+                VkPipeline nativePipeline=GetPipeline(nativeKey,layout.pipeline,pending,true);
+                if(nativePipeline) { pipeline=nativePipeline;key=nativeKey; }
+                else { nativeGeometry=false;s_nativeVertexStats.pending+=pending; }
+            }
         }
 
         // The attachments' common size (the pass extent) and this draw's
@@ -9291,10 +9357,20 @@ void main()
                 s_ps->info.usesKill, s_ps->info.writesDepth, s_ps->info.usesMemExport, s_vs->info.usesMemExport);
             if (useIndices) timed.indices += vertexCount; else timed.vertices += vertexCount;
             timed.snapshotDraws += copyCount != 0;
+            timed.nativeDraws += nativeGeometry;
             timed.snapshotRanges += copyCount; timed.snapshotBytes += copyBytes;
             timed.vs = s_vs->hash; timed.ps = s_ps->hash;
             timed.depthOnlyDraws += s_ps->hash == kDepthOnlyPsHash;
             timed.alphaDraws += pc.alphaTest != 7u;
+        }
+        if(nativeGeometry) {
+            VkBuffer buffers[16];VkDeviceSize offsets[16];
+            for(uint32_t i=0;i<s_vs->info.nativeAttributes.size();++i) {
+                buffers[i]=nativeShared[i] ? s_shared : s_ring;
+                offsets[i]=(nativeShared[i] ? VkDeviceSize(0) : VkDeviceSize(pc.vfRedirect[0][2]))+nativeOffsets[i];
+            }
+            gpu::plume_rhi::BindVertexBuffers(s_cmd,0,uint32_t(s_vs->info.nativeAttributes.size()),buffers,offsets);
+            ++s_nativeVertexStats.draws;s_nativeVertexStats.attributes+=s_vs->info.nativeAttributes.size();
         }
         if (useIndices)
         {
@@ -9346,6 +9422,7 @@ void main()
                     auto& timed = s_timedSlots[s_slot].regions[s_timedPass];
                     ++timed.draws;
                     timed.snapshotDraws += copyCount != 0;
+            timed.nativeDraws += nativeGeometry;
                     timed.noFragmentDraws += (key.raster & 128u) != 0;
                     timed.eligibleDepthDraws += gpu::CanOmitFragmentStage(key.colorMask, alphaTest,
                         s_ps->info.usesKill, s_ps->info.writesDepth, s_ps->info.usesMemExport, s_vs->info.usesMemExport);
@@ -9729,6 +9806,10 @@ void main()
     void OnSwap(uint64_t frame)
     {
         if (frame % 120 == 0) {
+            const auto& nv=s_nativeVertexStats;
+            fprintf(stderr,"[native-geometry] candidates=%llu draws=%llu attributes=%llu scanned_indices=%llu optional_pipeline_pending=%llu prepare_us=%llu (cumulative; game command processor still active)\n",
+                (unsigned long long)nv.candidates,(unsigned long long)nv.draws,(unsigned long long)nv.attributes,
+                (unsigned long long)nv.indicesScanned,(unsigned long long)nv.pending,(unsigned long long)(nv.prepareNs/1000));
             const auto& vr = s_vertexRouteStats;
             fprintf(stderr, "[vertex-route] enabled=%d draws=%llu snapshot_routes=%llu shared_routes=%llu fallback_routes=%llu metadata_changes=%llu (cumulative declared fetch ranges, not GPU hits)\n",
                 gpu::g_vertexRoutingEnabled, (unsigned long long)vr.draws, (unsigned long long)vr.snapshots,

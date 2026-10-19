@@ -145,6 +145,17 @@ void PushDescriptors(PFN_vkCmdPushDescriptorSetKHR push, VkCommandBuffer cmd, Vk
 #endif
     push(cmd,point,layout,set,count,writes);
 }
+void BindVertexBuffers(VkCommandBuffer cmd, uint32_t first, uint32_t count, const VkBuffer* buffers, const VkDeviceSize* offsets) {
+#ifdef SB_PLUME_RHI
+    if(enabled) {
+        assert(count<=16);
+        plume::VulkanBuffer wrapped[16];plume::RenderVertexBufferView views[16];plume::RenderInputSlot slots[16];
+        for(uint32_t i=0;i<count;++i) { wrapped[i].vk=buffers[i];views[i].buffer={&wrapped[i],offsets[i]};slots[i].index=first+i; }
+        Cmd(cmd).list.setVertexBuffers(first,views,count,slots);return;
+    }
+#endif
+    vkCmdBindVertexBuffers(cmd,first,count,buffers,offsets);
+}
 void Draw(VkCommandBuffer cmd, uint32_t count, uint32_t instances, uint32_t first, uint32_t firstInstance) {
 #ifdef SB_PLUME_RHI
     if (enabled) { Cmd(cmd).list.drawInstanced(count,instances,first,firstInstance); ++draws; return; }

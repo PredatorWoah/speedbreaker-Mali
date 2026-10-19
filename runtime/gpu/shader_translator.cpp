@@ -176,6 +176,7 @@ float xmul(float a, float b)
 
             // Previous vfetch_full, for vfetch_mini.
             VertexFetchInstruction lastFullFetch{};
+            bool nativeIndexUnmodified=true;
 
             void Error(const std::string& message)
             {
@@ -456,6 +457,10 @@ float xmul(float a, float b)
                 if (!vecNeeded && !scaNeeded && !zeroMask && !oneMask)
                     return;
 
+                if (!op.is_export() &&
+                    (((vecMask & 1u) && (op.vector_dest()==0 || op.is_vector_dest_relative())) ||
+                     ((scaMask & 1u) && (op.scalar_dest()==0 || op.is_scalar_dest_relative()))))
+                    nativeIndexUnmodified=false;
                 Predicate(op.is_predicated(), op.predicate_condition());
                 // Both operations read the registers as they were before the
                 // instruction: compute into temporaries, then store.
@@ -511,6 +516,7 @@ float xmul(float a, float b)
             // Destination swizzle for fetches: 3 bits per component.
             void StoreFetchResult(uint32_t dest, bool destRelative, uint32_t swizzle, const std::string& value)
             {
+                if (destRelative || (dest==0 && (swizzle&7u)!=7u)) nativeIndexUnmodified=false;
                 std::string dst = Reg(dest, destRelative);
                 for (uint32_t c = 0; c < 4; c++)
                 {
@@ -560,11 +566,20 @@ float xmul(float a, float b)
                 case xenos::VertexFormat::k_32_32_32_32_FLOAT: words = 4; break;
                 default: break;
                 }
+                unsigned nativeSlot=unsigned(out.nativeAttributes.size());
+                out.nativeAttributes.push_back({slot,uint32_t(full.stride())*4u,words,int32_t(op.offset())*4});
+                if(!nativeIndexUnmodified || full.src()!=0 || full.is_src_relative() || full.src_swizzle()!=0 || nativeSlot>=16)
+                    out.nativeVertexEligible=false;
+                Line("#ifdef NATIVE_VERTEX_INPUT");
+                Line(std::format("#define VF_WORD(i) native_attr{}[i]",nativeSlot));
+                Line("#else");
+                if(g_vertexRoutingEnabled) Line("#define VF_WORD(i) vwords[i]");
+                else Line("#define VF_WORD(i) vmem(vbase + uint(i)*4u)");
+                Line("#endif");
                 if (g_vertexRoutingEnabled)
                     Line(std::format("uvec4 vwords = vertexWords{}(vbase, vf0, vf1, u.vertexRoutes[{}][{}]);", words, slot / 4, slot % 4));
                 auto word = [&](int i) {
-                    return g_vertexRoutingEnabled ? std::format("gpuSwap(vwords[{}], vendian)", i)
-                        : std::format("gpuSwap(vmem(vbase + {}u), vendian)", i * 4);
+                    return std::format("gpuSwap(VF_WORD({}), vendian)",i);
                 };
                 std::string value;
                 // Packed integer formats: widths/offsets per component.
@@ -654,6 +669,7 @@ float xmul(float a, float b)
                     value = std::format("({} * {})", value, std::ldexp(1.0f, op.exp_adjust()));
                 Line("vec4 vdata = " + value + ";");
                 StoreFetchResult(op.dest(), op.is_dest_relative(), op.dest_swizzle(), "vdata");
+                Line("#undef VF_WORD");
                 indent--;
                 Line("}");
                 if (!g_predicateCoalescingEnabled) ClosePredicate();
@@ -773,6 +789,7 @@ float xmul(float a, float b)
 
             void Translate()
             {
+                out.nativeVertexEligible=stage==ShaderStage::Vertex;
                 // Control flow program bound: the first exec's instruction address.
                 uint32_t bound = uint32_t(dwords / 3);
                 std::vector<ControlFlowInstruction> cf;
@@ -810,6 +827,7 @@ float xmul(float a, float b)
                     }
                 }
 
+                if (!flat) out.nativeVertexEligible=false;
                 if (flat)
                 {
                     for (auto& c : cf)
@@ -1074,6 +1092,12 @@ vec3 cubeDirection(vec3 c)
         const char* reciprocal = std::getenv("NFSMW_TEXTURE_RECIPROCAL");
         if (!g_workReductionEnabled || (reciprocal && reciprocal[0] == '0'))
             g.insert(g.find('\n') + 1, "#define TEXTURE_SIZE_QUERY\n");
+        if(stage==ShaderStage::Vertex) {
+            g += "#ifdef NATIVE_VERTEX_INPUT\n";
+            for(size_t i=0;i<result.nativeAttributes.size();++i)
+                g += std::format("layout(location = {}) in uvec4 native_attr{};\n",i,i);
+            g += "#endif\n";
+        }
         g += kHelpers;
         g += std::format("#define R_COUNT {}\n", regCount);
         for (uint32_t n = 0; n < 32; n++)

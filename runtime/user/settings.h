@@ -69,6 +69,7 @@ namespace settings
         GpuWorkReduction,
         PredicateCoalescing,
         VertexMemoryRouting,
+        NativeVertexInput,
         DepthStageReduction,
         RenderBackend,
         Count

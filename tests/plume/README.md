@@ -34,3 +34,8 @@ The vertex-route fixture also compares 8.4 million CPU word-source addresses and
 generates the exact routed GLSL helpers used by production. GPU compute compares
 those helpers with the old per-word path across 257 address/range cases, under
 both native and Plume recording. This adds a fourth CTest case.
+
+The native geometry pilot additionally checks all four uint vertex attribute
+widths, endian conversion, offset/stride and indexed draws against the same image.
+Borrowed runtime buffer wrappers must leave the owning buffer intact. Both
+runtime Plume and Legacy recording execute these hardware-fetch checks.

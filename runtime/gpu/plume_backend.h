@@ -19,6 +19,7 @@ void BindPipeline(VkCommandBuffer cmd, VkPipelineBindPoint point, VkPipeline pip
 void PushConstants(VkCommandBuffer cmd, VkPipelineLayout layout, VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void* data);
 void BindDescriptorSets(VkCommandBuffer cmd, VkPipelineBindPoint point, VkPipelineLayout layout, uint32_t first, uint32_t count, const VkDescriptorSet* sets, uint32_t offsetCount, const uint32_t* offsets);
 void PushDescriptors(PFN_vkCmdPushDescriptorSetKHR push, VkCommandBuffer cmd, VkPipelineBindPoint point, VkPipelineLayout layout, uint32_t set, uint32_t count, const VkWriteDescriptorSet* writes);
+void BindVertexBuffers(VkCommandBuffer cmd, uint32_t first, uint32_t count, const VkBuffer* buffers, const VkDeviceSize* offsets);
 void Draw(VkCommandBuffer cmd, uint32_t count, uint32_t instances, uint32_t first, uint32_t firstInstance);
 void DrawIndexed(VkCommandBuffer cmd, uint32_t count, uint32_t instances, uint32_t first, int32_t base, uint32_t firstInstance);
 void Dispatch(VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t z);

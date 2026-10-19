@@ -24,6 +24,13 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/route.comp.spv
     COMMAND ${SB_SPIRV_VAL} --target-env vulkan1.2 ${CMAKE_CURRENT_BINARY_DIR}/route.comp.spv
     DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/route.comp)
 list(APPEND SHADERS ${CMAKE_CURRENT_BINARY_DIR}/route.comp.spv)
+foreach(n RANGE 1 4)
+    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/native${n}.vert.spv
+        COMMAND ${SB_GLSLANG} -V --target-env vulkan1.2 -Os -g0 -DNATIVE_WORDS=${n} ${CMAKE_CURRENT_SOURCE_DIR}/native.vert -o ${CMAKE_CURRENT_BINARY_DIR}/native${n}.vert.spv
+        COMMAND ${SB_SPIRV_VAL} --target-env vulkan1.2 ${CMAKE_CURRENT_BINARY_DIR}/native${n}.vert.spv
+        DEPENDS native.vert)
+    list(APPEND SHADERS ${CMAKE_CURRENT_BINARY_DIR}/native${n}.vert.spv)
+endforeach()
 add_executable(plume_offscreen_test offscreen.cpp ../../runtime/gpu/plume_backend.cpp ${SHADERS})
 target_compile_definitions(plume_offscreen_test PRIVATE SB_PLUME_RHI=1 VK_NO_PROTOTYPES)
 target_compile_options(plume_offscreen_test PRIVATE -UNDEBUG -include volk.h)
