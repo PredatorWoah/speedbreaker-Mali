@@ -18,9 +18,12 @@ and populated checkouts. No RP6 performance gain is inferred from host results.
 All five tests also pass in Debug with AddressSanitizer and core+sync validation;
 LeakSanitizer is disabled for the sandbox's restricted process inspection.
 
-The earlier 0.1.12–0.1.14 APKs remain separate preserved artifacts. Android build
-and package verification for this checkpoint are recorded separately when done;
-the interrupted build before workspace maintenance is not a successful result.
+The earlier 0.1.12–0.1.14 APKs remain separate preserved artifacts. Optimized
+signed ARM64 0.1.15 code 16 is built from clean source `3402b25`; retained
+certificate, seven staged libraries, all 56,736 mappings and strong game hooks
+are verified. SHA256 `9884ae8102ed071ee43225aa92a3d7bab7dd2766c67be433a3add965c4d2e070`.
+Record: `builds/android/0.1.15-game-shader-resources/`. The interrupted build before
+workspace maintenance is excluded. No RP6 gameplay or performance validation.
 
 Branch: `android/plume-rhi`; fallback: `android/rp6-bringup` and retained 0.1.11 APK.
 Plume: `renderbag/plume@e48a55be0cff0f1e82b25cd0ab68be37357ee0f9` (MIT).
@@ -46,7 +49,11 @@ The generic Plume resource/shader/graphics/compute interfaces are also exercised
 
 ## Build and rollback
 
-`SB_PLUME_RHI=ON` fetches the exact pin/submodules and applies `patches/plume/0001-shared-vulkan-interop.patch` idempotently. Plume and the runtime share that pin's Volk and Vulkan headers, with one hidden Volk implementation. Plume's own Volk implementation is disabled. The selected system/custom Android loader remains authoritative.
+`SB_PLUME_RHI=ON` fetches the exact pin/submodules and applies patches 0001–0003
+in `patches/plume/` idempotently, including upgrades of populated checkouts.
+Plume and the runtime share that pin's Volk and Vulkan headers, with one hidden
+Volk implementation. Plume's own Volk implementation is disabled. The selected
+system/custom Android loader remains authoritative.
 
 Gradle accepts `-PsbPlume=ON`; the established external native staging workflow remains supported. OFF builds do not link Plume and tolerate a stale saved Plume selection by using Legacy.
 

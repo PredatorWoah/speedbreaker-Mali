@@ -1,4 +1,4 @@
-# Game-native renderer migration — 0.1.14 first geometry slice
+# Game-native renderer migration — 0.1.15 shader resources
 
 ## Goal and actual state
 
@@ -8,7 +8,8 @@ Vulkan. Renaming the existing PM4/Xenos path is not completion of that goal.
 
 **Full conversion is NOT complete.** 0.1.14 implements functional hardware vertex
 input in the running rendering flow, with validated offscreen draws and an
-Android build. PM4 processing, register-state translation, shader translation,
+Android build. 0.1.15 adds game-level shader creation and immutable variants,
+consumed by pipeline creation. PM4 processing, register-state translation, shader translation,
 EDRAM target interpretation and custom resolves remain active. There is no
 misleading fully-native backend selection. Legacy/Plume rollback stays available.
 
@@ -199,3 +200,20 @@ and presentation remain. This is not a no-emulated-GPU backend. Next: ordered
 host draws with complete semantic state and native target/texture handles,
 including CPU-visible resource synchronization, followed by native presentation.
 A source checkpoint or synthetic GPU test is not a playable fully native game.
+
+### 0.1.15 signed Android checkpoint
+
+Clean compiled source `3402b25b06cd1a31dc9e217029d20796ffa99651`, Android code 16,
+NDK r28c, RelWithDebInfo (-O2). Complete ARM64 runtime link and Gradle release
+packaging pass with the preserved certificate. Seven exact staged libraries,
+all 56,736 mapping symbols, three strong constructor/patcher hook symbols,
+manifest/ABI/ZIP/alignment, single hidden Volk and no direct libvulkan dependency
+are verified. Build ID `23c8284f4a5e8ea71ad3acf36b9d63c31a3c0ae7`.
+APK SHA256 `9884ae8102ed071ee43225aa92a3d7bab7dd2766c67be433a3add965c4d2e070`.
+See `builds/android/0.1.15-game-shader-resources/` for build evidence.
+
+All three Plume patches were also applied twice to a clean worktree at the pin;
+the result matches the built patched source byte for byte. Full Android OFF
+link was not repeated; adapter compile-OFF and runtime Legacy GPU tests pass.
+This is offline validation, with no RP6 gameplay, visual or FPS result. Existing
+APKs remain separately saved. No ADB/device access or shader/disc uploads occurred.
