@@ -18,6 +18,7 @@
 #include "memory_plan.h"
 #include "pipeline_cache_header.h"
 #include "shader_translator.h"
+#include "game_shader.h"
 #include "zpd_report.h"
 #include "visual_capture.h"
 #include <report/zip.h>
@@ -7367,6 +7368,7 @@ void main()
         s_depthStageReduction = settings::GetBool(settings::Id::DepthStageReduction);
         gpu::g_vertexRoutingEnabled = settings::GetBool(settings::Id::VertexMemoryRouting);
         s_nativeVertexInput = settings::GetBool(settings::Id::NativeVertexInput);
+        game_shader::PublishTranslationReady();
         fprintf(stderr, "[renderer] vertex memory routing=%d\n", gpu::g_vertexRoutingEnabled);
         fprintf(stderr, "[renderer] predicate coalescing=%d depth stage reduction=%d\n",
             gpu::g_predicateCoalescingEnabled, s_depthStageReduction);
@@ -7630,10 +7632,16 @@ void main()
             slot = std::make_unique<Shader>();
             slot->stage = type == 0 ? ShaderStage::Vertex : ShaderStage::Pixel;
             slot->hash = h;
-            std::vector<uint32_t> ucode(dwords);
-            for (uint32_t i = 0; i < dwords; i++)
-                ucode[i] = __builtin_bswap32(words[i]);
-            slot->info = TranslateShader(slot->stage, ucode.data(), dwords);
+            const auto native = game_shader::Enabled() ?
+                game_shader::GetLibrary().Find(type,h,{words,dwords}) : nullptr;
+            if (native) {
+                slot->info = native->translated;
+            } else {
+                std::vector<uint32_t> ucode(dwords);
+                for (uint32_t i = 0; i < dwords; i++)
+                    ucode[i] = __builtin_bswap32(words[i]);
+                slot->info = TranslateShader(slot->stage, ucode.data(), dwords);
+            }
             if (!slot->info.ok)
                 fprintf(stderr, "[renderer] %s_%016llx: translation failed: %s\n", type == 0 ? "vs" : "ps",
                     (unsigned long long)h, slot->info.error.c_str());
@@ -9806,6 +9814,10 @@ void main()
     void OnSwap(uint64_t frame)
     {
         if (frame % 120 == 0) {
+            const auto gs=game_shader::GetLibrary().GetStats();
+            fprintf(stderr,"[game-shaders] enabled=%d created=%llu reused=%llu pipeline_sources=%llu rejected=%llu bytes=%zu (cumulative; PM4 draw/state/EDRAM remain)\n",
+                game_shader::Enabled(),(unsigned long long)gs.created,(unsigned long long)gs.reused,
+                (unsigned long long)gs.hits,(unsigned long long)gs.rejected,gs.bytes);
             const auto& nv=s_nativeVertexStats;
             fprintf(stderr,"[native-geometry] candidates=%llu draws=%llu attributes=%llu scanned_indices=%llu optional_pipeline_pending=%llu prepare_us=%llu (cumulative; game command processor still active)\n",
                 (unsigned long long)nv.candidates,(unsigned long long)nv.draws,(unsigned long long)nv.attributes,
