@@ -71,16 +71,19 @@ A as an optimization priority. Do not infer vertex cost from a color-pass label.
   The graphics pilot adds 1–4-word hardware inputs with a nonzero buffer offset,
   stride, endian swap and indexed draw. All seven offscreen outputs match the
   original 1,024-byte image. Borrowed Plume buffers survive wrapper destruction.
-- 240 native/compatibility format shaders compile/validate: all 15 supported
-  guest formats, Vulkan 1.1/1.2, split/contiguous memory and routing on/off.
-- One synthetic four-word shader: compatibility 18,288 bytes/57 static branches;
-  hardware-input variant 6,620 bytes/16 branches, with guest buffer binding zero
+- 480 native/compatibility format shaders compile/validate: all 15 supported
+  guest formats, Vulkan 1.1/1.2, split/contiguous memory, routing on/off, and ordinary/position-only outputs.
+- One synthetic four-word shader: compatibility 13,912 bytes/35 static branches;
+  hardware-input variant 6,620 bytes/16 branches (ordinary primitive mode on both), with guest buffer binding zero
   absent. This demonstrates removal of that shader access path, not Adreno
   cycle performance or hot-game coverage.
 - Existing fetched Plume checkout upgrade and repeatable patch-series application
   pass; clean pinned source build tests pass. One loader/device remains.
-- Android optimized native link passes. Final signed APK evidence is recorded
-  separately under builds/android/0.1.14-plume-vulkan/ when complete.
+- Android optimized native link and signed APK packaging pass. Compiled clean source
+  17ddb60, code 15, retained certificate, seven exact staged libraries and all
+  56,736 mapping entries verified. ZIP/alignment/manifest checks pass; see
+  builds/android/0.1.14-plume-vulkan/. CI was queued at verification time; no
+  CI success is inferred from local validation.
 
 No 0.1.14 RP6 execution, parity, FPS/pacing improvement or 2x speedup is established.
 

@@ -463,7 +463,20 @@ Implemented a hardware vertex-input path with exact address bounds, protected
 static/shared buffers or snapshots, native attribute layouts and Plume binding.
 Original format/endian/ALU retained; unsupported cases and optional-pipeline
 compilation fall back without losing draws. Added native pass counts and CPU
-preparation diagnostics. 46 host suites, four Vulkan/Legacy checks, 240 shader
+preparation diagnostics. 46 host suites, four Vulkan/Legacy checks, 480 shader
 modules and Android native link pass. This is NOT a completed full-native
 renderer: game-call/resource interception, PM4 removal and native render-target
 ownership remain. See ANDROID_NATIVE_RENDERER.md for evidence and next stages.
+
+### 0.1.14 signed native-geometry stage completed
+
+Compiled clean source 17ddb60, version 0.1.14 code 15. APK/native build,
+retained signature, seven library identities, all 56,736 mapping symbols,
+ZIP/alignment/manifest/dispatch checks pass. APK SHA256
+56cf6fa50214012f5567451ed60d1b60495661019e53a674526bfbbb5c1fb5f4;
+native Build ID 015811f3b5b4401c3a7cccf658e8271127c33cd7.
+0.1.12 and 0.1.13 APK checksums verified unchanged. CI queued, local tests pass.
+Fair synthetic shader comparison uses ordinary primitive mode on both paths:
+13,912 bytes/35 branches vs native 6,620/16. The earlier 18,288/57 comparison
+included compatibility primitive expansion and was not a fair runtime delta.
+No RP6 performance or completed full-native renderer claim.
