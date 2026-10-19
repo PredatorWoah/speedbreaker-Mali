@@ -157,6 +157,27 @@ add_custom_target(nfsmw_build_info
     VERBATIM)
 add_dependencies(SpeedBreaker nfsmw_build_info)
 
+# Experimental Plume RHI integration. Off for the established Vulkan renderer.
+# The Plume backend is built on Android only; guest draw translation is not yet migrated.
+option(SB_PLUME_RHI "Build experimental Plume Vulkan RHI on Android" OFF)
+if(SB_PLUME_RHI)
+    if(NOT ANDROID)
+        message(FATAL_ERROR "SB_PLUME_RHI currently supports only Android")
+    endif()
+    include(FetchContent)
+    set(PLUME_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(PLUME_SDL2_VULKAN_ENABLED OFF CACHE BOOL "" FORCE)
+    set(PLUME_SDL3_VULKAN_ENABLED OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(sb_plume
+        GIT_REPOSITORY https://github.com/renderbag/plume.git
+        GIT_TAG e48a55be0cff0f1e82b25cd0ab68be37357ee0f9
+        GIT_SHALLOW FALSE
+        GIT_SUBMODULES_RECURSE TRUE)
+    FetchContent_MakeAvailable(sb_plume)
+    target_link_libraries(SpeedBreaker PRIVATE plume)
+    target_compile_definitions(SpeedBreaker PRIVATE SB_PLUME_RHI=1)
+endif()
+
 target_link_libraries(SpeedBreaker PRIVATE NfsmwRecompLib XenonUtilsLite o1heap imgui SDL3::SDL3 ${SB_VULKAN_TARGET} glslang::glslang glslang::glslang-default-resource-limits ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY})
 # glslang before 15 (the Steam Frame's 14) keeps the C API's SPIR-V
 # generation in its own library.
