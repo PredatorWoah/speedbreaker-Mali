@@ -1,32 +1,61 @@
-# Plume RHI Android migration (work in progress)
+# Plume Vulkan implementation — Android 0.1.12
 
-Source branch: `android/rp6-bringup` at creation of `android/plume-rhi`.
-Reference Plume upstream: `renderbag/plume` at `e48a55be0cff0f1e82b25cd0ab68be37357ee0f9` (2026-10-12).
-License: Plume MIT; preserve attribution and ensure distribution includes its license.
+Branch: `android/plume-rhi`; fallback: `android/rp6-bringup` and retained 0.1.11 APK.
+Plume: `renderbag/plume@e48a55be0cff0f1e82b25cd0ab68be37357ee0f9` (MIT).
 
-## Actual state
+## Implemented rendering path
 
-Stage 0 only: `SB_PLUME_RHI=ON` fetches/compiles/links pinned Plume as an optional Android dependency. The existing `gpu/renderer.cpp` implementation continues using raw Vulkan. This is **not yet an alternate renderer**, no graphics commands are routed through Plume, and no Android build/device test has been performed. `SB_PLUME_RHI=OFF` preserves the prior path.
+This is an incremental Vulkan interoperability implementation, not just a linked dependency. PM4 and Xenos shader translation still feed the existing renderer, which now routes these real game operations through `gpu/plume_backend.cpp` when Plume is selected:
 
-## Required architectural migration
+| Operation | Implementation |
+| --- | --- |
+| Color/depth dynamic rendering, draw/indexed draw, compute dispatch | Plume command lists wrapping the existing fenced command buffers |
+| Pipeline binding, push constants, viewport/scissor/depth bias | Plume commands with borrowed pipeline/layout wrappers |
+| Graphics/compute pipeline creation, descriptors with dynamic offsets/push descriptors | Patched Plume Vulkan interop preserving original Vulkan create information and pipeline caches |
+| Renderer images: render targets, depth, textures, front buffer | Plume-owned VMA allocations; original image descriptions, formats and view interpretation |
+| Queue submission | Plume interop under the existing submission mutex, foreground gate and fences |
+| Xbox 360 EDRAM resolves | Original custom shaders, packing, tiled guest writes and sequencing; dispatch through Plume |
+| Shader translation, descriptor/pipeline layouts, guest buffers, imports, upload rings | Existing implementation |
+| Barriers, timestamps, queries, transfers/readback, swapchain/presentation, remaining dynamic state | Existing Vulkan implementation |
 
-Current rendering path: PM4 commands -> `gpu/command_processor.cpp` -> `gpu/renderer.cpp` -> native Vulkan; shader translation via `gpu/shader_translator.cpp`. Rendering uses external-host-memory imports, game EDRAM targets, compute resolves, Vulkan pipeline caches, async submissions and fences, dynamic rendering, surface presentation and GPU timestamps.
+The small pinned upstream patch supplies borrowed device/command-buffer support and native interop where the generic RHI cannot represent existing state exactly. It never creates another instance, device, queue, loader or global dispatch table. A borrowed device cannot create an independently synchronized queue. Plume has one private allocator; image owners retain its lifetime through existing fenced resource retirement. Borrowed pipeline/command wrappers do not destroy their native handles.
 
-Plume exposes `RenderDevice`, `RenderCommandList`, resources, descriptor sets, graphics/compute pipelines, fences and Vulkan swapchain interfaces; it does not automatically implement Xenos EDRAM behavior. The migration must preserve guest memory coherency and correct draw/resolve order, especially Adreno/Android external memory and custom Turnip loader behavior.
+The generic Plume resource/shader/graphics/compute interfaces are also exercised in the offscreen validation pilot. Production game pipelines currently use the exact-state interop path. This distinction matters: broad command routing does not yet replace all state translation with generic RHI descriptions.
 
-1. **Loader interoperability gate:** Check Plume's Vulkan instance/device creation and volk global dispatch against SpeedBreaker's selected Android loader via libadrenotools. Never silently create a second device using the system loader. Prevent multiple volk implementations from interposing symbols. Explicitly test selected/system driver on device.
-2. **Feature parity map:** Enumerate Vulkan usages in `gpu/renderer.cpp`. Map buffers, descriptors, shader modules, pipeline variants, attachments, barriers, memory imports and resolves onto Plume primitives. Identify uncovered features before rerouting rendering.
-3. **Smallest real render pilot:** Route a non-gameplay offscreen graphics/compute pass through Plume on its own isolated code path; compare bitwise or bounded-error results to raw Vulkan. Avoid double ownership of host images or queues.
-4. **Game rendering integration:** Move selected real game passes to Plume behind a per-pass and whole-backend rollback switch, preserving raw Vulkan as an independent implementation until parity and profiling pass.
-5. **Performance:** Reuse the established 0.1.10/0.1.11 diagnostics; compare like-for-like warm Quick Race frames at 720p on RP6. Track complete-frame latency, pass GPU times, draw/resolve counts, power and thermals. Plume integration alone is not a measured optimization.
+## Build and rollback
 
-## Known risks and falsification criteria
+`SB_PLUME_RHI=ON` fetches the exact pin/submodules and applies `patches/plume/0001-shared-vulkan-interop.patch` idempotently. Plume and the runtime share that pin's Volk and Vulkan headers, with one hidden Volk implementation. Plume's own Volk implementation is disabled. The selected system/custom Android loader remains authoritative.
 
-- Different volk/Vulkan loader ownership -> wrong custom driver or crash. Verify actual driver ID/name and use one dispatch path.
-- Backend migration reproduces existing 25.9ms color/offscreen work -> no meaningful performance gain; do not claim improvement without device evidence.
-- Differences in barriers/texture layout/EDRAM synchronization -> visual corruption or invalid guest memory; compare render captures, race, tunnel, shadows and mirrors.
-- Build dependency via Git submodules -> a CMake/NDK failure. Test clean Android configuration with `SB_PLUME_RHI=ON`; until then link integration is unverified.
+Gradle accepts `-PsbPlume=ON`; the established external native staging workflow remains supported. OFF builds do not link Plume and tolerate a stale saved Plume selection by using Legacy.
 
-## Validation not yet run
+The Android launch screen's **Select rendering backend** allows Legacy Vulkan, Plume Vulkan, or the in-game Advanced setting. The selection is independent of driver preferences. Restart the game process to apply a change; Resume keeps the running backend. The in-game Advanced renderer setting is also restart-bound. Plume-enabled builds default to Plume. Use Legacy from the launcher for recovery if startup fails.
 
-No build, APK signing, RP6 execution or benchmarking has been performed for this branch. The next action is a clean Android compile with `SB_PLUME_RHI=ON` and diagnostic verification of loader compatibility, followed by the first actual offscreen render pilot. Keep 0.1.11 and older APKs as rollback.
+ISO loading, audio, controllers, frontend, pause/suspend gates, shader/shadow fixes and existing timestamp instrumentation retain their existing paths. No ADB connection was made. The previous 0.1.11 APK was not changed.
+
+## Validation
+
+- Clean FetchContent configuration and patched Plume build from the pinned remote source succeeded.
+- Three offscreen/legacy tests pass on Mesa lavapipe with Khronos core and synchronization validation (zero errors); also passed an AddressSanitizer build with leak detection disabled.
+- A standard Plume graphics pipeline renders a 16x16 scissored image matching native Vulkan and the runtime indexed-draw adapter byte-for-byte (1,024 bytes).
+- A standard Plume compute pipeline/storage descriptor produces 257 reference-checked words through native and Plume command recording.
+- Mutable-format image allocation/free and borrowed instance/device/dispatch lifetime checks pass. Runtime Legacy executes without Plume command counters; the compile-time OFF adapter links without Plume.
+- Synthetic shaders pass glslang and spirv-val. Existing standalone host regression harness passes 44 suites (not the SDL-linked audio or PPC write-watch integration harness).
+- Full Android ARM64 optimized native link succeeds using NDK r28c and genuine generated game code. Packaging/signature results are recorded with the APK build record when complete.
+- `tests/plume/README.md` documents reproducible host checks. A separate CI workflow runs the clean offscreen suite.
+
+Plume's current Vulkan `copyTextureRegion` does not implement image-to-buffer copying. The pilot retains native readback instead; production transfer/capture paths also remain native. This is an upstream API coverage limitation, not evidence that generic resolves implement EDRAM.
+
+## Performance evidence and limitations
+
+Prior RP6 measurements remain the baseline: racing 21–39 FPS at 720p, approximately 34 ms GPU work, 25.9 ms color/offscreen, 5 ms depth and 3.5 ms resolves; menu around 60 FPS. The user reported no visible 0.1.11 improvement and custom-driver crashes. This implementation does not claim to fix those crashes or deliver 60 FPS. Start comparison runs with the System driver.
+
+Shader workloads and most synchronization are intentionally preserved for parity. This stage does not establish a reduction in the expensive color workload merely by routing its commands through Plume. GPU timestamps and existing pass counters remain usable. Additional periodic `[plume]` counters expose actual graphics/compute/pipeline/descriptor/image activity. The old physical Vulkan-allocation counter only counts the legacy allocator; VMA image counts must not be compared as physical allocation counts.
+
+No RP6 execution, gameplay-image parity, Android custom-driver compatibility, thermal or performance measurement has been performed for this APK. Host software-Vulkan success is not device or game validation.
+
+## Next implementation and acceptance steps
+
+1. Compare the same warm 720p Quick Race with System driver in Legacy and Plume, using retained timestamps and game settings. Validate shadows, tunnels, mirrors, depth, pause/background and resume before interpreting FPS.
+2. Exercise custom-driver initialization separately with crash logs; preserve the shared dispatch and loader identity checks.
+3. Convert remaining production descriptor/pipeline ownership and buffer/transfer operations to generic RHI descriptions only where exact Vulkan state can be represented. Keep custom guest-memory imports and EDRAM semantics explicit.
+4. Use the existing pass timings to target color/depth memory traffic, shader/vertex work and redundant pass transitions. Accept optimizations only with image parity and lower full-frame time; 720p60 requires less than 16.67 ms, not a faster isolated pilot.

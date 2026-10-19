@@ -4,6 +4,15 @@ What changed in each SpeedBreaker release, newest first. Each release's notes on
 its entry here, and the game shows the entry once, the first time a new version starts (offline:
 it's built into the game).
 
+## v0.1.12 (2026-10-19)
+
+- Optional Plume Vulkan backend: game render-pass scopes, pipeline creation,
+  draw/compute recording, descriptors, queue submissions and image allocation.
+- One shared Vulkan loader/device/queue; original Xenos shaders, resolves,
+  synchronization and timing retained.
+- Backend selection on the launch screen and in Advanced. Legacy Vulkan remains
+  available; no RP6 performance improvement is established by this migration.
+
 ## v0.1.11 (2026-10-16)
 
 - Android GPU driver launch selector: import ARM64 Turnip ZIPs, retain multiple

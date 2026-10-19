@@ -398,3 +398,19 @@ APK SHA256 b04e0640b2022d7937b031370cf2fb5c5f452fb1d18c840e9f093676402e3045;
 native Build ID fce54df293c9c7a1768e34a73e86b465393d7607.
 Retained 0.1.10 checksum unchanged. Build record under
 builds/android/0.1.11-turnip-performance/. No RP6 execution or gain verified.
+
+## Android 0.1.12 — real Plume command/resource integration
+
+The user reported no visible 0.1.11 performance improvement and crashes with
+custom drivers. Those reports remain unresolved; no successful device result is
+inferred from the prior build validation.
+
+Plume now executes game graphics/compute commands, owns renderer image
+allocations, and routes pipeline creation/descriptors/submission through shared
+Vulkan interoperability. One existing device, queue, loader and dispatch remain.
+Launcher and in-game backend selection preserve Legacy rollback. Custom EDRAM
+shader semantics, timestamps, lifecycle gates and presentation remain intact.
+Three offscreen/legacy checks (core+sync validation) and 44 host suites pass;
+Android optimized native link succeeds. See ANDROID_PLUME_RHI.md for precise
+migration boundaries, limitations and device acceptance steps. No RP6 speedup or
+playability claim is made.
