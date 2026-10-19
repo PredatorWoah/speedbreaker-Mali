@@ -126,7 +126,8 @@ int main(int argc,char** argv) {
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};imageInfo.imageType=VK_IMAGE_TYPE_2D;imageInfo.extent={16,16,1};imageInfo.mipLevels=imageInfo.arrayLayers=1;imageInfo.format=VK_FORMAT_R8G8B8A8_UNORM;imageInfo.samples=VK_SAMPLE_COUNT_1_BIT;imageInfo.usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_STORAGE_BIT;imageInfo.flags=VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
         std::shared_ptr<rhi::ImageAllocation> owner;VkImage nativeImage;VkDeviceSize bytes=0;if (requested) { Check(rhi::AllocateImage(imageInfo,nativeImage,bytes,owner));assert(nativeImage && bytes);owner.reset(); }
         // Plume-owned compute pipeline/descriptors/storage; raw and Plume dispatch must match.
-        auto shader=device->createShader(cs.data(),cs.size()*4,"main",RenderShaderFormat::SPIRV);
+        for (const auto& bytecode : {cs, Read(folder+"/route.comp.spv")}) {
+        auto shader=device->createShader(bytecode.data(),bytecode.size()*4,"main",RenderShaderFormat::SPIRV);
         RenderDescriptorRange bufferRange(RenderDescriptorRangeType::READ_WRITE_STRUCTURED_BUFFER,0,1);RenderDescriptorSetDesc setDesc(&bufferRange,1);
         RenderPushConstantRange push(0,0,0,4,RenderShaderStageFlag::COMPUTE);auto computeLayout=device->createPipelineLayout(RenderPipelineLayoutDesc(&push,1,&setDesc,1));
         auto computePipeline=device->createComputePipeline(RenderComputePipelineDesc(computeLayout.get(),shader.get(),64,1,1));
@@ -141,8 +142,9 @@ int main(int argc,char** argv) {
             Check(vkEndCommandBuffer(cmd));submit();RenderRange rr(0,257*4);auto* words=static_cast<uint32_t*>(output->map(0,&rr));for(uint32_t i=0;i<257;++i)assert(words[i]==((i*1664525u+1013904223u)^seed));output->unmap();
         }
     }
+    }
     const auto c=rhi::GetCounters();
-    if (requested) assert(c.passes==1 && c.indexedDraws==1 && c.dispatches==1 && c.images==1);
+    if (requested) assert(c.passes==1 && c.indexedDraws==1 && c.dispatches==2 && c.images==1);
     else assert(c.passes==0 && c.indexedDraws==0 && c.dispatches==0 && c.images==0);
     rhi::Shutdown(); fixture.reset(); // Must leave native device and dispatch alive.
     assert(vkGetInstanceProcAddr==gipa);Check(vkDeviceWaitIdle(native));

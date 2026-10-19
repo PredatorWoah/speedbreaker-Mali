@@ -24,6 +24,7 @@ namespace gpu
     // Set once by renderer initialization, before shader translation/workers.
     extern bool g_workReductionEnabled;
     extern bool g_predicateCoalescingEnabled;
+    extern bool g_vertexRoutingEnabled;
 
     enum class ShaderStage : uint32_t { Vertex = 0, Pixel = 1 };
 

@@ -15,6 +15,7 @@ function(sb_test name)
     add_test(NAME ${name} COMMAND ${name} ${T_ARGS})
 endfunction()
 
+sb_test(vertex_route_test)
 sb_test(block_ranges_test)
 sb_test(pass_timing_test)
 sb_test(disc_mount_test SOURCES ${RT}/install/disc_mount.cpp ${RT}/install/disc_source.cpp

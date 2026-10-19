@@ -4,6 +4,7 @@
 #include <stdafx.h>
 #include "renderer.h"
 #include "plume_backend.h"
+#include "vertex_route.h"
 #ifdef __ANDROID__
 #include <platform/android/gpu_driver.h>
 #endif
@@ -286,7 +287,9 @@ namespace gpu::renderer
         // XenosConstants (shader_translator.cpp): c[512], fetch[48], bools[2],
         // loops[8], drawInfo[4], each a vec4/uvec4.
         constexpr uint32_t kTextureReciprocalOffset = (512 + 48 + 2 + 8 + 4) * 16;
-        constexpr uint32_t kConstantsSize = kTextureReciprocalOffset + 32 * 16;
+        struct VertexRouteStats { uint64_t draws=0, snapshots=0, shared=0, fallback=0, changes=0; } s_vertexRouteStats;
+        constexpr uint32_t kVertexRoutesOffset = kTextureReciprocalOffset + 32 * 16;
+        constexpr uint32_t kConstantsSize = kVertexRoutesOffset + 96 * sizeof(uint32_t);
 
         // Image memory. Images are bound at offsets into blocks of device
         // memory (64 MB; gpu/block_ranges.h keeps each block's free ranges),
@@ -7346,6 +7349,8 @@ void main()
         gpu::g_workReductionEnabled = settings::GetBool(settings::Id::GpuWorkReduction);
         gpu::g_predicateCoalescingEnabled = settings::GetBool(settings::Id::PredicateCoalescing);
         s_depthStageReduction = settings::GetBool(settings::Id::DepthStageReduction);
+        gpu::g_vertexRoutingEnabled = settings::GetBool(settings::Id::VertexMemoryRouting);
+        fprintf(stderr, "[renderer] vertex memory routing=%d\n", gpu::g_vertexRoutingEnabled);
         fprintf(stderr, "[renderer] predicate coalescing=%d depth stage reduction=%d\n",
             gpu::g_predicateCoalescingEnabled, s_depthStageReduction);
         fprintf(stderr, "[renderer] GPU work reduction %s (early depth, texture reciprocals, 1x resolve lanes)\n",
@@ -8070,7 +8075,7 @@ void main()
         // Vertex data snapshots, copied into the ring with this draw's
         // constants and indices (one allocation: a submit between two would
         // leave the snapshot in the previous submission's slot).
-        struct SnapshotRange { uint32_t base, size; };
+        using SnapshotRange = gpu::vertex_route::Snapshot;
         SnapshotRange copies[4];
         uint32_t copyCount = 0;
         VkDeviceSize copyBytes = 0;
@@ -8106,6 +8111,29 @@ void main()
                 EnsureShadow(pc.indexAddress, count << (src.is32 ? 2 : 1));
                 GuardGpu(pc.indexAddress, count << (src.is32 ? 2 : 1), false, "indices");
             }
+        }
+
+        // Routes depend only on the fetch ranges and snapshot layout, not the
+        // absolute ring address. Keep constant-upload reuse across fresh snapshots.
+        uint32_t vertexRoutes[96];
+        std::fill_n(vertexRoutes, 96, gpu::vertex_route::kFallback);
+        if (gpu::g_vertexRoutingEnabled)
+            for (uint32_t word = 0; word < 3; ++word)
+                for (uint32_t bits = s_vs->info.vertexFetchConstants[word] | s_ps->info.vertexFetchConstants[word]; bits; bits &= bits - 1)
+                {
+                    uint32_t constant = word * 32 + uint32_t(__builtin_ctz(bits));
+                    const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + constant * 2];
+                    uint32_t base = gpu::vertex_route::Base(vf[0]);
+                    vertexRoutes[constant] = gpu::vertex_route::Build(base, gpu::vertex_route::Size(base, vf[1]), copies, copyCount);
+                    if (vertexRoutes[constant] == gpu::vertex_route::kFallback) ++s_vertexRouteStats.fallback;
+                    else if (vertexRoutes[constant] == gpu::vertex_route::kShared) ++s_vertexRouteStats.shared;
+                    else ++s_vertexRouteStats.snapshots;
+                }
+        static uint32_t lastVertexRoutes[96] = {};
+        if (gpu::g_vertexRoutingEnabled) ++s_vertexRouteStats.draws;
+        if (memcmp(lastVertexRoutes, vertexRoutes, sizeof(vertexRoutes)) != 0) {
+            g_constantsDirty.store(true, std::memory_order_relaxed);
+            ++s_vertexRouteStats.changes;
         }
 
         // NFSMW_LOG_TEXTURE_USE=<hex base>: dump the shaders of draws that
@@ -8194,6 +8222,8 @@ void main()
                 memset(c + 570 * 16, 0, 4 * 16);
                 memcpy(c + kTextureReciprocalOffset, textureReciprocal, sizeof(textureReciprocal));
                 memcpy(lastTextureReciprocal, textureReciprocal, sizeof(textureReciprocal));
+                memcpy(c + kVertexRoutesOffset, vertexRoutes, sizeof(vertexRoutes));
+                memcpy(lastVertexRoutes, vertexRoutes, sizeof(vertexRoutes));
                 s_lastConstantsOffset = at;
                 s_lastConstantsSubmission = s_submissionCounter;
                 s_stats.constantUploads++;
@@ -9698,6 +9728,12 @@ void main()
 
     void OnSwap(uint64_t frame)
     {
+        if (frame % 120 == 0) {
+            const auto& vr = s_vertexRouteStats;
+            fprintf(stderr, "[vertex-route] enabled=%d draws=%llu snapshot_routes=%llu shared_routes=%llu fallback_routes=%llu metadata_changes=%llu (cumulative declared fetch ranges, not GPU hits)\n",
+                gpu::g_vertexRoutingEnabled, (unsigned long long)vr.draws, (unsigned long long)vr.snapshots,
+                (unsigned long long)vr.shared, (unsigned long long)vr.fallback, (unsigned long long)vr.changes);
+        }
         if (gpu::plume_rhi::Enabled() && frame % 120 == 0) {
             auto c = gpu::plume_rhi::GetCounters();
             fprintf(stderr, "[plume] frame=%llu passes=%llu draws=%llu indexed=%llu dispatches=%llu graphics_pipelines=%llu compute_pipelines=%llu descriptors=%llu images=%llu (cumulative)\n",

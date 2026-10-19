@@ -4,6 +4,7 @@
 // spirv_shader_translator{,_alu,_fetch}.cc and shader_translator.cc
 // (BSD license); comments name the rule where it isn't obvious.
 #include "shader_translator.h"
+#include "vertex_route.h"
 #include "shared_memory_glsl.h"
 
 #include "xenos/ucode.h"
@@ -19,6 +20,7 @@ namespace gpu
 {
     bool g_workReductionEnabled = true;
     bool g_predicateCoalescingEnabled = true;
+    bool g_vertexRoutingEnabled = false;
 
     using namespace xe::gpu;
     using namespace xe::gpu::ucode;
@@ -41,6 +43,7 @@ layout(std140, set = 0, binding = 1) uniform XenosConstants
     uvec4 loops[8];       // 32 loop constants
     uvec4 drawInfo[4];    // see gpu/renderer.cpp
     vec4 textureReciprocal[32]; // actual sampled host image size, xy reciprocal
+    uvec4 vertexRoutes[24]; // 96 fetch constants: relative ring bias/shared/fallback
 } u;
 
 layout(push_constant) uniform DrawConstants
@@ -546,7 +549,23 @@ float xmul(float a, float b)
                 xenos::VertexFormat format = op.data_format();
                 bool isSigned = op.is_signed();
                 bool normalized = op.is_normalized();
-                auto word = [&](int i) { return std::format("gpuSwap(vmem(vbase + {}u), vendian)", i * 4); };
+                unsigned words = 1;
+                switch (format) {
+                case xenos::VertexFormat::k_16_16_16_16:
+                case xenos::VertexFormat::k_16_16_16_16_FLOAT:
+                case xenos::VertexFormat::k_32_32:
+                case xenos::VertexFormat::k_32_32_FLOAT: words = 2; break;
+                case xenos::VertexFormat::k_32_32_32_FLOAT: words = 3; break;
+                case xenos::VertexFormat::k_32_32_32_32:
+                case xenos::VertexFormat::k_32_32_32_32_FLOAT: words = 4; break;
+                default: break;
+                }
+                if (g_vertexRoutingEnabled)
+                    Line(std::format("uvec4 vwords = vertexWords{}(vbase, vf0, vf1, u.vertexRoutes[{}][{}]);", words, slot / 4, slot % 4));
+                auto word = [&](int i) {
+                    return g_vertexRoutingEnabled ? std::format("gpuSwap(vwords[{}], vendian)", i)
+                        : std::format("gpuSwap(vmem(vbase + {}u), vendian)", i * 4);
+                };
                 std::string value;
                 // Packed integer formats: widths/offsets per component.
                 auto packed = [&](std::initializer_list<std::pair<int, int>> comps, int words) {
@@ -1051,6 +1070,7 @@ vec3 cubeDirection(vec3 c)
             resetRegisters += std::format("    r[{}] = vec4(0.0);\n", i);
 
         std::string g = ShaderCommonGlsl();
+        if (g_vertexRoutingEnabled) g += vertex_route::Glsl();
         const char* reciprocal = std::getenv("NFSMW_TEXTURE_RECIPROCAL");
         if (!g_workReductionEnabled || (reciprocal && reciprocal[0] == '0'))
             g.insert(g.find('\n') + 1, "#define TEXTURE_SIZE_QUERY\n");

@@ -12,6 +12,18 @@ foreach(shader triangle.vert triangle.frag words.comp)
         DEPENDS ${shader})
     list(APPEND SHADERS ${CMAKE_CURRENT_BINARY_DIR}/${shader}.spv)
 endforeach()
+add_executable(vertex_route_fixture ../vertex_route_test.cpp)
+target_include_directories(vertex_route_fixture PRIVATE ../../runtime)
+target_compile_options(vertex_route_fixture PRIVATE -UNDEBUG)
+add_test(NAME vertex_route_addresses COMMAND vertex_route_fixture)
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/route.comp
+    COMMAND vertex_route_fixture ${CMAKE_CURRENT_BINARY_DIR}/route.comp
+    DEPENDS vertex_route_fixture ../../runtime/gpu/vertex_route.h)
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/route.comp.spv
+    COMMAND ${SB_GLSLANG} -V --target-env vulkan1.2 -Os -g0 ${CMAKE_CURRENT_BINARY_DIR}/route.comp -o ${CMAKE_CURRENT_BINARY_DIR}/route.comp.spv
+    COMMAND ${SB_SPIRV_VAL} --target-env vulkan1.2 ${CMAKE_CURRENT_BINARY_DIR}/route.comp.spv
+    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/route.comp)
+list(APPEND SHADERS ${CMAKE_CURRENT_BINARY_DIR}/route.comp.spv)
 add_executable(plume_offscreen_test offscreen.cpp ../../runtime/gpu/plume_backend.cpp ${SHADERS})
 target_compile_definitions(plume_offscreen_test PRIVATE SB_PLUME_RHI=1 VK_NO_PROTOTYPES)
 target_compile_options(plume_offscreen_test PRIVATE -UNDEBUG -include volk.h)

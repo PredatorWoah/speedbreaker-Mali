@@ -29,3 +29,8 @@ The test enables Khronos core and synchronization validation, and fails on error
   and checks recovery from a stale saved Plume setting.
 
 A host GPU test is not an Adreno test or a game-image parity/performance result.
+
+The vertex-route fixture also compares 8.4 million CPU word-source addresses and
+generates the exact routed GLSL helpers used by production. GPU compute compares
+those helpers with the old per-word path across 257 address/range cases, under
+both native and Plume recording. This adds a fourth CTest case.
