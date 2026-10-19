@@ -40,8 +40,8 @@ ISO loading, audio, controllers, frontend, pause/suspend gates, shader/shadow fi
 - A standard Plume compute pipeline/storage descriptor produces 257 reference-checked words through native and Plume command recording.
 - Mutable-format image allocation/free and borrowed instance/device/dispatch lifetime checks pass. Runtime Legacy executes without Plume command counters; the compile-time OFF adapter links without Plume.
 - Synthetic shaders pass glslang and spirv-val. Existing standalone host regression harness passes 44 suites (not the SDL-linked audio or PPC write-watch integration harness).
-- Full Android ARM64 optimized native link succeeds using NDK r28c and genuine generated game code. Packaging/signature results are recorded with the APK build record when complete.
-- `tests/plume/README.md` documents reproducible host checks. A separate CI workflow runs the clean offscreen suite.
+- Full Android ARM64 optimized native link succeeds using NDK r28c and genuine generated game code. Full Android `SB_PLUME_RHI=OFF` link also succeeds. The signed release APK is complete: code 13, retained certificate, seven exact staged libraries, all 56,736 game mapping entries, ZIP/alignment/manifest checks pass. Native code is optimized; the release variant permits run-as diagnostics. See `builds/android/0.1.12-plume-vulkan/`.
+- `tests/plume/README.md` documents reproducible host checks. GitHub Actions clean offscreen validation also passed for compiled source `b27899e` ([run](https://github.com/onenonlygit/speedbreaker-one/actions/runs/39271108669)).
 
 Plume's current Vulkan `copyTextureRegion` does not implement image-to-buffer copying. The pilot retains native readback instead; production transfer/capture paths also remain native. This is an upstream API coverage limitation, not evidence that generic resolves implement EDRAM.
 

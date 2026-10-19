@@ -414,3 +414,13 @@ Three offscreen/legacy checks (core+sync validation) and 44 host suites pass;
 Android optimized native link succeeds. See ANDROID_PLUME_RHI.md for precise
 migration boundaries, limitations and device acceptance steps. No RP6 speedup or
 playability claim is made.
+
+### 0.1.12 signed Plume APK completed
+
+Compiled clean source b27899e, version 0.1.12 code 13; both full Android ON/OFF
+native configurations link. Seven staged libraries and all 56,736 mapping entries
+verified. Retained certificate, ZIP/alignment, manifest/ABI and license checks pass.
+APK SHA256 248c69ac660f697bae4b0ea5ca098f82e66842ffbe530e839807aa66076e71cb;
+native Build ID 1da6a82968c8e94a6cb090d53bb9511ec925f32b.
+CI offscreen run 39271108669 passes. Build record:
+builds/android/0.1.12-plume-vulkan/. No RP6 execution, parity or speed gain verified.
