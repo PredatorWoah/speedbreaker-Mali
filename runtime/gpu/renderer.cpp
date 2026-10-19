@@ -7368,7 +7368,7 @@ void main()
         s_depthStageReduction = settings::GetBool(settings::Id::DepthStageReduction);
         gpu::g_vertexRoutingEnabled = settings::GetBool(settings::Id::VertexMemoryRouting);
         s_nativeVertexInput = settings::GetBool(settings::Id::NativeVertexInput);
-        game_shader::PublishTranslationReady();
+        game_shader::PublishTranslationReady(settings::GetBool(settings::Id::GameShaderResources));
         fprintf(stderr, "[renderer] vertex memory routing=%d\n", gpu::g_vertexRoutingEnabled);
         fprintf(stderr, "[renderer] predicate coalescing=%d depth stage reduction=%d\n",
             gpu::g_predicateCoalescingEnabled, s_depthStageReduction);

@@ -140,6 +140,58 @@ int main(int argc,char** argv) {
         }
         RenderRange readRange(0,1024);auto* expected=reads[0]->map(0,&readRange);assert(expected);
         for(unsigned n=1;n<7;++n){auto* actual=reads[n]->map(0,&readRange);assert(!std::memcmp(expected,actual,1024));reads[n]->unmap();}
+        // Use the actual translated shader from a host-owned game resource,
+        // not the handwritten native-input pilot. Its guest vertex bytes are
+        // decoded by the translator while Plume records the indexed draw.
+        {
+            auto binary=Read(folder+"/game-resource.vert.spv");
+            auto shader=device->createShader(binary.data(),binary.size()*4,"main",RenderShaderFormat::SPIRV);
+            auto constants=device->createBuffer(RenderBufferDesc::UploadBuffer(16384,RenderBufferFlag::CONSTANT));
+            auto* data=static_cast<uint32_t*>(constants->map());std::memset(data,0,16384);
+            data[8192/4+1]=2; // fetch constant zero: guest 8-in-32 endian swap
+            constants->unmap();
+            auto geometry=device->createBuffer(RenderBufferDesc::UploadBuffer(64,RenderBufferFlag::VERTEX));
+            float positions[12]={-1,-1,0.5f,1, 3,-1,0.5f,1, -1,3,0.5f,1};
+            auto* vertices=static_cast<uint32_t*>(geometry->map());std::memset(vertices,0,64);
+            for(unsigned i=0;i<12;++i){uint32_t bits;std::memcpy(&bits,&positions[i],4);vertices[4+i]=__builtin_bswap32(bits);}
+            geometry->unmap();
+            VkDescriptorSetLayoutBinding uniform{1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr};
+            VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};setInfo.bindingCount=1;setInfo.pBindings=&uniform;
+            VkDescriptorSetLayout setLayout;Check(vkCreateDescriptorSetLayout(native,&setInfo,nullptr,&setLayout));
+            VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1};
+            VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};poolInfo.maxSets=1;poolInfo.poolSizeCount=1;poolInfo.pPoolSizes=&poolSize;
+            VkDescriptorPool descriptorPool;Check(vkCreateDescriptorPool(native,&poolInfo,nullptr,&descriptorPool));
+            VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};allocation.descriptorPool=descriptorPool;allocation.descriptorSetCount=1;allocation.pSetLayouts=&setLayout;
+            VkDescriptorSet descriptor;Check(vkAllocateDescriptorSets(native,&allocation,&descriptor));
+            VkDescriptorBufferInfo buffer{static_cast<VulkanBuffer*>(constants.get())->vk,0,16384};
+            VkWriteDescriptorSet update{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};update.dstSet=descriptor;update.dstBinding=1;update.descriptorCount=1;update.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;update.pBufferInfo=&buffer;
+            vkUpdateDescriptorSets(native,1,&update,0,nullptr);
+            VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,112};
+            VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};layoutInfo.setLayoutCount=1;layoutInfo.pSetLayouts=&setLayout;layoutInfo.pushConstantRangeCount=1;layoutInfo.pPushConstantRanges=&push;
+            VkPipelineLayout gameLayout;Check(vkCreatePipelineLayout(native,&layoutInfo,nullptr,&gameLayout));
+            VkVertexInputBindingDescription binding{0,16,VK_VERTEX_INPUT_RATE_VERTEX};
+            VkVertexInputAttributeDescription attribute{0,0,VK_FORMAT_R32G32B32A32_UINT,0};
+            vi.vertexBindingDescriptionCount=vi.vertexAttributeDescriptionCount=1;vi.pVertexBindingDescriptions=&binding;vi.pVertexAttributeDescriptions=&attribute;
+            stages[0].module=static_cast<VulkanShader*>(shader.get())->vk;gp.layout=gameLayout;
+            VkPipeline gamePipeline;Check(rhi::CreateGraphicsPipelines(native,VK_NULL_HANDLE,1,&gp,nullptr,&gamePipeline));
+            auto output=device->createBuffer(RenderBufferDesc::ReadbackBuffer(1024));
+            Check(vkResetCommandBuffer(cmd,0));VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};Check(vkBeginCommandBuffer(cmd,&begin));rhi::BeginRecording(cmd);
+            ImageBarrier(cmd,image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_ACCESS_TRANSFER_READ_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+            VkRenderingAttachmentInfoKHR attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};attachment.imageView=static_cast<VulkanTexture*>(color.get())->imageView;attachment.imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;attachment.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;attachment.storeOp=VK_ATTACHMENT_STORE_OP_STORE;attachment.clearValue.color.float32[3]=1;
+            VkRenderingInfoKHR info{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};info.renderArea.extent={16,16};info.layerCount=1;info.colorAttachmentCount=1;info.pColorAttachments=&attachment;
+            VkViewport view{0,0,16,16,0,1};VkRect2D clip{{2,3},{8,9}};
+            std::array<uint32_t,28> pc{};std::memcpy(pc.data(),value,16);pc[7]=2; // normal W; ordinary mode ignores index-address words
+            rhi::BeginRendering(cmd,&info,vkCmdBeginRenderingKHR);rhi::BindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,gamePipeline);
+            rhi::BindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,gameLayout,0,1,&descriptor,0,nullptr);
+            VkBuffer vb=static_cast<VulkanBuffer*>(geometry.get())->vk;VkDeviceSize offset=16;rhi::BindVertexBuffers(cmd,0,1,&vb,&offset);
+            rhi::SetViewport(cmd,0,1,&view);rhi::SetScissor(cmd,0,1,&clip);rhi::PushConstants(cmd,gameLayout,push.stageFlags,0,112,pc.data());
+            vkCmdBindIndexBuffer(cmd,static_cast<VulkanBuffer*>(index.get())->vk,0,VK_INDEX_TYPE_UINT16);rhi::DrawIndexed(cmd,3,1,0,0,0);rhi::EndRendering(cmd,vkCmdEndRenderingKHR);
+            ImageBarrier(cmd,image,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT);
+            VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.imageExtent={16,16,1};vkCmdCopyImageToBuffer(cmd,image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,static_cast<VulkanBuffer*>(output.get())->vk,1,&copy);
+            HostBarrier(cmd,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);Check(vkEndCommandBuffer(cmd));submit();
+            const void* actual=output->map(0,&readRange);assert(!std::memcmp(expected,actual,1024));output->unmap();
+            vkDestroyPipeline(native,gamePipeline,nullptr);vkDestroyPipelineLayout(native,gameLayout,nullptr);vkDestroyDescriptorPool(native,descriptorPool,nullptr);vkDestroyDescriptorSetLayout(native,setLayout,nullptr);
+        }
         auto* pixel=static_cast<const uint8_t*>(expected);assert(pixel[(4*16+4)*4]==64 && pixel[0]==0 && pixel[3]==255);reads[0]->unmap();
         vkDestroyPipeline(native,dynamicPipeline,nullptr);
         // Native image ownership uses Plume/VMA, including mutable formats.
@@ -164,7 +216,7 @@ int main(int argc,char** argv) {
     }
     }
     const auto c=rhi::GetCounters();
-    if (requested) assert(c.passes==5 && c.indexedDraws==5 && c.dispatches==2 && c.images==1);
+    if (requested) assert(c.passes==6 && c.indexedDraws==6 && c.dispatches==2 && c.images==1);
     else assert(c.passes==0 && c.indexedDraws==0 && c.dispatches==0 && c.images==0);
     rhi::Shutdown(); fixture.reset(); // Must leave native device and dispatch alive.
     assert(vkGetInstanceProcAddr==gipa);Check(vkDeviceWaitIdle(native));

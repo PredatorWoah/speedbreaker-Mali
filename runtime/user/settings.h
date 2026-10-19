@@ -70,6 +70,7 @@ namespace settings
         PredicateCoalescing,
         VertexMemoryRouting,
         NativeVertexInput,
+        GameShaderResources,
         DepthStageReduction,
         RenderBackend,
         Count

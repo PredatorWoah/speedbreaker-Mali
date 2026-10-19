@@ -128,3 +128,74 @@ Specific next implementation stages:
 The missing game-level resource/state boundary and native target ownership are
 real remaining implementation work. This hardware-input slice must not be
 presented as completion of those stages.
+
+## Game shader resources — October 19, 2026
+
+Baseline: `b578ee5`, preserved 0.1.14 geometry APK. No new device measurement
+was supplied. The architectural gap was shader resources known only through
+IM_LOAD and mutable guest code, without original game-object identity. This
+stage implements shader creation from item 1 above; the rest remains incomplete.
+
+`runtime/game/graphics_shaders.cpp` overrides verified USA functions:
+
+| Entry | Contract / action |
+| --- | --- |
+| `8259BA98` | PS constructor: original contiguous container r3; returned object r3; physical allocation pointer object+12 |
+| `8259BE40` | VS constructor: same input/return; executable pointer object+40 |
+| `825A2DC0` | Declaration patcher: VS object r4, executable destination r5; capture after the original patches in place or into a ring copy |
+
+Checked against regenerated USA bodies from the supported XEX, not just a PAL
+offset. Wrappers always call the original and preserve its returned PPC context,
+allocation/refcounts and driver bookkeeping while creating host-owned resources.
+
+Data path: original 2005 container -> immutable original identity -> executable
+snapshot at constructor/patcher -> endian conversion and translation on the game
+thread -> native shader resource -> exact executable match during existing
+binding -> graphics pipeline creation and Plume drawing. Physical code begins at
+virtualSize. Reject 2008 headers, wraparound, truncated/misaligned headers and
+excessive sizes. This feature writes no shader data to disk.
+
+The library keeps declaration variants separate, deduplicates matching bytes,
+checks stage/length/content after hashing, and retains no guest pointers. Ring
+reuse and later in-place patches cannot alter an existing resource. Unknown
+constructors invalidate stale identity at reused object addresses. Resource
+accounting is bounded at 64 MiB and object-identity storage at another 16 MiB.
+Failed translations/budget exhaustion retain compatibility translation; failed
+variants are cached to avoid repeated translation at each patch.
+
+Renderer initialization publishes the fixed translation policy before game
+threads translate. Hooks issue no Vulkan commands and never touch CP state.
+**Advanced > Game Shader Resources** (`SB_GAME_SHADER_RESOURCES`), restart
+required, provides rollback. Shader math and pipeline keys are unchanged.
+
+Competing hypotheses: moving creation could reduce CP-critical translation;
+duplicate capture or already-warm caches could instead add CPU work without
+changing GPU time. Exact GLSL equality is the cheapest correctness discriminator.
+Paired startup and warm racing timings with the setting toggled discriminate
+performance. No RP6 improvement is established by this work.
+
+Validation after workspace recovery:
+
+- 49 host suites pass, including write-watch, resource lifetime/concurrent lookup
+  and actual PPC-context hook fixtures. SDL downmix is outside this standalone
+  harness; audio code is unchanged.
+- The hook fixture links real wrappers/context types with synthetic original
+  callees, comparing every returned context byte, variants, reuse and disabled
+  fallback. It does not execute the original game function bodies.
+- Five Release Plume/Legacy tests pass under core+sync validation. An actual
+  translated game-resource VS renders indexed guest-endian hardware attributes,
+  with UBO/push constants. Its 1,024 image bytes match the reference, alongside
+  the seven previous rendering outputs. Generated SPIR-V validates for Vulkan 1.2.
+- Debug/ASan exposed a borrowed-pipeline constructor asserting a non-null owner.
+  Patch 0003 gives borrowed handles a separate nullptr constructor; the owned
+  constructor retains its assertion. This is independent of game shader math.
+  All five Debug/ASan tests then pass with core+sync validation. LeakSanitizer
+  is disabled because this sandbox prevents its process/thread inspection;
+  this is not a leak-check result.
+
+**Still compatibility-driven:** IM_LOAD selects matching resources. PM4 draw
+submission, register state, target identity, EDRAM copies/resolves, fences/queries
+and presentation remain. This is not a no-emulated-GPU backend. Next: ordered
+host draws with complete semantic state and native target/texture handles,
+including CPU-visible resource synchronization, followed by native presentation.
+A source checkpoint or synthetic GPU test is not a playable fully native game.

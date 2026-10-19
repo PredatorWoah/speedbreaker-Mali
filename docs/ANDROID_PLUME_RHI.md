@@ -1,5 +1,27 @@
 # Plume Vulkan implementation — Android 0.1.12
 
+## 0.1.15 native resource development checkpoint
+
+Game shader constructors and declaration patching now create immutable host
+shader resources, consumed by existing graphics pipeline creation on an exact
+executable match. See `ANDROID_NATIVE_RENDERER.md` for verified USA entries,
+ownership, rollback, tests and remaining architecture. This is shader resource
+migration; it does not bypass PM4 draws/state or replace EDRAM target identity.
+
+The offscreen pilot now renders an actual translated game-resource shader via
+Plume hardware vertex input, descriptors and indexed drawing. It compares all
+1,024 image bytes to the reference. Five Release tests (including Legacy and
+compile-OFF fallback) pass with core+sync validation; 49 host suites pass.
+Patch 0003 separates borrowed pipeline construction from owned-device assertions
+found by Debug/ASan testing. The complete three-patch series applies to the pin
+and populated checkouts. No RP6 performance gain is inferred from host results.
+All five tests also pass in Debug with AddressSanitizer and core+sync validation;
+LeakSanitizer is disabled for the sandbox's restricted process inspection.
+
+The earlier 0.1.12–0.1.14 APKs remain separate preserved artifacts. Android build
+and package verification for this checkpoint are recorded separately when done;
+the interrupted build before workspace maintenance is not a successful result.
+
 Branch: `android/plume-rhi`; fallback: `android/rp6-bringup` and retained 0.1.11 APK.
 Plume: `renderbag/plume@e48a55be0cff0f1e82b25cd0ab68be37357ee0f9` (MIT).
 

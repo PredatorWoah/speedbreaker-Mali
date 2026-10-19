@@ -13,7 +13,7 @@ void Put(std::vector<uint8_t>& b,size_t p,uint32_t v) {
 int main(int argc,char** argv) {
     std::vector<uint32_t> host={1u|(2u<<12)|(1u<<16),2u<<12,0,
         1u<<12,0x688u|(38u<<16),4u,
-        62u|(1u<<15)|(15u<<16)|(50u<<26),0,(2u<<24)|(1u<<31)|(1u<<30)};
+        62u|(1u<<15)|(15u<<16)|(50u<<26),0,(2u<<24)|(1u<<31)|(1u<<30)|(1u<<16)|(1u<<8)};
     std::vector<uint32_t> words(host.size());
     for(size_t i=0;i<host.size();++i)words[i]=__builtin_bswap32(host[i]);
     std::vector<uint8_t> blob(64+words.size()*4);

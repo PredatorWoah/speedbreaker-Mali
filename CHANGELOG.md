@@ -4,6 +4,15 @@ What changed in each SpeedBreaker release, newest first. Each release's notes on
 its entry here, and the game shows the entry once, the first time a new version starts (offline:
 it's built into the game).
 
+## v0.1.15 (2026-10-19)
+
+- Create host-owned shader resources at the game's graphics calls, retaining
+  original identity and immutable declaration-patched variants.
+- Pipeline creation can reuse those translations; Game Shader Resources in
+  Advanced provides a restart-bound rollback.
+- Native-renderer development checkpoint. PM4 draw/state and EDRAM handling
+  remain; no racing performance gain or completed native backend is claimed.
+
 ## v0.1.14 (2026-10-19)
 
 - First native geometry slice: hardware vertex attributes for supported draws,

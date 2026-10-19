@@ -48,7 +48,7 @@ private:
 Library& GetLibrary();
 // Publish after all TranslateShader globals have their final values. Game
 // threads acquire this before translating; they never issue Vulkan commands.
-void PublishTranslationReady();
+void PublishTranslationReady(bool enabled);
 bool Enabled();
 bool TranslationReady();
 }

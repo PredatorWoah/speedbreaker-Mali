@@ -24,6 +24,19 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/route.comp.spv
     COMMAND ${SB_SPIRV_VAL} --target-env vulkan1.2 ${CMAKE_CURRENT_BINARY_DIR}/route.comp.spv
     DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/route.comp)
 list(APPEND SHADERS ${CMAKE_CURRENT_BINARY_DIR}/route.comp.spv)
+add_executable(game_shader_fixture ../game_shader_test.cpp ../../runtime/gpu/game_shader.cpp
+    ../../runtime/gpu/shader_translator.cpp ../../runtime/gpu/xenos/ucode.cpp)
+target_include_directories(game_shader_fixture PRIVATE ../../runtime)
+target_compile_options(game_shader_fixture PRIVATE -UNDEBUG)
+add_test(NAME game_shader_resources COMMAND game_shader_fixture)
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/game-resource.vert
+    COMMAND game_shader_fixture ${CMAKE_CURRENT_BINARY_DIR}/game-resource.vert
+    DEPENDS game_shader_fixture)
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/game-resource.vert.spv
+    COMMAND ${SB_GLSLANG} -V --target-env vulkan1.2 -Os -g0 ${CMAKE_CURRENT_BINARY_DIR}/game-resource.vert -o ${CMAKE_CURRENT_BINARY_DIR}/game-resource.vert.spv
+    COMMAND ${SB_SPIRV_VAL} --target-env vulkan1.2 ${CMAKE_CURRENT_BINARY_DIR}/game-resource.vert.spv
+    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/game-resource.vert)
+list(APPEND SHADERS ${CMAKE_CURRENT_BINARY_DIR}/game-resource.vert.spv)
 foreach(n RANGE 1 4)
     add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/native${n}.vert.spv
         COMMAND ${SB_GLSLANG} -V --target-env vulkan1.2 -Os -g0 -DNATIVE_WORDS=${n} ${CMAKE_CURRENT_SOURCE_DIR}/native.vert -o ${CMAKE_CURRENT_BINARY_DIR}/native${n}.vert.spv

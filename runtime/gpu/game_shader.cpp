@@ -7,6 +7,11 @@
 namespace gpu::game_shader {
 namespace {
 std::atomic<bool> ready{false};
+#if defined(__ANDROID__) && defined(SB_PLUME_RHI)
+std::atomic<bool> configured{true};
+#else
+std::atomic<bool> configured{false};
+#endif
 uint32_t Be32(std::span<const uint8_t> b, size_t p) {
     return (uint32_t(b[p]) << 24) | (uint32_t(b[p+1]) << 16) | (uint32_t(b[p+2]) << 8) | b[p+3];
 }
@@ -101,16 +106,11 @@ std::shared_ptr<const Resource> Library::Find(uint32_t stage,uint64_t hash,std::
 Library::Stats Library::GetStats() {std::lock_guard lock(mutex_);return stats_;}
 Library& GetLibrary() {static Library library;return library;}
 bool Enabled() {
-    static const bool on=[] {
-        const char* v=std::getenv("SB_GAME_SHADER_RESOURCES");
-        if(v) return v[0]!='0';
-#if defined(__ANDROID__) && defined(SB_PLUME_RHI)
-        return true;
-#else
-        return false;
-#endif
-    }();return on;
+    return configured.load(std::memory_order_acquire);
 }
-void PublishTranslationReady() {ready.store(true,std::memory_order_release);}
+void PublishTranslationReady(bool enabled) {
+    configured.store(enabled,std::memory_order_release);
+    ready.store(true,std::memory_order_release);
+}
 bool TranslationReady() {return ready.load(std::memory_order_acquire);}
 }
