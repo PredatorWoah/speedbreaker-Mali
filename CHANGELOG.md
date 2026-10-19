@@ -4,6 +4,14 @@ What changed in each SpeedBreaker release, newest first. Each release's notes on
 its entry here, and the game shows the entry once, the first time a new version starts (offline:
 it's built into the game).
 
+## v0.1.14 (2026-10-19)
+
+- First native geometry slice: hardware vertex attributes for supported draws,
+  with proven ranges and compatibility fallback.
+- Native Vertex Input rollback, per-pass native coverage and CPU preparation logs.
+- Full game-native rendering remains in progress: PM4 and EDRAM paths are still
+  active. No measured RP6 speedup is claimed.
+
 ## v0.1.13 (2026-10-19)
 
 - Precomputed vertex-memory routes share address selection across an attribute,

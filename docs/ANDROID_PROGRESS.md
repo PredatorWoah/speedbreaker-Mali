@@ -454,3 +454,16 @@ APK SHA256 4f44ad2a2937bbb658d7c9a91e11f6fb783721d44a70bfc1728faf99eca71126;
 native Build ID 265d14231f67525a1051c7a08ebc9d45f50e8021.
 CI offscreen run 39274316020 passes. 0.1.12 APK checksum verified unchanged.
 Build record: builds/android/0.1.13-plume-vulkan/. No new device gain claimed.
+
+## Full-native rendering decision and 0.1.14 first geometry slice
+
+Juan reports 0.1.13 remains about 30–40 FPS, with possible pacing improvement but
+no confirmed gain, and requests game-native rendering without GPU emulation.
+Implemented a hardware vertex-input path with exact address bounds, protected
+static/shared buffers or snapshots, native attribute layouts and Plume binding.
+Original format/endian/ALU retained; unsupported cases and optional-pipeline
+compilation fall back without losing draws. Added native pass counts and CPU
+preparation diagnostics. 46 host suites, four Vulkan/Legacy checks, 240 shader
+modules and Android native link pass. This is NOT a completed full-native
+renderer: game-call/resource interception, PM4 removal and native render-target
+ownership remain. See ANDROID_NATIVE_RENDERER.md for evidence and next stages.

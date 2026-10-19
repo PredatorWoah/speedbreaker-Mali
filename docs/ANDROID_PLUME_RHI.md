@@ -71,3 +71,10 @@ matched performance delta and custom-driver compatibility remain unverified.
 Further 0.1.12 report: Mr Purple T26 reaches the 50 FPS range but sometimes drops
 to 26 FPS. This is positive execution evidence for that driver/session, not a
 matched performance gain or a resolution of all custom-driver crashes.
+
+## Full-native target and 0.1.14
+
+The next goal is a game-call-level renderer with no PM4/EDRAM emulation. 0.1.14
+adds real hardware vertex inputs for supported draws. It does not complete that
+conversion; existing command processing and EDRAM operations remain active.
+See ANDROID_NATIVE_RENDERER.md for implementation boundaries and required stages.
