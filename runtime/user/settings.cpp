@@ -120,6 +120,9 @@ namespace settings
 
         // Defaults are what the runtime did before settings existed, so an
         // empty settings.toml changes nothing.
+        constexpr EnumEntry kRenderBackendEntries[] = {
+            {0, "legacy", "Legacy Vulkan"}, {1, "plume", "Plume Vulkan"}
+        };
         constexpr Option kOptions[] = {
             // Video
             { .id = Id::Fullscreen, .category = Category::Display, .type = Type::Bool, .apply = Apply::Live, .hidden = kFullscreenHidden,
@@ -234,6 +237,21 @@ namespace settings
               .table = "advanced", .key = "depth_stage_reduction", .label = "Depth Stage Reduction",
               .description = "Remove unused shader outputs and safe fragment stages from depth draws. Keeps alpha-tested casters. Restart to compare.",
               .env = "SB_DEPTH_STAGE_REDUCTION", .defaultValue = kGpuWorkDefault },
+            { .id = Id::RenderBackend, .category = Category::Advanced, .type = Type::Enum, .apply = Apply::Restart,
+#ifdef SB_PLUME_RHI
+              .hidden = false,
+#else
+              .hidden = true,
+#endif
+              .table = "advanced", .key = "render_backend", .label = "Rendering Backend",
+              .description = "Plume Vulkan records game draws and compute resolves on the existing Vulkan device. Restart to switch backends.",
+              .env = "SB_RENDER_BACKEND",
+#ifdef SB_PLUME_RHI
+              .defaultValue = 1,
+#else
+              .defaultValue = 0,
+#endif
+              .entries = kRenderBackendEntries },
         };
         static_assert(std::size(kOptions) == kCount, "one row per settings::Id");
 

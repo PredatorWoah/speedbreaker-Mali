@@ -3,6 +3,10 @@
 // vulkan/vulkan_pipeline_cache.cc.
 #include <stdafx.h>
 #include "renderer.h"
+#include "plume_backend.h"
+#ifdef __ANDROID__
+#include <platform/android/gpu_driver.h>
+#endif
 #include <cpu/guest_thread.h>
 #include <cpu/host_cpu.h>
 #include <cpu/guest_time.h>
@@ -321,6 +325,7 @@ namespace gpu::renderer
             VkDeviceSize bytes = 0;  // its allocation or range (the [perf] line's memory)
             ImageBlock* block = nullptr;  // bound at `offset` in this block, if any
             VkDeviceSize offset = 0;
+            std::shared_ptr<gpu::plume_rhi::ImageAllocation> plumeAllocation;
         };
 
         const bool s_imagePool = [] { const char* v = std::getenv("NFSMW_IMAGE_POOL"); return !v || v[0] != '0'; }();
@@ -520,36 +525,45 @@ namespace gpu::renderer
             ici.tiling = VK_IMAGE_TILING_OPTIMAL;  // (image memory blocks hold nothing linear)
             ici.usage = usage;
             ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            VkResult result = vkCreateImage(s_dev, &ici, nullptr, &img.image);
-            if (fallible && result != VK_SUCCESS)
-                return {};
-            Check(result, "vkCreateImage");
-            VkMemoryDedicatedRequirements dedicated{ VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS };
-            VkMemoryRequirements2 req2{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &dedicated };
-            if (s_imagePool)
-            {
-                VkImageMemoryRequirementsInfo2 info{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, nullptr, img.image };
-                vkGetImageMemoryRequirements2(s_dev, &info, &req2);
+            VkResult result;
+            if (gpu::plume_rhi::Enabled()) {
+                result = gpu::plume_rhi::AllocateImage(ici, img.image, img.bytes, img.plumeAllocation);
+                if (fallible && result != VK_SUCCESS) return {};
+                Check(result, "Plume image allocation");
+                // VMA owns physical block allocations; don't count its logical
+                // images as legacy vkAllocateMemory calls in the old diagnostics.
+            } else {
+                result = vkCreateImage(s_dev, &ici, nullptr, &img.image);
+                if (fallible && result != VK_SUCCESS)
+                    return {};
+                Check(result, "vkCreateImage");
+                VkMemoryDedicatedRequirements dedicated{ VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS };
+                VkMemoryRequirements2 req2{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &dedicated };
+                if (s_imagePool)
+                {
+                    VkImageMemoryRequirementsInfo2 info{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, nullptr, img.image };
+                    vkGetImageMemoryRequirements2(s_dev, &info, &req2);
+                }
+                else
+                    vkGetImageMemoryRequirements(s_dev, img.image, &req2.memoryRequirements);
+                const VkMemoryRequirements& req = req2.memoryRequirements;
+                uint32_t memoryType = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                img.bytes = req.size;
+                if (!s_imagePool || dedicated.prefersDedicatedAllocation || dedicated.requiresDedicatedAllocation ||
+                    req.size > s_blockSize / 2 || !BindToBlock(img, req, memoryType))
+                {
+                    VkMemoryDedicatedAllocateInfo dai{ VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, nullptr, img.image };
+                    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                    mai.pNext = dedicated.requiresDedicatedAllocation ? &dai : nullptr;
+                    mai.allocationSize = req.size;
+                    mai.memoryTypeIndex = memoryType;
+                    auto allocationStart = std::chrono::steady_clock::now();
+                    Check(vkAllocateMemory(s_dev, &mai, nullptr, &img.memory), "vkAllocateMemory(image)");
+                    s_imageTotals.allocations++;
+                    s_imageTotals.allocationNs += SinceNs(allocationStart);
+                }
+                Check(vkBindImageMemory(s_dev, img.image, img.memory, img.offset), "vkBindImageMemory");
             }
-            else
-                vkGetImageMemoryRequirements(s_dev, img.image, &req2.memoryRequirements);
-            const VkMemoryRequirements& req = req2.memoryRequirements;
-            uint32_t memoryType = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            img.bytes = req.size;
-            if (!s_imagePool || dedicated.prefersDedicatedAllocation || dedicated.requiresDedicatedAllocation ||
-                req.size > s_blockSize / 2 || !BindToBlock(img, req, memoryType))
-            {
-                VkMemoryDedicatedAllocateInfo dai{ VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, nullptr, img.image };
-                VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-                mai.pNext = dedicated.requiresDedicatedAllocation ? &dai : nullptr;
-                mai.allocationSize = req.size;
-                mai.memoryTypeIndex = memoryType;
-                auto allocationStart = std::chrono::steady_clock::now();
-                Check(vkAllocateMemory(s_dev, &mai, nullptr, &img.memory), "vkAllocateMemory(image)");
-                s_imageTotals.allocations++;
-                s_imageTotals.allocationNs += SinceNs(allocationStart);
-            }
-            Check(vkBindImageMemory(s_dev, img.image, img.memory, img.offset), "vkBindImageMemory");
             VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
             vci.pNext = viewNext;
             vci.image = img.image;
@@ -575,6 +589,11 @@ namespace gpu::renderer
         {
             if (img.view)
                 vkDestroyImageView(s_dev, img.view, nullptr);
+            if (img.plumeAllocation) {
+                img.plumeAllocation.reset();
+                img = {};
+                return;
+            }
             if (img.image)
                 vkDestroyImage(s_dev, img.image, nullptr);
             if (ImageBlock* block = img.block)
@@ -937,6 +956,7 @@ namespace gpu::renderer
             VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             Check(vkBeginCommandBuffer(s_cmd, &bi), "vkBeginCommandBuffer");
+            gpu::plume_rhi::BeginRecording(s_cmd);
             s_recording = true;
             s_stateEpoch++;
             s_recordStart = std::chrono::steady_clock::now();
@@ -1009,7 +1029,7 @@ namespace gpu::renderer
                 else
                     video::WaitForeground(lock);
                 auto t1 = std::chrono::steady_clock::now();
-                Check(vkQueueSubmit(s_vk->queue, 1, &si, sub.fence), "vkQueueSubmit");
+                Check(gpu::plume_rhi::SubmitQueue(s_vk->queue, 1, &si, sub.fence), "vkQueueSubmit");
                 auto t2 = std::chrono::steady_clock::now();
                 s_queueLockUs += std::chrono::duration<double, std::micro>(tl - t0).count();
                 s_queueSubmitUs += std::chrono::duration<double, std::micro>(t2 - t1).count();
@@ -2294,7 +2314,7 @@ namespace gpu::renderer
             if (!s_passActive)
                 return;
             ZpdEndSegment();  // a segment never outlives its pass
-            s_vk->cmdEndRendering(s_cmd);
+            gpu::plume_rhi::EndRendering(s_cmd, s_vk->cmdEndRendering);
             s_passActive = false;
             TimingEnd(s_timedPass);
             s_timedPass = -1;
@@ -2616,7 +2636,7 @@ namespace gpu::renderer
                     timed.base = depth->base; timed.format = depth->format;
                 }
             }
-            s_vk->cmdBeginRendering(s_cmd, &ri);
+            gpu::plume_rhi::BeginRendering(s_cmd, &ri, s_vk->cmdBeginRendering);
             s_passActive = true;
             s_stats.passes++;
             for (const PendingClear& pc : inPass)
@@ -2986,14 +3006,14 @@ namespace gpu::renderer
             gpci.pDynamicState = &ds;
             gpci.layout = layout;
             VkPipeline pipeline = VK_NULL_HANDLE;
-            VkResult r = vkCreateGraphicsPipelines(s_dev, s_pipelineCache, 1, &gpci, nullptr, &pipeline);
+            VkResult r = gpu::plume_rhi::CreateGraphicsPipelines(s_dev, s_pipelineCache, 1, &gpci, nullptr, &pipeline);
             if (r != VK_SUCCESS && noFragment) {
                 // Keep solid casters even if a driver rejects a vertex-only pipeline.
                 stages[1].module = PixelVariant(ps, outputs, inputs, false);
                 gpci.stageCount = 2;
                 if (pipeline) vkDestroyPipeline(s_dev, pipeline, nullptr);
                 pipeline = VK_NULL_HANDLE;
-                if (stages[1].module) r = vkCreateGraphicsPipelines(s_dev, s_pipelineCache, 1, &gpci, nullptr, &pipeline);
+                if (stages[1].module) r = gpu::plume_rhi::CreateGraphicsPipelines(s_dev, s_pipelineCache, 1, &gpci, nullptr, &pipeline);
                 fprintf(stderr, "[renderer] depth-only fragment fallback result %d\n", int(r));
             }
             bool legacySpirv = false;
@@ -3013,7 +3033,7 @@ namespace gpu::renderer
                 if (stages[0].module && stages[1].module)
                 {
                     legacySpirv = true;
-                    r = vkCreateGraphicsPipelines(s_dev, s_pipelineCache, 1, &gpci, nullptr, &pipeline);
+                    r = gpu::plume_rhi::CreateGraphicsPipelines(s_dev, s_pipelineCache, 1, &gpci, nullptr, &pipeline);
                     if (r == VK_SUCCESS)
                         fprintf(stderr, "[renderer] pipeline vs %016llx ps %016llx recovered with SPIR-V 1.3\n",
                             (unsigned long long)key.vs, (unsigned long long)key.ps);
@@ -4480,13 +4500,13 @@ void main()
                             if (!t.uploaded && slice == 0)
                                 ToGeneral(t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, layers);
                             s_stateEpoch++;
-                            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileStorePipeline);
-                            s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileStoreLayout, 0, AddSharedParts(w, 2), w);
-                            vkCmdPushConstants(s_cmd, s_untileStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
+                            gpu::plume_rhi::BindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileStorePipeline);
+                            gpu::plume_rhi::PushDescriptors(s_pushDescriptorSet, s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileStoreLayout, 0, AddSharedParts(w, 2), w);
+                            gpu::plume_rhi::PushConstants(s_cmd, s_untileStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
                             if (!(s_exp & 4))
                                 {
                                     int timed = TimingBegin("texture_compute");
-                                    vkCmdDispatch(s_cmd, (bw + 7) / 8, (bh + 7) / 8, 1);
+                                    gpu::plume_rhi::Dispatch(s_cmd, (bw + 7) / 8, (bh + 7) / 8, 1);
                                     TimingEnd(timed);
                                 }
                             FullBarrier();
@@ -4514,14 +4534,14 @@ void main()
                             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ring, nullptr },
                         };
                         s_stateEpoch++;
-                        vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untilePipeline);
-                        s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileLayout, 0, AddSharedParts(w, 2), w);
-                        vkCmdPushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
+                        gpu::plume_rhi::BindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untilePipeline);
+                        gpu::plume_rhi::PushDescriptors(s_pushDescriptorSet, s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileLayout, 0, AddSharedParts(w, 2), w);
+                        gpu::plume_rhi::PushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
                         uint32_t groupsX = fi.convert != 0 || fi.bpbLog2 >= 2 ? bw : rowWords;
                         if (!(s_exp & 4))
                             {
                                 int timed = TimingBegin("texture_compute");
-                                vkCmdDispatch(s_cmd, (groupsX + 7) / 8, (bh + 7) / 8, 1);
+                                gpu::plume_rhi::Dispatch(s_cmd, (groupsX + 7) / 8, (bh + 7) / 8, 1);
                                 TimingEnd(timed);
                             }
                         FullBarrier();
@@ -4580,13 +4600,13 @@ void main()
                                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ring, nullptr },
                             };
                             s_stateEpoch++;
-                            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untilePipeline);
-                            s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileLayout, 0, AddSharedParts(w, 2), w);
-                            vkCmdPushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
+                            gpu::plume_rhi::BindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untilePipeline);
+                            gpu::plume_rhi::PushDescriptors(s_pushDescriptorSet, s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileLayout, 0, AddSharedParts(w, 2), w);
+                            gpu::plume_rhi::PushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
                             uint32_t groupsX = fi.convert != 0 || fi.bpbLog2 >= 2 ? lbw : levelRowWords;
                             {
                                 int timed = TimingBegin("texture_compute");
-                                vkCmdDispatch(s_cmd, (groupsX + 7) / 8, (lbh + 7) / 8, 1);
+                                gpu::plume_rhi::Dispatch(s_cmd, (groupsX + 7) / 8, (lbh + 7) / 8, 1);
                                 TimingEnd(timed);
                             }
                             FullBarrier();
@@ -5901,14 +5921,14 @@ void main()
                     const bool wordOrder = gpu::g_workReductionEnabled && wordOrderEnabled && source->scale.IsOne() && !scaledWrite && bl == 2;
                     if (wordOrder && !s_resolveWordPipeline)
                         if (gpu::g_workReductionEnabled) MakeResolvePipeline(false, 1, 1, &s_resolveWordPipeline, true);
-                    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, wordOrder ? s_resolveWordPipeline : ResolvePipeline(coalesced, source->scale));
-                    s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
-                    vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
+                    gpu::plume_rhi::BindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, wordOrder ? s_resolveWordPipeline : ResolvePipeline(coalesced, source->scale));
+                    gpu::plume_rhi::PushDescriptors(s_pushDescriptorSet, s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
+                    gpu::plume_rhi::PushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
                     uint32_t perWord = bl >= 2 ? 1 : (4 >> bl);
                     int timedResolve = TimingBegin(depthSource ? "resolve_depth" : "resolve_color",
                         rc.width, rc.height, rc.destBase, format, rangeBytes);
                     if (!(s_exp & 2))
-                        vkCmdDispatch(s_cmd, (coalesced || wordOrder) ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
+                        gpu::plume_rhi::Dispatch(s_cmd, (coalesced || wordOrder) ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
                             (coalesced || wordOrder) ? (rc.height + 1) / 2 : (rc.height + 7) / 8, 1);
                     if (scaledWrite)
                         FullBarrier();  // (above 1x: as before)
@@ -6060,7 +6080,7 @@ void main()
             cpci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
                 module, "main", nullptr };
             cpci.layout = layout;
-            Check(vkCreateComputePipelines(s_dev, s_pipelineCache, 1, &cpci, nullptr, &pipeline), "compute pipeline");
+            Check(gpu::plume_rhi::CreateComputePipelines(s_dev, s_pipelineCache, 1, &cpci, nullptr, &pipeline), "compute pipeline");
         }
 
         // Scaled memory's GPU side (see ScaledMemory): made on the first
@@ -6396,23 +6416,23 @@ void main()
                 VkDescriptorImageInfo ii{ VK_NULL_HANDLE, t.storeView, VK_IMAGE_LAYOUT_GENERAL };
                 w[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     &ii, nullptr, nullptr };
-                vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledStorePipeline);
-                s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledStoreLayout, 0, 3, w);
-                vkCmdPushConstants(s_cmd, s_scaledStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                gpu::plume_rhi::BindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledStorePipeline);
+                gpu::plume_rhi::PushDescriptors(s_pushDescriptorSet, s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledStoreLayout, 0, 3, w);
+                gpu::plume_rhi::PushConstants(s_cmd, s_scaledStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
                 {
                     int timed = TimingBegin("texture_compute");
-                    vkCmdDispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
+                    gpu::plume_rhi::Dispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
                     TimingEnd(timed);
                 }
                 ComputeBarrier();
                 return;
             }
-            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledUntilePipeline);
-            s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledUntileLayout, 0, 3, w);
-            vkCmdPushConstants(s_cmd, s_scaledUntileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            gpu::plume_rhi::BindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledUntilePipeline);
+            gpu::plume_rhi::PushDescriptors(s_pushDescriptorSet, s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledUntileLayout, 0, 3, w);
+            gpu::plume_rhi::PushConstants(s_cmd, s_scaledUntileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
             {
                 int timed = TimingBegin("scaled_texture_compute", t.width, t.height);
-                vkCmdDispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
+                gpu::plume_rhi::Dispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
                 TimingEnd(timed);
             }
             FullBarrier();
@@ -6456,12 +6476,12 @@ void main()
                 struct { uint32_t count, slotWords, listWord, pad, scaleX, scaleY, denX, denY; } pc = { count, s_scaled.slotWords,
                     uint32_t(list / 4), 0, sc.x.num, sc.y.num, sc.x.den, sc.y.den };
                 s_stateEpoch++;
-                vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledFillPipeline);
-                s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledFillLayout, 0, AddSharedParts(w, 3), w);
-                vkCmdPushConstants(s_cmd, s_scaledFillLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                gpu::plume_rhi::BindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledFillPipeline);
+                gpu::plume_rhi::PushDescriptors(s_pushDescriptorSet, s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledFillLayout, 0, AddSharedParts(w, 3), w);
+                gpu::plume_rhi::PushConstants(s_cmd, s_scaledFillLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
                 {
                     int timed = TimingBegin("scaled_memory_fill");
-                    vkCmdDispatch(s_cmd, (count * 1024 + 63) / 64, 1, 1);
+                    gpu::plume_rhi::Dispatch(s_cmd, (count * 1024 + 63) / 64, 1, 1);
                     TimingEnd(timed);
                 }
                 FullBarrier();
@@ -6589,7 +6609,7 @@ void main()
             cpci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
                 module, "main", nullptr };
             cpci.layout = s_resolveLayout;
-            Check(vkCreateComputePipelines(s_dev, s_pipelineCache, 1, &cpci, nullptr, out), "resolve pipeline");
+            Check(gpu::plume_rhi::CreateComputePipelines(s_dev, s_pipelineCache, 1, &cpci, nullptr, out), "resolve pipeline");
         }
 
         // The resolve pipeline for a source at `scale` (see s_resolveDenPipelines).
@@ -7372,6 +7392,12 @@ void main()
             s_vk = nullptr;
             return false;
         }
+        bool requestPlume = settings::GetInt(settings::Id::RenderBackend) == 1;
+#ifdef __ANDROID__
+        int backendOverride = platform::android::RendererBackendOverride();
+        if (backendOverride >= 0) requestPlume = backendOverride == 1;
+#endif
+        if (!gpu::plume_rhi::Initialize(s_vk->instance, s_vk->physical, s_dev, s_vk->queueFamily, requestPlume)) return false;
         glslang_initialize_process();
         CreatePipelineCache();
 
@@ -9080,12 +9106,12 @@ void main()
         }
         if (fresh || bound.pipeline != pipeline)
         {
-            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            gpu::plume_rhi::BindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             bound.pipeline = pipeline;
         }
         if (fresh || memcmp(&bound.viewport, &viewport, sizeof(viewport)) != 0)
         {
-            vkCmdSetViewport(s_cmd, 0, 1, &viewport);
+            gpu::plume_rhi::SetViewport(s_cmd, 0, 1, &viewport);
             bound.viewport = viewport;
         }
         // The scissor and the push constants are recorded through these, so
@@ -9093,11 +9119,11 @@ void main()
         // copies (below) change both, and a stale cache would skip the next
         // draw's own scissor and clip it to a fill rectangle.
         auto setScissor = [&](const VkRect2D& r) {
-            vkCmdSetScissor(s_cmd, 0, 1, &r);
+            gpu::plume_rhi::SetScissor(s_cmd, 0, 1, &r);
             bound.scissor = r;
         };
         auto pushConstants = [&](const DrawConstants& c) {
-            vkCmdPushConstants(s_cmd, layout.pipeline, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(c), &c);
+            gpu::plume_rhi::PushConstants(s_cmd, layout.pipeline, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(c), &c);
             bound.pc = c;
         };
         if (fresh || memcmp(&bound.scissor, &scissor, sizeof(scissor)) != 0)
@@ -9132,14 +9158,14 @@ void main()
         }
         if (fresh || memcmp(bound.bias, bias, sizeof(bias)) != 0)
         {
-            vkCmdSetDepthBias(s_cmd, bias[0], bias[1], bias[2]);
+            gpu::plume_rhi::SetDepthBias(s_cmd, bias[0], bias[1], bias[2]);
             memcpy(bound.bias, bias, sizeof(bias));
         }
 
         uint32_t dynamicOffset = uint32_t(constantsOffset);
         if (fresh || bound.setOffset != dynamicOffset)
         {
-            vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.pipeline, 0, 1, &s_set0, 1, &dynamicOffset);
+            gpu::plume_rhi::BindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.pipeline, 0, 1, &s_set0, 1, &dynamicOffset);
             bound.setOffset = dynamicOffset;
         }
 
@@ -9166,7 +9192,7 @@ void main()
                     bound.textures[i].imageLayout == writes[i].pImageInfo->imageLayout;
             if (!same)
             {
-                s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.pipeline, 1, writeCount, writes);
+                gpu::plume_rhi::PushDescriptors(s_pushDescriptorSet, s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.pipeline, 1, writeCount, writes);
                 bound.textureLayout = layout.pipeline;
                 bound.textureCount = writeCount;
                 for (uint32_t i = 0; i < writeCount; i++)
@@ -9243,11 +9269,11 @@ void main()
         if (useIndices)
         {
             vkCmdBindIndexBuffer(s_cmd, s_ring, indexOffset, indices16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(s_cmd, vertexCount, 1, 0, 0, 0);
+            gpu::plume_rhi::DrawIndexed(s_cmd, vertexCount, 1, 0, 0, 0);
         }
         else
         {
-            vkCmdDraw(s_cmd, vertexCount, 1, 0, 0);
+            gpu::plume_rhi::Draw(s_cmd, vertexCount, 1, 0, 0);
         }
         // Edge bars (above): the same draw again per rectangle, with the
         // stretched posScale and the rectangle as its scissor (inside this
@@ -9298,9 +9324,9 @@ void main()
                     timed.alphaDraws += pc.alphaTest != 7u;
                 }
                 if (useIndices)
-                    vkCmdDrawIndexed(s_cmd, vertexCount, 1, 0, 0, 0);
+                    gpu::plume_rhi::DrawIndexed(s_cmd, vertexCount, 1, 0, 0, 0);
                 else
-                    vkCmdDraw(s_cmd, vertexCount, 1, 0, 0);
+                    gpu::plume_rhi::Draw(s_cmd, vertexCount, 1, 0, 0);
             }
         }
         if (s_submitAfterDraw)
@@ -9573,12 +9599,12 @@ void main()
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &table, nullptr },
         };
         s_stateEpoch++;
-        vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontPipeline);
-        s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontLayout, 0, AddSharedParts(w, 4), w);
-        vkCmdPushConstants(s_cmd, s_frontLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        gpu::plume_rhi::BindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontPipeline);
+        gpu::plume_rhi::PushDescriptors(s_pushDescriptorSet, s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontLayout, 0, AddSharedParts(w, 4), w);
+        gpu::plume_rhi::PushConstants(s_cmd, s_frontLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         {
             int timed = TimingBegin("front_compute", outW, outH);
-            vkCmdDispatch(s_cmd, (outW + 7) / 8, (outH + 7) / 8, 1);
+            gpu::plume_rhi::Dispatch(s_cmd, (outW + 7) / 8, (outH + 7) / 8, 1);
             TimingEnd(timed);
         }
         GuardGpu(pc.base, frontBytes, false, "front buffer");
@@ -9672,6 +9698,13 @@ void main()
 
     void OnSwap(uint64_t frame)
     {
+        if (gpu::plume_rhi::Enabled() && frame % 120 == 0) {
+            auto c = gpu::plume_rhi::GetCounters();
+            fprintf(stderr, "[plume] frame=%llu passes=%llu draws=%llu indexed=%llu dispatches=%llu graphics_pipelines=%llu compute_pipelines=%llu descriptors=%llu images=%llu (cumulative)\n",
+                (unsigned long long)frame, (unsigned long long)c.passes, (unsigned long long)c.draws,
+                (unsigned long long)c.indexedDraws, (unsigned long long)c.dispatches,
+                (unsigned long long)c.graphicsPipelines, (unsigned long long)c.computePipelines, (unsigned long long)c.descriptors, (unsigned long long)c.images);
+        }
 #ifdef __ANDROID__
         // Bounded aggregate evidence, no images or guest data. GPU interval
         // totals are asynchronous completed submissions, not per-frame times.

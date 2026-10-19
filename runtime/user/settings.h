@@ -69,6 +69,7 @@ namespace settings
         GpuWorkReduction,
         PredicateCoalescing,
         DepthStageReduction,
+        RenderBackend,
         Count
     };
     constexpr size_t kCount = size_t(Id::Count);
