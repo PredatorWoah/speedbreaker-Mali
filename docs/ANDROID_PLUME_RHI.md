@@ -59,3 +59,15 @@ No RP6 execution, gameplay-image parity, Android custom-driver compatibility, th
 2. Exercise custom-driver initialization separately with crash logs; preserve the shared dispatch and loader identity checks.
 3. Convert remaining production descriptor/pipeline ownership and buffer/transfer operations to generic RHI descriptions only where exact Vulkan state can be represented. Keep custom guest-memory imports and EDRAM semantics explicit.
 4. Use the existing pass timings to target color/depth memory traffic, shader/vertex work and redundant pass transitions. Accept optimizations only with image parity and lower full-frame time; 720p60 requires less than 16.67 ms, not a faster isolated pilot.
+
+## Subsequent device report — October 19
+
+Juan tested signed 0.1.12 in Quick Race with Plume Vulkan, System driver, 720p,
+and reported no visual glitches. Some scenes reached 40 FPS but the game remains
+slow. This updates the build-time absence of device evidence above; full parity,
+matched performance delta and custom-driver compatibility remain unverified.
+0.1.13 targets vertex-memory routing; see ANDROID_PERFORMANCE_0113.md.
+
+Further 0.1.12 report: Mr Purple T26 reaches the 50 FPS range but sometimes drops
+to 26 FPS. This is positive execution evidence for that driver/session, not a
+matched performance gain or a resolution of all custom-driver crashes.

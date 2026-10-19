@@ -424,3 +424,23 @@ APK SHA256 248c69ac660f697bae4b0ea5ca098f82e66842ffbe530e839807aa66076e71cb;
 native Build ID 1da6a82968c8e94a6cb090d53bb9511ec925f32b.
 CI offscreen run 39271108669 passes. Build record:
 builds/android/0.1.12-plume-vulkan/. No RP6 execution, parity or speed gain verified.
+
+## RP6 Plume 0.1.12 result and 0.1.13 vertex-routing candidate
+
+Juan confirms Quick Race with Plume Vulkan + System driver at 720p, no observed
+visual glitches. Some scenes reach 40 FPS; overall performance is still poor.
+This is initial device gameplay evidence, not a matched performance gain or
+comprehensive image parity proof. Prior 0.1.11 custom-driver crashes remain open.
+
+Implemented precomputed vertex-memory routes with complete-attribute bounds,
+first-match snapshot priority and original per-word fallback. Relative ring bias
+preserves constants reuse across allocations. Existing geometry/format/endian,
+shader ALU, EDRAM and synchronization remain. Restart rollback and cumulative
+route-coverage logs included. 8.4M CPU address comparisons, actual GLSL GPU
+comparison, 120 format/target/memory shader variants, 45 host suites and four
+Plume/Legacy tests pass. No 0.1.13 RP6 gain inferred. See ANDROID_PERFORMANCE_0113.md.
+
+Additional 0.1.12 user report: Mr Purple T26 runs and reaches the 50 FPS range,
+with some drops to 26 FPS. This updates the blanket absence of custom-driver
+execution evidence, not the stability of other previously crashing drivers.
+Keep driver choice fixed while comparing the new vertex-routing setting.

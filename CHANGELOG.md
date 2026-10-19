@@ -4,6 +4,14 @@ What changed in each SpeedBreaker release, newest first. Each release's notes on
 its entry here, and the game shows the entry once, the first time a new version starts (offline:
 it's built into the game).
 
+## v0.1.13 (2026-10-19)
+
+- Precomputed vertex-memory routes share address selection across an attribute,
+  retaining exact per-word fallback for overlaps and unusual accesses.
+- Restart-bound Vertex Memory Routing rollback and route-coverage diagnostics.
+- Preserves graphics quality, custom EDRAM handling and backend selection.
+  RP6 performance improvement remains unverified.
+
 ## v0.1.12 (2026-10-19)
 
 - Optional Plume Vulkan backend: game render-pass scopes, pipeline creation,
