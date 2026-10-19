@@ -70,10 +70,21 @@ if(IOS)
 else()
     find_package(Vulkan REQUIRED)
 endif()
+option(SB_PLUME_RHI "Use Plume Vulkan for game draw/resolve recording" OFF)
+if(SB_PLUME_RHI)
+    if(NOT ANDROID)
+        message(FATAL_ERROR "Full SB_PLUME_RHI runtime currently targets Android; use tests/plume for host validation")
+    endif()
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/plume.cmake)
+    target_link_libraries(SpeedBreaker PRIVATE plume)
+    target_compile_definitions(SpeedBreaker PRIVATE SB_PLUME_RHI=1)
+endif()
 if(ANDROID)
-    set(VOLK_STATIC_DEFINES "VK_USE_PLATFORM_ANDROID_KHR")
-    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../tools/volk ${CMAKE_BINARY_DIR}/volk)
-    set_target_properties(volk PROPERTIES C_VISIBILITY_PRESET hidden)
+    if(NOT SB_PLUME_RHI)
+        set(VOLK_STATIC_DEFINES "VK_USE_PLATFORM_ANDROID_KHR")
+        add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../tools/volk ${CMAKE_BINARY_DIR}/volk)
+        set_target_properties(volk PROPERTIES C_VISIBILITY_PRESET hidden)
+    endif()
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../tools/libadrenotools ${CMAKE_BINARY_DIR}/adrenotools)
     # Every application and ImGui call must use the selected loader's dispatch.
     set(SB_VULKAN_TARGET volk)
@@ -156,27 +167,6 @@ add_custom_target(nfsmw_build_info
     BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/generated/build_info.inc
     VERBATIM)
 add_dependencies(SpeedBreaker nfsmw_build_info)
-
-# Experimental Plume RHI integration. Off for the established Vulkan renderer.
-# The Plume backend is built on Android only; guest draw translation is not yet migrated.
-option(SB_PLUME_RHI "Build experimental Plume Vulkan RHI on Android" OFF)
-if(SB_PLUME_RHI)
-    if(NOT ANDROID)
-        message(FATAL_ERROR "SB_PLUME_RHI currently supports only Android")
-    endif()
-    include(FetchContent)
-    set(PLUME_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(PLUME_SDL2_VULKAN_ENABLED OFF CACHE BOOL "" FORCE)
-    set(PLUME_SDL3_VULKAN_ENABLED OFF CACHE BOOL "" FORCE)
-    FetchContent_Declare(sb_plume
-        GIT_REPOSITORY https://github.com/renderbag/plume.git
-        GIT_TAG e48a55be0cff0f1e82b25cd0ab68be37357ee0f9
-        GIT_SHALLOW FALSE
-        GIT_SUBMODULES_RECURSE TRUE)
-    FetchContent_MakeAvailable(sb_plume)
-    target_link_libraries(SpeedBreaker PRIVATE plume)
-    target_compile_definitions(SpeedBreaker PRIVATE SB_PLUME_RHI=1)
-endif()
 
 target_link_libraries(SpeedBreaker PRIVATE NfsmwRecompLib XenonUtilsLite o1heap imgui SDL3::SDL3 ${SB_VULKAN_TARGET} glslang::glslang glslang::glslang-default-resource-limits ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY})
 # glslang before 15 (the Steam Frame's 14) keeps the C API's SPIR-V
