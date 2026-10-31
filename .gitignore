@@ -54,3 +54,21 @@ speedbreaker-bug-report-*.zip
 # Python
 __pycache__/
 *.pyc
+
+# Android build metadata and private signing material
+android/.gradle/
+android/app/.cxx/
+android/local.properties
+*.keystore
+*.jks
+*.apk
+*.aab
+*.apks
+*.so
+*.o
+*.a
+android/app/build/
+android/build/
+
+# The launcher icon made from the player's disc (scripts/android/prepare_disc_icon.sh)
+/android/app/src/disc/

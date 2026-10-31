@@ -5,10 +5,13 @@
 // left/right changes it, A toggles, LB/RB turn pages, B closes. The mouse
 // works too (a click selects a row, its arrows change it, the tabs turn
 // pages), and touch as the mouse (on iOS a drag scrolls the rows: ui.cpp).
-// Advanced also has Save Bug Report (report/bug_report.cpp), the build's
-// identity (version and commit) and the legal notice.
+// Advanced also has Save Bug Report (report/bug_report.cpp), Check for
+// Updates (update_dialog.cpp), the build's identity (version and commit) and
+// the legal notice. The footer's last button is Quit Game, which asks first
+// (quit_game.h; not on iPhone or iPad).
 #include <stdafx.h>
 #include "ui.h"
+#include "quit_game.h"
 
 #include <report/report.h>
 #include <user/settings.h>
@@ -16,6 +19,11 @@
 #include <video/presenter.h>
 
 #include <imgui.h>
+#include <imgui_internal.h>  // ClosePopupToLevel: a dialog left open when the menu closed
+
+#include <SDL3/SDL_error.h>
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_timer.h>
 
 namespace ui
 {
@@ -29,9 +37,16 @@ namespace ui
         bool s_focusFirstRow = true; // put the controller's cursor on the page's first row
         Id s_described = Id::Count;  // the row the help line describes
         bool s_describedBugReport = false;  // ...or Save Bug Report's
+        bool s_describedUpdate = false;     // ...or Check for Updates'
+        int s_describedPreset = -1;         // ...or a Graphics preset's (Android)
         bool s_opened = true;        // just opened: take focus
 
         constexpr int kCategories = int(Category::Count);
+
+#if SB_QUIT_GAME
+        constexpr const char* kQuitPopup = "quit";
+        quit::Prompt s_quit;
+#endif
 
         bool Pressed(ImGuiKey key)
         {
@@ -173,6 +188,10 @@ namespace ui
                     marker("ENV", ImGui::GetColorU32(ImGuiCol_TextDisabled));
                 if (settings::RestartPending(o.id))
                     marker("RESTART", ImGui::GetColorU32(ImGuiCol_PlotLines));
+                // The row is the saved choice; the system (the green button)
+                // changed the window this session: say what it is now.
+                if (o.id == Id::Fullscreen && !locked && video::FullscreenWindowDiffers())
+                    marker(video::WindowFullscreen() ? "NOW FULLSCREEN" : "NOW WINDOWED", ImGui::GetColorU32(ImGuiCol_TextDisabled));
             }
 
             int delta = 0;
@@ -243,11 +262,12 @@ namespace ui
             }
         }
 
-        // An action, not an option: A (or a click) saves the report.
-        void BugReportRow(float valueWidth)
+        // An action, not an option: a label and what it shows now (no
+        // arrows). True when A (or a click) pressed it.
+        bool ActionRow(const char* id, const char* label, const char* value, float valueWidth, bool& described)
         {
             const float rowHeight = RowHeight();
-            ImGui::PushID("bug-report");
+            ImGui::PushID(id);
             ImGui::TableNextRow(ImGuiTableRowFlags_None, rowHeight);
             ImGui::TableNextColumn();
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + LabelInset());
@@ -256,24 +276,168 @@ namespace ui
                 ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap, ImVec2(0, rowHeight));
             bool focused = ImGui::IsItemFocused();
             if (focused || (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem) && s_described == Id::Count))
-                s_describedBugReport = true;
-            const float mid = RowLabel(labelPos, "Save Bug Report");
+                described = true;
+            const float mid = RowLabel(labelPos, label);
             ImGui::TableNextColumn();
             float arrow = ImGui::GetFrameHeight();
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (rowHeight - arrow) * 0.5f);
             ImVec2 min = ImGui::GetCursorScreenPos();
             ImGui::Dummy(ImVec2(valueWidth + arrow * 2, arrow));
-            const char* text = BugReportValue();
-            ImVec2 size = ImGui::CalcTextSize(text);
+            ImVec2 size = ImGui::CalcTextSize(value);
             ImGui::GetWindowDrawList()->AddText(ImVec2(min.x + arrow + (valueWidth - size.x) * 0.5f, CentredTextTop(mid)),
-                ImGui::GetColorU32(focused ? ImGuiCol_PlotLines : ImGuiCol_Text), text);
-            if (activated)
-                report::SaveBugReport();
+                ImGui::GetColorU32(focused ? ImGuiCol_PlotLines : ImGuiCol_Text), value);
             ImGui::PopID();
+            return activated;
         }
+
+        // A (or a click) saves the report.
+        void BugReportRow(float valueWidth)
+        {
+            if (ActionRow("bug-report", "Save Bug Report", BugReportValue(), valueWidth, s_describedBugReport))
+                report::SaveBugReport();
+        }
+
+#ifdef __ANDROID__
+        // Graphics presets (Android): a phone's heat, not its speed, decides how
+        // long 60 fps lasts. Cool: no anti-aliasing (~0.75 ms of GPU a frame on a
+        // Mali-G1), 2x filtering, no sharpening. Quality: the defaults back.
+        // Both at 60 fps: Auto's 30 was too choppy for the owner.
+        struct Preset
+        {
+            const char* id;
+            const char* label;
+            const char* help;
+            double antiAliasing, anisotropy, sharpening, frameRate;
+        };
+        constexpr Preset kPresets[] = {
+            { "preset-cool", "Cool Preset", "Less heat for longer 60 fps: anti-aliasing off, 2x texture filtering, no sharpening, "
+              "and 60 fps. Change any of them afterwards as you like.",
+              0, 2, 0, 60 },
+            { "preset-quality", "Quality Preset", "The sharpest picture: anti-aliasing on, automatic texture filtering, the default "
+              "sharpening, and 60 fps (the phone gets warm sooner).",
+              1, settings::kAnisotropyAuto, 0.3, 60 },
+        };
+
+        void PresetRows(float valueWidth)
+        {
+            for (int i = 0; i < int(std::size(kPresets)); i++)
+            {
+                const Preset& p = kPresets[i];
+                bool described = false;
+                if (ActionRow(p.id, p.label, "Apply", valueWidth, described))
+                {
+                    settings::Set(Id::AntiAliasing, p.antiAliasing);
+                    settings::Set(Id::Anisotropy, p.anisotropy);
+                    settings::Set(Id::Sharpening, p.sharpening);
+                    settings::Set(Id::FrameRate, p.frameRate);
+                    fprintf(stderr, "[ui] %s applied\n", p.label);
+                    Toast(std::format("{} applied", p.label));
+                }
+                if (described)
+                    s_describedPreset = i;
+            }
+        }
+#endif
+
+        // A (or a click) asks GitHub, and the dialog shows the answer.
+        void UpdateRow(float valueWidth)
+        {
+            if (ActionRow("check-updates", "Check for Updates", UpdateRowValue(), valueWidth, s_describedUpdate))
+                OpenUpdateDialog();
+        }
+
+        bool QuitPromptOpen()
+        {
+#if SB_QUIT_GAME
+            return ImGui::IsPopupOpen(kQuitPopup);
+#else
+            return false;
+#endif
+        }
+
+#if SB_QUIT_GAME
+        // Quit Game's prompt (quit_game.h), at the settings window's top
+        // level like the other dialogs. True while it is open: B is its, not
+        // the menu's.
+        bool DrawQuitPrompt()
+        {
+            if (!ImGui::IsPopupOpen(kQuitPopup))
+            {
+                if (s_quit.Dismiss() == quit::Outcome::Cancelled)
+                    fprintf(stderr, "[ui] Quit Game: cancelled (the prompt closed)\n");
+                return false;
+            }
+            ImGuiViewport* viewport = ImGui::GetMainViewport();
+            ImGui::SetNextWindowPos(viewport->GetWorkCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+            if (!ImGui::BeginPopupModal(kQuitPopup, nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar))
+            {
+                if (s_quit.Dismiss() == quit::Outcome::Cancelled)
+                    fprintf(stderr, "[ui] Quit Game: cancelled (the prompt closed)\n");
+                return false;
+            }
+            s_quit.Shown();
+            ImGui::TextUnformatted("Quit SpeedBreaker? Progress since your last save will be lost.");
+            ImGui::Spacing();
+            const bool quitPressed = ImGui::Button("Quit");
+            ImGui::SameLine();
+            if (s_quit.TakeFocus())
+                ImGui::SetKeyboardFocusHere();  // Cancel (quit::Prompt::kDefaultFocus)
+            const bool cancelPressed = ImGui::Button("Cancel");
+            ImGui::SetItemDefaultFocus();
+            quit::Outcome outcome = quit::Outcome::None;
+            const char* how = "";
+            if (cancelPressed)
+            {
+                outcome = s_quit.Press(quit::Button::Cancel);
+                how = "Cancel";
+            }
+            else if (quitPressed)
+                outcome = s_quit.Press(quit::Button::Quit);
+            else if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+            {
+                outcome = s_quit.Back();
+                how = "B or Escape";
+            }
+            if (outcome == quit::Outcome::Cancelled)
+            {
+                fprintf(stderr, "[ui] Quit Game: cancelled (%s)\n", how);
+                ImGui::CloseCurrentPopup();
+            }
+            else if (outcome == quit::Outcome::Quit)
+            {
+                // The way out a window close takes: RunFrame returns false on
+                // its next poll and main() shuts the game down.
+                fprintf(stderr, "[ui] Quit Game: quitting (as closing the window does)\n");
+                ImGui::CloseCurrentPopup();
+                SDL_Event e{};
+                e.type = SDL_EVENT_QUIT;
+                e.quit.timestamp = SDL_GetTicksNS();
+                if (!SDL_PushEvent(&e))
+                {
+                    fprintf(stderr, "[ui] Quit Game: couldn't queue the quit: %s\n", SDL_GetError());
+                    Toast("Couldn't quit. Close the game's window instead.");
+                    s_quit.QuitFailed();
+                }
+            }
+            ImGui::EndPopup();
+            return true;
+        }
+#endif
 
         void HelpLine()
         {
+#ifdef __ANDROID__
+            if (s_describedPreset >= 0)
+            {
+                ImGui::TextWrapped("%s", kPresets[s_describedPreset].help);
+                return;
+            }
+#endif
+            if (s_describedUpdate)
+            {
+                UpdateRowHelp();
+                return;
+            }
             if (s_describedBugReport)
             {
 #if defined(__APPLE__) && TARGET_OS_IOS
@@ -317,6 +481,14 @@ namespace ui
             if (o.id == Id::Fullscreen && video::FullscreenLocked())
             {
                 ImGui::TextDisabled("Always on in Game Mode: Steam sets the resolution (Properties > Game Resolution).");
+                return;
+            }
+            // The window's own fullscreen button (or the system) changed it for
+            // this session; the setting still decides how the game starts.
+            if (o.id == Id::Fullscreen && video::FullscreenWindowDiffers() && !settings::EnvOverride(o.id))
+            {
+                ImGui::TextDisabled("The window is %s for now. The game starts %s, as set here.",
+                    video::WindowFullscreen() ? "fullscreen" : "windowed", settings::GetBool(Id::Fullscreen) ? "fullscreen" : "windowed");
                 return;
             }
             // The experiment's finer scale wins over Screen Resolution's.
@@ -374,8 +546,9 @@ namespace ui
         TitleText("Settings", "F1 / Back + Start");
 #endif
 
-        // Pages: LB/RB (Q/E) or the tabs.
-        if (int delta = PageDelta())
+        // Pages: LB/RB (Q/E) or the tabs; not under a dialog, which keeps them.
+        const bool dialog = ImGui::IsPopupOpen("reset") || UpdateDialogOpen() || QuitPromptOpen();
+        if (int delta = dialog ? 0 : PageDelta())
         {
             s_category = Category((int(s_category) + delta + kCategories) % kCategories);
             s_tabPending = true;
@@ -383,6 +556,8 @@ namespace ui
         }
         s_described = Id::Count;
         s_describedBugReport = false;
+        s_describedUpdate = false;
+        s_describedPreset = -1;
         if (ImGui::BeginTabBar("pages", ImGuiTabBarFlags_NoTooltip))
         {
             for (int c = 0; c < kCategories; c++)
@@ -427,7 +602,8 @@ namespace ui
                         if (o.category == category && !o.hidden)
                             valueWidth = std::max(valueWidth, ValueWidth(o));
                     if (category == Category::Advanced)
-                        valueWidth = std::max(valueWidth, ImGui::CalcTextSize("Saving...").x);
+                        for (const char* text : { "Saving...", "Checking...", UpdateRowValue() })
+                            valueWidth = std::max(valueWidth, ImGui::CalcTextSize(text).x);
                     valueWidth += 2 * kSpaceM * s;
                     float arrow = ImGui::GetFrameHeight();
                     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, cellPadding);
@@ -441,8 +617,17 @@ namespace ui
                                 OptionRow(o, valueWidth, focusFirst);
                                 focusFirst = false;
                             }
+#ifdef __ANDROID__
+                        if (category == Category::Graphics)
+                            PresetRows(valueWidth);
+#endif
                         if (category == Category::Advanced)
+                        {
                             BugReportRow(valueWidth);
+#ifndef __ANDROID__
+                            UpdateRow(valueWidth);  // Official desktop bundles cannot update this Android fork.
+#endif
+                        }
                         ImGui::EndTable();
                     }
                     ImGui::PopStyleVar();
@@ -487,6 +672,16 @@ namespace ui
         ImGui::SameLine();
         if (ImGui::Button("Close"))
             CloseSettings();
+#if SB_QUIT_GAME
+        // Last, after Close: Down from the rows lands on the footer's first
+        // button, so Quit Game takes a Right more, and then asks.
+        ImGui::SameLine();
+        if (ImGui::Button("Quit Game") && s_quit.Choose() == quit::Outcome::Asking)
+        {
+            fprintf(stderr, "[ui] Quit Game: asking\n");
+            ImGui::OpenPopup(kQuitPopup);
+        }
+#endif
         ImGui::SameLine();
         {
             const char* legend = "D-pad: choose, change   LB RB: page   B: close";
@@ -495,8 +690,10 @@ namespace ui
             ImGui::TextDisabled("%s", legend);
         }
 
+        bool popup = false;  // a dialog has the input: B is its, not the menu's
         if (ImGui::BeginPopupModal("reset", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar))
         {
+            popup = true;
             ImGui::Text("Reset every %s setting to its default?", settings::CategoryName(s_category));
             ImGui::Spacing();
             if (ImGui::Button("Reset"))
@@ -515,7 +712,13 @@ namespace ui
             ImGui::SetItemDefaultFocus();
             ImGui::EndPopup();
         }
-        else if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::IsAnyItemActive() &&
+        if (DrawUpdateDialog())
+            popup = true;
+#if SB_QUIT_GAME
+        if (DrawQuitPrompt())
+            popup = true;
+#endif
+        if (!popup && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::IsAnyItemActive() &&
             (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)))
             CloseSettings();
         ImGui::End();
@@ -524,5 +727,18 @@ namespace ui
     void ResetSettingsMenu()
     {
         s_opened = true;
+        // A dialog the menu was closed under (Start or Back alone closes it
+        // from anywhere) doesn't come back with it.
+        if (ImGuiContext* g = ImGui::GetCurrentContext(); g && g->OpenPopupStack.Size > 0)
+            ImGui::ClosePopupToLevel(0, false);
+        ForgetUpdateDialog();
+    }
+
+    void ForgetQuitPrompt()
+    {
+#if SB_QUIT_GAME
+        if (s_quit.Dismiss() == quit::Outcome::Cancelled)
+            fprintf(stderr, "[ui] Quit Game: cancelled (the menu closed)\n");
+#endif
     }
 }

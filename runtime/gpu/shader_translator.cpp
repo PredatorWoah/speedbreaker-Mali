@@ -9,6 +9,7 @@
 #include "xenos/ucode.h"
 
 #include <cfloat>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <format>
@@ -16,6 +17,10 @@
 
 namespace gpu
 {
+    bool g_workReductionEnabled = true;
+    bool g_predicateCoalescingEnabled = true;
+    bool g_forwardControlFlowEnabled = false;
+
     using namespace xe::gpu;
     using namespace xe::gpu::ucode;
 
@@ -31,11 +36,14 @@ layout(std430, set = 0, binding = 2) readonly buffer RingMemory { uint g_ring[];
 
 layout(std140, set = 0, binding = 1) uniform XenosConstants
 {
-    vec4 c[512];          // float constants (VS and PS share the file)
+    // The fixed part comes first and the float constants last, so an upload
+    // whose shaders read few of them is only that long (renderer.cpp).
     uvec4 fetch[48];      // 32 fetch constants x 6 dwords
     uvec4 bools[2];       // 256 bool constants
     uvec4 loops[8];       // 32 loop constants
     uvec4 drawInfo[4];    // see gpu/renderer.cpp
+    vec4 textureReciprocal[32]; // actual sampled host image size, xy reciprocal
+    vec4 c[512];          // float constants (VS and PS share the file)
 } u;
 
 layout(push_constant) uniform DrawConstants
@@ -94,12 +102,16 @@ uint memWord(uint byteAddress)
 uint vmem(uint byteAddress)
 {
     uint a = byteAddress & 0x1FFFFFFFu;
-    for (int r = 0; r < 4; r++)
-    {
-        uint d = a - pc.vfRedirect[r].x;
-        if (d < pc.vfRedirect[r].y)
-            return g_ring[(pc.vfRedirect[r].z + d) >> 2];
-    }
+    // Constant indices let mobile compilers keep these in registers instead
+    // of lowering a loop with dynamically indexed push-constant arrays.
+    uint d = a - pc.vfRedirect[0].x;
+    if (d < pc.vfRedirect[0].y) return g_ring[(pc.vfRedirect[0].z + d) >> 2];
+    d = a - pc.vfRedirect[1].x;
+    if (d < pc.vfRedirect[1].y) return g_ring[(pc.vfRedirect[1].z + d) >> 2];
+    d = a - pc.vfRedirect[2].x;
+    if (d < pc.vfRedirect[2].y) return g_ring[(pc.vfRedirect[2].z + d) >> 2];
+    d = a - pc.vfRedirect[3].x;
+    if (d < pc.vfRedirect[3].y) return g_ring[(pc.vfRedirect[3].z + d) >> 2];
     return memLoad(a >> 2);
 }
 
@@ -135,6 +147,30 @@ float xmul(float a, float b)
             TranslatedShader out;
             std::string body;
             int indent = 1;
+            int openPredicate = -1;
+
+            void ClosePredicate()
+            {
+                if (openPredicate < 0) return;
+                --indent;
+                Line("}");
+                openPredicate = -1;
+            }
+
+            void Predicate(bool enabled, bool condition)
+            {
+                out.predicatedInstructions += enabled;
+                int desired = enabled ? int(condition) : -1;
+                if (!g_predicateCoalescingEnabled || openPredicate != desired)
+                    ClosePredicate();
+                if (desired >= 0 && openPredicate < 0)
+                {
+                    Line(std::format("if (p0 == {}) {{", condition ? "true" : "false"));
+                    ++indent;
+                    ++out.predicateBlocks;
+                    openPredicate = desired;
+                }
+            }
             bool usesRelativeRegisters = false;
             uint32_t maxRegister = 0;
 
@@ -420,11 +456,7 @@ float xmul(float a, float b)
                 if (!vecNeeded && !scaNeeded && !zeroMask && !oneMask)
                     return;
 
-                if (op.is_predicated())
-                {
-                    Line(std::format("if (p0 == {}) {{", op.predicate_condition() ? "true" : "false"));
-                    indent++;
-                }
+                Predicate(op.is_predicated(), op.predicate_condition());
                 // Both operations read the registers as they were before the
                 // instruction: compute into temporaries, then store.
                 Line("{");
@@ -473,11 +505,7 @@ float xmul(float a, float b)
                 }
                 indent--;
                 Line("}");
-                if (op.is_predicated())
-                {
-                    indent--;
-                    Line("}");
-                }
+                if (!g_predicateCoalescingEnabled || vinfo.changed_state || sinfo.changed_state) ClosePredicate();
             }
 
             // Destination swizzle for fetches: 3 bits per component.
@@ -503,11 +531,7 @@ float xmul(float a, float b)
                 out.vertexFetchMask |= 1u << (slot / 3);
                 out.vertexFetchConstants[slot / 32] |= 1u << (slot % 32);
 
-                if (op.is_predicated())
-                {
-                    Line(std::format("if (p0 == {}) {{", op.predicate_condition() ? "true" : "false"));
-                    indent++;
-                }
+                Predicate(op.is_predicated(), op.predicate_condition());
                 Line("{");
                 indent++;
                 std::string index = Reg(full.src(), full.is_src_relative()) + "." + kComp[full.src_swizzle() & 3];
@@ -616,17 +640,14 @@ float xmul(float a, float b)
                 StoreFetchResult(op.dest(), op.is_dest_relative(), op.dest_swizzle(), "vdata");
                 indent--;
                 Line("}");
-                if (op.is_predicated())
-                {
-                    indent--;
-                    Line("}");
-                }
+                if (!g_predicateCoalescingEnabled) ClosePredicate();
             }
 
             void TextureFetch(const TextureFetchInstruction& op)
             {
                 if (op.opcode() == FetchOpcode::kSetTextureLod)
                 {
+                    ClosePredicate();
                     Line("texLod = " + Reg(op.src(), op.is_src_relative()) + "." + kComp[op.src_swizzle() & 3] + ";");
                     return;
                 }
@@ -636,11 +657,7 @@ float xmul(float a, float b)
                     return;
                 }
                 uint32_t slot = op.fetch_constant_index();
-                if (op.is_predicated())
-                {
-                    Line(std::format("if (p0 == {}) {{", op.predicate_condition() ? "true" : "false"));
-                    indent++;
-                }
+                Predicate(op.is_predicated(), op.predicate_condition());
                 Line("{");
                 indent++;
                 std::string src = Reg(op.src(), op.is_src_relative());
@@ -678,9 +695,9 @@ float xmul(float a, float b)
                     if (op.unnormalized_coordinates())
                         uv = op.dimension() == xenos::FetchOpDimension::k2D
                             ? std::format("({}) / fetchSize2D({}u)", uv, slot)
-                            : std::format("({}) / vec2(textureSize(t2d_{}, 0))", uv, slot);
+                            : std::format("({}) * inverseTextureSize_{}()", uv, slot);
                     if (op.offset_x() != 0.0f || op.offset_y() != 0.0f)
-                        uv = std::format("({} + vec2({}, {}) / vec2(textureSize(t2d_{}, 0)))", uv, op.offset_x(), op.offset_y(), slot);
+                        uv = std::format("({} + vec2({}, {}) * inverseTextureSize_{}())", uv, op.offset_x(), op.offset_y(), slot);
                     value = sample(std::format("t2d_{}", slot), uv);
                     break;
                 }
@@ -705,11 +722,7 @@ float xmul(float a, float b)
                 StoreFetchResult(op.dest(), op.is_dest_relative(), op.dest_swizzle(), "tdata");
                 indent--;
                 Line("}");
-                if (op.is_predicated())
-                {
-                    indent--;
-                    Line("}");
-                }
+                if (!g_predicateCoalescingEnabled) ClosePredicate();
             }
 
             template<typename T>
@@ -722,6 +735,7 @@ float xmul(float a, float b)
                     if (size_t(exec.address() + k) * 3 + 3 > dwords)
                     {
                         Error("instruction address outside the shader");
+                        ClosePredicate();
                         return;
                     }
                     if (seq & 1)
@@ -737,6 +751,8 @@ float xmul(float a, float b)
                         Alu(*reinterpret_cast<const AluInstruction*>(op));
                     }
                 }
+                // Never carry an instruction predicate through an EXEC/CF edge.
+                ClosePredicate();
             }
 
             void Translate()
@@ -788,7 +804,29 @@ float xmul(float a, float b)
                 }
                 else
                 {
-                    EmitStateMachine(cf);
+                    // A strictly forward program visits each CF index at most
+                    // once. Avoid presenting its acyclic graph as a dynamic
+                    // loop/switch to drivers that spend minutes compiling it.
+                    // Calls, returns and loops retain the general dispatcher.
+                    bool forward = g_forwardControlFlowEnabled;
+                    for (size_t i = 0; i < cf.size() && forward; ++i)
+                    {
+                        switch (cf[i].opcode())
+                        {
+                        case ControlFlowOpcode::kLoopStart:
+                        case ControlFlowOpcode::kLoopEnd:
+                        case ControlFlowOpcode::kCondCall:
+                        case ControlFlowOpcode::kReturn:
+                            forward = false;
+                            break;
+                        case ControlFlowOpcode::kCondJmp:
+                            forward = cf[i].cond_jmp.address() > i;
+                            break;
+                        default:
+                            break;
+                        }
+                    }
+                    EmitStateMachine(cf, forward);
                 }
             }
 
@@ -832,18 +870,23 @@ float xmul(float a, float b)
             }
 
             // General control flow: a pc state machine over CF indices.
-            void EmitStateMachine(const std::vector<ControlFlowInstruction>& cf)
+            void EmitStateMachine(const std::vector<ControlFlowInstruction>& cf, bool forward)
             {
                 Line("int cfpc = 0;");
                 Line("int loopDepth = 0; int loopCounter[4]; int loopAl[4];");
                 Line("int callDepth = 0; int callStack[4];");
-                Line("while (cfpc >= 0) {");
-                indent++;
-                Line("switch (cfpc) {");
+                if (!forward)
+                {
+                    Line("while (cfpc >= 0) {");
+                    indent++;
+                    Line("switch (cfpc) {");
+                }
                 for (size_t i = 0; i < cf.size(); i++)
                 {
                     const auto& c = cf[i];
-                    Line(std::format("case {}: {{", i));
+                    // The do scope preserves the local exit of every CF edge's
+                    // break, including a taken jump and an unconditional END.
+                    Line(forward ? std::format("if (cfpc == {}) {{ do {{", i) : std::format("case {}: {{", i));
                     indent++;
                     int next = int(i) + 1;
                     switch (c.opcode())
@@ -931,12 +974,15 @@ float xmul(float a, float b)
                     }
                     Line(std::format("cfpc = {}; break;", next));
                     indent--;
+                    Line(forward ? "} while (false); }" : "}");
+                }
+                if (!forward)
+                {
+                    Line("default: cfpc = -1; break;");
+                    Line("}");
+                    indent--;
                     Line("}");
                 }
-                Line("default: cfpc = -1; break;");
-                Line("}");
-                indent--;
-                Line("}");
             }
         };
 
@@ -1033,14 +1079,23 @@ vec3 cubeDirection(vec3 c)
         if (stage == ShaderStage::Pixel)
             regCount = std::max(regCount, 16u);  // interpolators land in r0..r15
         result.registerCount = regCount;
+        std::string resetRegisters;
+        for (uint32_t i = 0; i < regCount; i++)
+            resetRegisters += std::format("    r[{}] = vec4(0.0);\n", i);
 
         std::string g = ShaderCommonGlsl();
+        const char* reciprocal = std::getenv("NFSMW_TEXTURE_RECIPROCAL");
+        if (!g_workReductionEnabled || (reciprocal && reciprocal[0] == '0'))
+            g.insert(g.find('\n') + 1, "#define TEXTURE_SIZE_QUERY\n");
         g += kHelpers;
         g += std::format("#define R_COUNT {}\n", regCount);
         for (uint32_t n = 0; n < 32; n++)
         {
             if (result.texture2DMask & (1u << n))
+            {
                 g += std::format("layout(set = 1, binding = {}) uniform sampler2D t2d_{};\n", n, n);
+                g += std::format("vec2 inverseTextureSize_{0}() {{\n#ifdef TEXTURE_SIZE_QUERY\nreturn 1.0 / vec2(textureSize(t2d_{0}, 0));\n#else\nreturn u.textureReciprocal[{0}].xy;\n#endif\n}}\n", n);
+            }
             if (result.texture3DMask & (1u << n))
                 g += std::format("layout(set = 1, binding = {}) uniform sampler3D t3d_{};\n", 32 + n, n);
             if (result.textureCubeMask & (1u << n))
@@ -1052,7 +1107,7 @@ vec3 cubeDirection(vec3 c)
             // one costs vertex output bandwidth (a lot on tile-based GPUs).
             for (uint32_t i = 0; i < 16; i++)
                 if (result.interpolatorMask & (1u << i))
-                    g += std::format("layout(location = {0}) out vec4 o_i{0};\n", i);
+                    g += std::format("#ifndef POSITION_ONLY\nlayout(location = {0}) out vec4 o_i{0};\n#endif\n", i);
             g += "vec4 o_interpT[16];\n";
             g += "out gl_PerVertex { invariant vec4 gl_Position; float gl_PointSize; };\n";
         }
@@ -1095,6 +1150,11 @@ vec4 constRel(int index, int rel)
             g += R"(
 uint fetchIndex(uint i)
 {
+#if defined(VERTEX_PRIMITIVE_MODE) && VERTEX_PRIMITIVE_MODE == 0
+    // The renderer supplies ordinary indices through vkCmdDrawIndexed.
+    // Only rectangle expansion fetches the guest index buffer itself.
+    return i;
+#else
     if (pc.indexAddress == 0u)
         return i;
     if ((pc.indexInfo & 1u) != 0u)
@@ -1107,12 +1167,12 @@ uint fetchIndex(uint i)
     bool firstInHigh = endian == 2u || endian == 3u;
     bool high = ((i & 1u) != 0u) != firstInHigh;
     return high ? (word >> 16) : (word & 0xFFFFu);
+#endif
 }
 
 void runVertex(uint logicalIndex)
 {
-    for (int i = 0; i < R_COUNT; i++) r[i] = vec4(0.0);
-    for (int i = 0; i < 16; i++) o_interpT[i] = vec4(0.0);
+@@VS_REGISTER_INIT@@@@VS_INTERPOLATOR_INIT@@
     p0 = false; a0 = 0; aL = 0; ps = 0.0;
     o_position = vec4(0.0, 0.0, 0.0, 1.0);
     r[0].x = float(fetchIndex(logicalIndex) + pc.indexOffset);
@@ -1123,7 +1183,17 @@ void runVertex(uint logicalIndex)
 void main()
 {
     uint vid = uint(gl_VertexIndex);
+#if defined(VERTEX_PRIMITIVE_MODE) && VERTEX_PRIMITIVE_MODE == 0
+    // Ordinary geometry: run once, with no rectangle corner arrays or loop.
+    runVertex(vid);
+    vec4 pos = o_position;
+@@VS_DIRECT_OUTPUTS@@
+#else
+#ifdef VERTEX_PRIMITIVE_MODE
+    uint mode = uint(VERTEX_PRIMITIVE_MODE);
+#else
     uint mode = (pc.indexInfo >> 3) & 3u;   // 0 as is, 1 rectangle list, 2 quad list
+#endif
     // runVertex() has ONE call site: compilers inline every call, and the
     // rectangle's synthesised corner used to add three more copies of the
     // whole shader (RADV took ~10x longer to compile every vertex shader).
@@ -1161,7 +1231,9 @@ void main()
             for (int i = 0; i < 16; i++) it[i] = it[i] + o_interpT[i] - it0[i];
         }
     }
-@@VS_OUTPUTS@@    // PA_CL_VTE_CNTL formats (as Xenia): bit 1 W is not 1/W, bit 2 XY were
+@@VS_OUTPUTS@@
+#endif
+    // PA_CL_VTE_CNTL formats (as Xenia): bit 1 W is not 1/W, bit 2 XY were
     // already divided by W, bit 3 Z was.
     if ((pc.flags & 2u) == 0u) pos.w = 1.0 / pos.w;
     if ((pc.flags & 4u) != 0u) pos.xy *= pos.w;
@@ -1179,8 +1251,8 @@ void main()
         }
         else
         {
-            g += "\nvoid main()\n{\n";
-            g += "    for (int i = 0; i < R_COUNT; i++) r[i] = vec4(0.0);\n";
+            g += "\n#ifdef EARLY_DEPTH\nlayout(early_fragment_tests) in;\n#endif\nvoid main()\n{\n";
+            g += resetRegisters;
             for (uint32_t i = 0; i < std::min(16u, regCount); i++)
                 g += std::format("#ifdef IN{0}\n    r[{0}] = i_i{0};\n#endif\n", i);
             g += t.body;
@@ -1214,12 +1286,24 @@ void main()
         }
         if (stage == ShaderStage::Vertex)
         {
-            std::string outs;
+            std::string outs, directOuts;
             for (uint32_t i = 0; i < 16; i++)
                 if (result.interpolatorMask & (1u << i))
-                    outs += std::format("    o_i{0} = it[{0}];\n", i);
+                {
+                    outs += std::format("#ifndef POSITION_ONLY\n    o_i{0} = it[{0}];\n#endif\n", i);
+                    directOuts += std::format("#ifndef POSITION_ONLY\n    o_i{0} = o_interpT[{0}];\n#endif\n", i);
+                }
             size_t at = g.find("@@VS_OUTPUTS@@");
             g.replace(at, strlen("@@VS_OUTPUTS@@"), outs);
+            at = g.find("@@VS_DIRECT_OUTPUTS@@");
+            g.replace(at, strlen("@@VS_DIRECT_OUTPUTS@@"), directOuts);
+            at = g.find("@@VS_REGISTER_INIT@@");
+            g.replace(at, strlen("@@VS_REGISTER_INIT@@"), resetRegisters);
+            std::string resetInterpolators;
+            for (uint32_t i = 0; i < 16; i++)
+                resetInterpolators += std::format("    o_interpT[{}] = vec4(0.0);\n", i);
+            at = g.find("@@VS_INTERPOLATOR_INIT@@");
+            g.replace(at, strlen("@@VS_INTERPOLATOR_INIT@@"), resetInterpolators);
         }
         // Absolute constant reads: packed slot numbers (the count of used
         // constants below), unless the shader also addresses them relatively.

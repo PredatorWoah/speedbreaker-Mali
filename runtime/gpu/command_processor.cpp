@@ -6,11 +6,14 @@
 #include <kernel/vmem.h>
 #include <cpu/guest_thread.h>
 #include <cpu/host_cpu.h>
+#include <platform/perf_hint.h>
 #include <cpu/guest_time.h>
 #include <kernel/function.h>
 #include <video/presenter.h>
 #include <video/frame_rate.h>
 #include <video/vblank_lock.h>
+#include <video/vblank_timer.h>
+#include <video/display_gamma.h>
 #include <platform/thermal.h>
 #include <game/frame_time.h>
 #include "renderer.h"
@@ -259,13 +262,19 @@ namespace gpu
             {
                 s_regs[index] |= 0x80000000u;
             }
+            else if (video::display_gamma::IsLutRegister(index))
+            {
+                // The display gamma ramp (video/display_gamma.h): stored as
+                // any register, and followed for the presenter.
+                video::display_gamma::OnRegisterWrite(index, value);
+            }
             if (index != REG_CP_RB_WPTR)  // the game owns that one
                 *MmioRegister(index) = s_regs[index];
         }
 
         // A run of registers WriteRegister has nothing special for (it treats
-        // only the scratch fences, COHER_STATUS_HOST and the write pointer
-        // specially) can be written in bulk.
+        // only the scratch fences, COHER_STATUS_HOST, the write pointer and
+        // the display gamma ramp's registers specially) can be written in bulk.
         bool BulkSafe(uint32_t base, uint32_t count)
         {
             uint32_t end = base + count;
@@ -273,7 +282,8 @@ namespace gpu
                 return false;
             auto hits = [&](uint32_t lo, uint32_t hi) { return base <= hi && end > lo; };
             return !hits(REG_CP_RB_WPTR, REG_CP_RB_WPTR) && !hits(REG_SCRATCH_REG0, REG_SCRATCH_REG7) &&
-                !hits(REG_COHER_STATUS_HOST, REG_COHER_STATUS_HOST);
+                !hits(REG_COHER_STATUS_HOST, REG_COHER_STATUS_HOST) &&
+                !hits(video::display_gamma::kRegRwMode, video::display_gamma::kRegLutaControl);
         }
 
         // WriteRegister for `count` registers from `src`, big-endian dwords
@@ -514,6 +524,9 @@ namespace gpu
                 static double worstMs = 0;
                 {
                     AccountBusy();
+                    static uint64_t swapBusyNs = 0;
+                    perfhint::FrameDone(renderer::g_cpBusyNs - swapBusyNs);
+                    swapBusyNs = renderer::g_cpBusyNs;
                     int64_t swapNow = guesttime::NowNs();
                     double frameMs = double(swapNow - lastSwap) / 1e6;
                     worstMs = std::max(worstMs, frameMs);
@@ -635,6 +648,19 @@ namespace gpu
                     lastGuard = guard;
                     lastScaled = scaled;
                     lastPost = post;
+                    // NFSMW_SNAPSHOT_REUSE: the vertex snapshots' repeats and what reuse saved
+                    // (mode 2: how many repeats were identical to the earlier copy).
+                    fprintf(stderr, "[constants] per frame: %.0f uploads, %.0f KB of ring (%.0f bytes each)\n",
+                        double(st.constantUploads - last.constantUploads) / 120, double(st.constantBytes - last.constantBytes) / 1024 / 120,
+                        st.constantUploads > last.constantUploads ? double(st.constantBytes - last.constantBytes) / double(st.constantUploads - last.constantUploads) : 0.0);
+                    if (st.snapRanges != last.snapRanges)
+                        fprintf(stderr, "[snapshot] per frame: %.0f ranges copied, %.0f repeated in their submission, %.0f reused (%.0f KB), "
+                            "%.0f watched, %.0f lost to a write | measured repeats: %.0f identical (%.0f KB), %.0f different (%.0f KB)\n",
+                            double(st.snapRanges - last.snapRanges) / 120, double(st.snapRepeats - last.snapRepeats) / 120,
+                            double(st.snapReused - last.snapReused) / 120, double(st.snapReusedBytes - last.snapReusedBytes) / 1024 / 120,
+                            double(st.snapWatched - last.snapWatched) / 120, double(st.snapChanged - last.snapChanged) / 120,
+                            double(st.snapSame - last.snapSame) / 120, double(st.snapSameBytes - last.snapSameBytes) / 1024 / 120,
+                            double(st.snapDiff - last.snapDiff) / 120, double(st.snapDiffBytes - last.snapDiffBytes) / 1024 / 120);
                     worstMs = 0;
                     lastTime = now;
                     last = st;
@@ -1057,12 +1083,15 @@ namespace gpu
             // scheduler left it on a 3.5 GHz core, or on the sibling of a
             // spinning game thread, while those held the 4.8 GHz cores.
             hostcpu::UseReservedCore("command processor");
+            perfhint::AddThisThread("command processor");
             GuestThreadContext thread(2);
             PPCContext& ctx = thread.ppcContext;
             renderer::Initialize(s_regs);
             auto lastWork = std::chrono::steady_clock::now();
             while (true)
             {
+                // Suspend before consuming a queued batch too, not only when idle.
+                guesttime::WaitWhileSuspended();
                 uint32_t primary = s_primaryBuffer;
                 uint32_t writeIndex = *MmioRegister(REG_CP_RB_WPTR);
                 if (primary == 0 || writeIndex == s_readIndex || writeIndex * 4 >= s_primarySize)
@@ -1111,29 +1140,41 @@ namespace gpu
             }
         }
 
-        // One line for the vblank lock's state (on changes, and each minute).
-        void LogVblank(const video::VblankLock::Status& s)
+        // One line for the vblank lock's state (on changes, and each minute),
+        // and how late the last minute's vblanks fired.
+        void LogVblank(const video::VblankLock::Status& s, const video::VblankTiming& timing, const char* timer)
         {
             const video::RefreshEstimate& d = s.display;
+            std::string line;
             if (s.locked)
-                fprintf(stderr, "[vblank] locked to the display: %.4f Hz (fit %u presents over %.1f s, rms %.2f ms, %u set aside); "
-                    "vblank %.2f ms before its refresh, error %+.3f ms; vblank to screen %.1f ms (median), to present %.1f ms (99%%); %llu slips\n",
+                line = std::format("locked to the display: {:.4f} Hz (fit {} presents over {:.1f} s, rms {:.2f} ms, {} set aside); "
+                    "vblank {:.2f} ms before its refresh, error {:+.3f} ms; vblank to screen {:.1f} ms (median), to present {:.1f} ms (99%); {} slips",
                     1e9 / d.periodNs, d.samples, d.spanNs / 1e9, d.rmsNs / 1e6, d.rejected, s.leadNs / 1e6, s.errorNs / 1e6,
-                    s.latencyNs / 1e6, s.readyNs / 1e6, (unsigned long long)s.slips);
+                    s.latencyNs / 1e6, s.readyNs / 1e6, s.slips);
             else if (s.follows)
-                fprintf(stderr, "[vblank] free-running every %.3f ms: the display follows the vblank (variable refresh?), "
-                    "so there is no refresh to lock to\n", s.periodNs / 1e6);
+                line = std::format("free-running every {:.3f} ms: the display follows the vblank (variable refresh?), "
+                    "so there is no refresh to lock to", s.periodNs / 1e6);
             else if (d.samples)
-                fprintf(stderr, "[vblank] free-running every %.3f ms; display %s: %.4f Hz (fit %u presents over %.1f s, rms %.2f ms, %u set aside)\n",
+                line = std::format("free-running every {:.3f} ms; display {}: {:.4f} Hz (fit {} presents over {:.1f} s, rms {:.2f} ms, {} set aside)",
                     s.periodNs / 1e6, d.valid ? "measured (lock off)" : "not accepted", 1e9 / d.periodNs, d.samples, d.spanNs / 1e9,
                     d.rmsNs / 1e6, d.rejected);
             else
-                fprintf(stderr, "[vblank] free-running every %.3f ms\n", s.periodNs / 1e6);
+                line = std::format("free-running every {:.3f} ms", s.periodNs / 1e6);
+            if (video::VblankTiming::Summary t = timing.Summarize(); t.count)
+                line += std::format("; timer {}: vblanks late {:.2f} ms (median), {:.2f} ms (99%), {:.2f} ms at most, handler {:.2f} ms (99%)",
+                    timer, t.lateMedianNs / 1e6, t.late99Ns / 1e6, t.lateMaxNs / 1e6, t.handler99Ns / 1e6);
+            fprintf(stderr, "[vblank] %s\n", line.c_str());
         }
 
         void Vsync()
         {
             SetHostThreadName("nfsmw-vsync");  // (Linux would give it its creator's name, nfsmw-main)
+            // Woken on time (video/vblank_timer.h): on macOS an ordinary
+            // thread's sleeps ran up to 9 ms late.
+            const video::VblankTimer timer = video::ChosenVblankTimer();
+            const bool realtime = video::PrepareVblankThread(timer, 16'666'667);
+            const char* timerName = video::VblankTimerName(timer, realtime);
+            video::VblankTiming timing;
             GuestThreadContext thread(2);
             using namespace std::chrono;
             video::VblankLock& clock = video::GuestVblank();
@@ -1173,14 +1214,16 @@ namespace gpu
                     paused = nowPaused;
                     clock.Resumed();
                 }
-                video::NoteGuestVblank(now());
+                const int64_t fired = now();
+                video::NoteGuestVblank(fired);
                 s_counter++;
                 s_vblanks++;
                 DispatchInterrupt(thread.ppcContext, 0, 2);
+                timing.Add(fired - next, now() - fired);
                 auto status = clock.GetStatus();
                 if (status.locked != locked || status.slips != slips || ++count % 3600 == 0)
                 {
-                    LogVblank(status);
+                    LogVblank(status, timing, timerName);
                     locked = status.locked;
                     slips = status.slips;
                 }

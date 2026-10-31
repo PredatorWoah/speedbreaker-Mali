@@ -8,6 +8,7 @@ add_library(XenonUtilsLite STATIC
     ${XR}/XenonUtils/image.cpp
     ${XR}/XenonUtils/xex_patcher.cpp
     ${XR}/XenonUtils/memory_mapped_file.cpp
+    ${XR}/XenonUtils/xdbf_wrapper.cpp
     ${XR}/thirdparty/libmspack/libmspack/mspack/lzxd.c
     ${XR}/thirdparty/tiny-AES-c/aes.c)
 target_include_directories(XenonUtilsLite PUBLIC ${XR}/XenonUtils ${XR}/thirdparty/simde
@@ -17,6 +18,14 @@ target_compile_options(XenonUtilsLite PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-include
 
 file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/thirdparty/")
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/platform/android/diagnostics\\.cpp$")
+if(NOT ANDROID)
+    list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/platform/android/")
+endif()
+# Nayuki's QR Code generator (thirdparty/qrcodegen, vendored, C): the
+# download page's code in Check for Updates. Part of the runtime itself, not
+# a library of its own, so the iOS app (scripts/ios/build.sh) links it too.
+list(APPEND RUNTIME_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/qrcodegen/qrcodegen.c)
 if(APPLE)
     # Apple's own glue for macOS and iOS (the thermal state) is
     # Objective-C++ on Foundation alone, platform/apple/*.mm. Built with the
@@ -39,7 +48,10 @@ if(IOS)
 endif()
 add_library(o1heap STATIC ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/o1heap/o1heap.c)
 target_include_directories(o1heap PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/o1heap)
-if(IOS)
+if(ANDROID)
+    add_library(SpeedBreaker SHARED ${RUNTIME_SOURCES})
+    target_link_libraries(SpeedBreaker PRIVATE android log)
+elseif(IOS)
     # On iOS the app is linked and signed by Xcode (scripts/ios): the runtime
     # is a static library there, and the app links it with the rest.
     add_library(SpeedBreaker STATIC ${RUNTIME_SOURCES})
@@ -47,7 +59,9 @@ else()
     add_executable(SpeedBreaker ${RUNTIME_SOURCES})
 endif()
 target_include_directories(SpeedBreaker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/kernel)
-find_package(SDL3 REQUIRED CONFIG)
+if(NOT TARGET SDL3::SDL3)
+    find_package(SDL3 REQUIRED CONFIG)
+endif()
 if(IOS)
     # iOS has no Vulkan loader: the app links MoltenVK statically, and the
     # runtime compiles against MoltenVK's own Vulkan headers.
@@ -56,6 +70,18 @@ if(IOS)
     target_include_directories(Vulkan::Vulkan INTERFACE ${MOLTENVK_DIR}/MoltenVK/include)
 else()
     find_package(Vulkan REQUIRED)
+endif()
+if(ANDROID)
+    set(VOLK_STATIC_DEFINES "VK_USE_PLATFORM_ANDROID_KHR")
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../tools/volk ${CMAKE_BINARY_DIR}/volk)
+    set_target_properties(volk PROPERTIES C_VISIBILITY_PRESET hidden)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../tools/libadrenotools ${CMAKE_BINARY_DIR}/adrenotools)
+    # Every application and ImGui call must use the selected loader's dispatch.
+    set(SB_VULKAN_TARGET volk)
+    target_link_libraries(SpeedBreaker PRIVATE adrenotools)
+    add_dependencies(SpeedBreaker main_hook hook_impl file_redirect_hook gsl_alloc_hook)
+else()
+    set(SB_VULKAN_TARGET Vulkan::Vulkan)
 endif()
 find_package(glslang REQUIRED CONFIG)
 # FFmpeg for XMA audio: the minimal static build that scripts/setup_tools.sh
@@ -70,7 +96,7 @@ set(IMGUI ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/imgui)
 add_library(imgui STATIC ${IMGUI}/imgui.cpp ${IMGUI}/imgui_draw.cpp ${IMGUI}/imgui_tables.cpp ${IMGUI}/imgui_widgets.cpp
     ${IMGUI}/backends/imgui_impl_sdl3.cpp ${IMGUI}/backends/imgui_impl_vulkan.cpp)
 target_include_directories(imgui PUBLIC ${IMGUI} ${IMGUI}/backends)
-target_link_libraries(imgui PUBLIC SDL3::SDL3 Vulkan::Vulkan)
+target_link_libraries(imgui PUBLIC SDL3::SDL3 ${SB_VULKAN_TARGET})
 # The UI font, compiled in as a byte array (generated/ui_font.inc).
 file(READ ${IMGUI}/fonts/Roboto-Medium.ttf UI_FONT_HEX HEX)
 string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," UI_FONT_BYTES "${UI_FONT_HEX}")
@@ -79,7 +105,7 @@ target_include_directories(SpeedBreaker PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/gene
 # The "What's new" note (ui/whats_new.cpp): this version's entry in
 # CHANGELOG.md, from its "## v<version>" heading to the next "## " one,
 # compiled in (generated/whats_new.inc). An edit of CHANGELOG.md reconfigures.
-set(SB_CHANGELOG ${CMAKE_SOURCE_DIR}/CHANGELOG.md)
+set(SB_CHANGELOG ${CMAKE_CURRENT_SOURCE_DIR}/../CHANGELOG.md)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${SB_CHANGELOG})
 set(SB_WHATS_NEW "")
 if(EXISTS ${SB_CHANGELOG})
@@ -126,21 +152,23 @@ endif()
 # checked on every build but rewritten only when it changes
 # (report/build_info.cmake), so a no-op build stays one.
 add_custom_target(nfsmw_build_info
-    COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generated/build_info.inc
+    COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/.. -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generated/build_info.inc
         -DVERSION=${CMAKE_PROJECT_VERSION} -DBUILD_TYPE=${CMAKE_BUILD_TYPE} -P ${CMAKE_CURRENT_SOURCE_DIR}/report/build_info.cmake
     BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/generated/build_info.inc
     VERBATIM)
 add_dependencies(SpeedBreaker nfsmw_build_info)
 
-target_link_libraries(SpeedBreaker PRIVATE NfsmwRecompLib XenonUtilsLite o1heap imgui SDL3::SDL3 Vulkan::Vulkan glslang::glslang glslang::glslang-default-resource-limits ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY})
+target_link_libraries(SpeedBreaker PRIVATE NfsmwRecompLib XenonUtilsLite o1heap imgui SDL3::SDL3 ${SB_VULKAN_TARGET} glslang::glslang glslang::glslang-default-resource-limits ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY})
 # glslang before 15 (the Steam Frame's 14) keeps the C API's SPIR-V
 # generation in its own library.
 if(TARGET glslang::SPIRV)
     target_link_libraries(SpeedBreaker PRIVATE glslang::SPIRV)
 endif()
-# platform/apple/*.mm (iOS: linked by scripts/ios/build.sh).
+# platform/apple/*.mm (iOS: linked by scripts/ios/build.sh): Foundation, and
+# on macOS AppKit (file_dialog.mm) and CoreFoundation (install/placement.cpp:
+# is a folder in iCloud Drive).
 if(APPLE AND NOT IOS)
-    target_link_libraries(SpeedBreaker PRIVATE "-framework Foundation")
+    target_link_libraries(SpeedBreaker PRIVATE "-framework Foundation" "-framework AppKit" "-framework CoreFoundation")
 endif()
 target_include_directories(SpeedBreaker SYSTEM PRIVATE ${FFMPEG_INCLUDE_DIR} ${XR}/thirdparty/tomlplusplus/include)
 # Assertions stay on in every build type: ported code marks its unhandled
@@ -153,4 +181,36 @@ if(IOS)
     # The CPU level both the iPad Pro (M2) and the iPhone 15 Pro (A17 Pro)
     # have; Apple clang's iOS default is far older.
     target_compile_options(SpeedBreaker PRIVATE -mcpu=apple-a15)
+endif()
+# macOS: the build folder gets MoltenVK's manifest too, next to the game
+# (runtime/vulkan/icd.d/MoltenVK_icd.json), naming the MoltenVK that
+# scripts/macos/make_app.py bundles (MOLTENVK in the environment, else
+# Homebrew's molten-vk; -DSB_MOLTENVK=<libMoltenVK.dylib> to choose). The game
+# points the Vulkan loader at <its folder>/vulkan/icd.d/MoltenVK_icd.json when
+# there is one, as in SpeedBreaker.app (video/presenter.cpp). The loader
+# scripts/macos/build_deps.sh builds searches only the system's folders
+# (/usr/local/etc, /etc, ...), never Homebrew's, where molten-vk keeps its
+# manifest: without this, the game run from the build folder (and
+# scripts/bench.sh, test_suspend.sh, verify_settings.py) finds no Vulkan
+# driver. VK_DRIVER_FILES or VK_ICD_FILENAMES set by hand still win.
+if(APPLE AND NOT IOS)
+    if(DEFINED ENV{MOLTENVK})
+        set(_sb_moltenvk "$ENV{MOLTENVK}")
+    else()
+        set(_sb_moltenvk "/opt/homebrew/opt/molten-vk/lib/libMoltenVK.dylib")
+    endif()
+    set(SB_MOLTENVK "${_sb_moltenvk}" CACHE FILEPATH "The MoltenVK the game in the build folder uses")
+    if(EXISTS "${SB_MOLTENVK}")
+        file(GENERATE OUTPUT "$<TARGET_FILE_DIR:SpeedBreaker>/vulkan/icd.d/MoltenVK_icd.json"
+            CONTENT "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"${SB_MOLTENVK}\",\n        \"api_version\": \"1.4.0\",\n        \"is_portability_driver\": true\n    }\n}\n")
+    else()
+        message(STATUS "No MoltenVK at ${SB_MOLTENVK}: the game in the build folder takes the Vulkan loader's own drivers (-DSB_MOLTENVK=<libMoltenVK.dylib> names one)")
+    endif()
+endif()
+
+if(ANDROID)
+    foreach(target SpeedBreaker imgui)
+        target_compile_definitions(${target} PRIVATE VK_NO_PROTOTYPES VK_USE_PLATFORM_ANDROID_KHR IMGUI_IMPL_VULKAN_USE_VOLK)
+        target_compile_options(${target} PRIVATE -include volk.h)
+    endforeach()
 endif()
