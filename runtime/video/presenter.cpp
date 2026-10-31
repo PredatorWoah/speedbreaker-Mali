@@ -9,11 +9,16 @@
 #include <apu/audio.h>
 #include <gpu/renderer.h>
 #include <game/ultrawide.h>
+#include "gpu_choice.h"
+#include "present_schedule.h"
 #include "picture_fit.h"
 #include "frame_rate.h"
+#include "swapchain_policy.h"
+#include "fullscreen_policy.h"
 #include <cpu/guest_thread.h>
 #include <cpu/guest_time.h>
 #include "vblank_lock.h"
+#include "display_tone.h"
 #include <ui/ui.h>
 #if defined(__APPLE__) && TARGET_OS_IOS
 #include <platform/ios_ui.h>
@@ -21,9 +26,14 @@
 #include <user/settings.h>
 #include <report/report.h>
 #include <platform/thermal.h>
+#include <kernel/memory_status.h>
+#include <platform/android/lifecycle_policy.h>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
+#ifdef __ANDROID__
+#include <platform/android/gpu_driver.h>
+#endif
 
 #include <algorithm>
 #include <condition_variable>
@@ -41,6 +51,10 @@ namespace video
         SDL_Window* s_window = nullptr;
         VkInstance s_instance = VK_NULL_HANDLE;
         VkSurfaceKHR s_surface = VK_NULL_HANDLE;
+#ifdef __ANDROID__
+        std::atomic<bool> s_androidSurfaceStale{false};
+        platform::android::LifecyclePolicy s_androidLifecycle;
+#endif
         VkPhysicalDevice s_physical = VK_NULL_HANDLE;
         VkDevice s_device = VK_NULL_HANDLE;
         uint32_t s_queueFamily = 0;
@@ -155,17 +169,36 @@ namespace video
         std::condition_variable s_foreground;
         bool SDLCALL OnAppEvent(void*, SDL_Event* e);
         // Main thread: RunFrame stopped the controller's rumble for the
-        // suspension (hid::Suspend), and a window resize waits for the
-        // resume to rebuild the swapchain (no GPU work before it).
+        // suspension (hid::Suspend).
         bool s_inputSuspended = false;
-        bool s_swapchainStale = false;
+        // When the swapchain is built again, and at what size (main thread;
+        // swapchain_policy.h): not while the app is inactive, the surface
+        // watched after a resume, a size event or a new swapchain,
+        // SUBOPTIMAL/OUT_OF_DATE followed, SDL's view fitted back to its
+        // window on iOS, and no portrait swapchain on a landscape iPhone.
+#ifdef __ANDROID__
+        SwapchainPolicy s_swapPolicy{ AndroidSwapchainRules([] {
+            const char* v = std::getenv("SB_ANDROID_SUBOPTIMAL_REBUILD");
+            return v && v[0] == '1';
+        }()) };
+#else
+        SwapchainPolicy s_swapPolicy;
+#endif
+        // What the next CreateSwapchain is for (its log line), and how many
+        // rebuilds at an unchanged size have been logged.
+        const char* s_swapReason = nullptr;
+        int s_sameSizeLogged = 0;
+        uint64_t s_swapCreations = 0, s_suboptimalReports = 0;
+        double s_swapRebuildMs = 0;
         // Bug-report screenshots waiting for the next frame drawn (CaptureFrame).
         std::mutex s_captureMutex;
         std::vector<std::promise<CapturedFrame>> s_captureRequests;
         // Window settings as applied (settings::Generation() tells when to look again).
         uint64_t s_settingsGeneration = ~0ull;
-        bool s_fullscreen = false;         // the window's state
-        bool s_fullscreenSetting = false;  // the setting as last applied
+        // Settings > Display > Fullscreen (the player's choice, which decides
+        // how the game starts) and the window's own state, which the system
+        // can change for the session (video/fullscreen_policy.h).
+        FullscreenPolicy s_fullscreen;
         // SteamOS Game Mode: gamescope gives the game a screen of the size
         // Steam chooses and resizes only fullscreen windows to it, so the
         // window is always fullscreen there (not saved: Desktop Mode keeps
@@ -269,10 +302,116 @@ namespace video
         VkSwapchainKHR s_waitSwapchain = VK_NULL_HANDLE;  // the one it may wait on
         FILE* s_timingLog = nullptr;          // NFSMW_VBLANK_LOG=<file>: one CSV line per present
 
+        // macOS: a new frame may be shown a set time after the guest vblank
+        // that released it (VK_GOOGLE_display_timing's desiredPresentTime,
+        // which MoltenVK hands to Metal's presentDrawable:atTime:): when and
+        // where, and the watchdog, in video/present_schedule.h. A MacBook
+        // Pro's ProMotion panel shows each present when it is ready (on a
+        // 240 Hz timing grid, not every other 120 Hz refresh), so as presented
+        // its frames came 8-29 ms apart while driving, with the GPU's work on
+        // each; held to their vblanks' cadence they come 16.67 ms apart.
+        // kShowAfterVblankNs: three of the panel's steps, past the 9-11 ms a
+        // frame takes to be ready at the median (M1 Pro, the default
+        // settings): 99.9% of frames 16.67 ms apart while driving, shown
+        // 12-16 ms after their vblank at the median (10.7 when ready). A
+        // frame not ready by then is shown when it is, as before.
+        // NFSMW_PRESENT_AT=<ms> sets the time and shows frames at it on any
+        // display; 0: always when ready.
+        bool s_displayTiming = false;
+        int64_t s_showAfterVblankNs = 0;
+#if defined(__APPLE__) && !TARGET_OS_IOS
+        constexpr int64_t kShowAfterVblankNs = 12'500'000;
+        uint32_t s_displayTimingId = 0;  // main thread
+        // The decision and the watchdog (main thread: Wanted; the waiter:
+        // the driver's reports), and the frames shown at a time not reported
+        // on yet: present id -> the time asked for (steady clock).
+        std::mutex s_scheduleMutex;
+        PresentSchedule s_schedule;
+        struct ScheduledPresent
+        {
+            uint32_t id = 0;
+            int64_t desiredNs = 0;
+            bool waited = false;
+        };
+        ScheduledPresent s_scheduled[64];
+        uint32_t s_scheduledNext = 0;
+        float s_displayHz = 0.0f;  // the display mode's, for the log (main thread)
+#endif
+        // NFSMW_VBLANK_LOG's <file>.actual.csv: the driver's own on-screen
+        // time per present (Metal's presentedTime, mach_absolute_time ns, 0:
+        // never shown; the first line gives the steady clock against it). The
+        // present wait returns well before it there (Metal's scheduling, not
+        // the panel).
+        PFN_vkGetPastPresentationTimingGOOGLE s_pastTiming = nullptr;
+        FILE* s_actualLog = nullptr;
+
         int64_t NowNs()
         {
             return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         }
+
+#if defined(__APPLE__) && !TARGET_OS_IOS
+        // Metal's host time is mach_absolute_time's (CLOCK_UPTIME_RAW); the
+        // steady clock goes on through sleep. Steady = host + this.
+        int64_t HostToSteadyNs()
+        {
+            return NowNs() - int64_t(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+        }
+
+        // Waiter thread, after each present wait (`t` the present waited
+        // for): the driver's reports on the presents shown since the last
+        // call, to NFSMW_VBLANK_LOG's .actual.csv and, for frames shown at a
+        // time, to the watchdog; and `t`, if shown at a time, counted as
+        // presented (the driver reports it a present or so later).
+        void ReadDriverReports(const PresentTiming& t)
+        {
+            uint32_t count = 0;
+            std::vector<VkPastPresentationTimingGOOGLE> past;
+            if (s_pastTiming(s_device, t.swapchain, &count, nullptr) == VK_SUCCESS && count)
+            {
+                past.resize(count);
+                if (s_pastTiming(s_device, t.swapchain, &count, past.data()) < VK_SUCCESS)
+                    count = 0;
+                past.resize(count);
+            }
+            const int64_t hostToSteady = HostToSteadyNs();
+            bool tripped = false;
+            {
+                std::lock_guard lock(s_scheduleMutex);
+                for (const VkPastPresentationTimingGOOGLE& e : past)
+                {
+                    if (s_actualLog)
+                        fprintf(s_actualLog, "%u,%llu\n", e.presentID, (unsigned long long)e.actualPresentTime);
+                    for (ScheduledPresent& p : s_scheduled)
+                        if (p.id == e.presentID && p.desiredNs)
+                        {
+                            const bool shown = e.actualPresentTime != 0;
+                            tripped |= s_schedule.Reported(shown, shown ? int64_t(e.actualPresentTime) + hostToSteady - p.desiredNs : 0);
+                            p = {};
+                            break;
+                        }
+                }
+                for (ScheduledPresent& p : s_scheduled)
+                    if (p.id == uint32_t(t.id) && p.desiredNs && !p.waited)
+                    {
+                        p.waited = true;
+                        tripped |= s_schedule.Presented();
+                        break;
+                    }
+            }
+            if (tripped)
+            {
+                if (s_schedule.GetReason() == PresentSchedule::Reason::Unreported)
+                    fprintf(stderr, "[vblank] new frames shown when ready from now on: %u frames shown at a time were presented and the "
+                        "driver reported none of them (VK_GOOGLE_display_timing)\n", PresentSchedule::kUnreported);
+                else
+                    fprintf(stderr, "[vblank] new frames shown when ready from now on: the time asked for wasn't kept for %u of the last %u "
+                        "frames shown at a time (the driver's reports, VK_GOOGLE_display_timing: %llu shown over %lld ms early, %llu never "
+                        "shown)\n", s_schedule.BadInWindow(), s_schedule.ReportedInWindow(), (unsigned long long)s_schedule.Early(),
+                        (long long)(PresentSchedule::kEarlyNs / 1'000'000), (unsigned long long)s_schedule.NotShown());
+            }
+        }
+#endif
 
         // Waiter thread: a present was on screen at `onScreen`. `timed`: the
         // wait was under way when it happened (not caught up on afterwards).
@@ -291,6 +430,10 @@ namespace video
                 fprintf(s_timingLog, "%llu,%lld,%lld,%lld,%d,%d,%.1f,%lld,%.0f\n", (unsigned long long)t.id, (long long)t.vblank,
                     (long long)t.presented, (long long)onScreen, timed, display.valid, display.periodNs, (long long)display.gridNs,
                     display.rmsNs);
+#if defined(__APPLE__) && !TARGET_OS_IOS
+            if (s_pastTiming)
+                ReadDriverReports(t);
+#endif
             if (!t.vblank)
                 return;
             s_shown++;
@@ -319,6 +462,11 @@ namespace video
         void PresentWaiter()
         {
             SetHostThreadName("nfsmw-present");
+#if defined(__APPLE__) && !TARGET_OS_IOS
+            // As the threads that present (the main thread) and draw: it
+            // takes MoltenVK's swapchain locks beside their presents.
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
             while (true)
             {
                 PresentTiming t;
@@ -348,6 +496,57 @@ namespace video
                     OnScreen(t, now, now - start > 50'000);
             }
         }
+
+        // The surface's extent: Vulkan's current extent, else (Wayland: the
+        // swapchain decides) the window's pixels.
+        Extent SurfaceExtent(const VkSurfaceCapabilitiesKHR& caps)
+        {
+            if (caps.currentExtent.width != UINT32_MAX)
+                return { caps.currentExtent.width, caps.currentExtent.height };
+            int w = 0, h = 0;
+            SDL_GetWindowSizeInPixels(s_window, &w, &h);
+            return { uint32_t(std::max(w, 0)), uint32_t(std::max(h, 0)) };
+        }
+
+        Extent SurfaceExtent()
+        {
+            VkSurfaceCapabilitiesKHR caps{};
+            if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_physical, s_surface, &caps) != VK_SUCCESS)
+                return {};
+            return SurfaceExtent(caps);
+        }
+
+        // The interface's orientation and whether the app is landscape-only
+        // there: iOS's (an iPhone is), unknown and no elsewhere.
+        Orientation InterfaceNow()
+        {
+#if defined(__APPLE__) && TARGET_OS_IOS
+            return platform::ios::InterfaceOrientation(s_window);
+#else
+            return Orientation::Unknown;
+#endif
+        }
+
+        bool LandscapeOnlyHere()
+        {
+#if defined(__APPLE__) && TARGET_OS_IOS
+            return platform::ios::LandscapeOnly();
+#else
+            return false;
+#endif
+        }
+
+        // iOS: the view, its window and the scene, for a log line ("" elsewhere).
+        std::string GeometryNote()
+        {
+#if defined(__APPLE__) && TARGET_OS_IOS
+            return ": " + platform::ios::DescribeGeometry(s_window);
+#else
+            return {};
+#endif
+        }
+
+        void UpdateDisplayItem();
 
         void DestroySwapchain()
         {
@@ -380,16 +579,22 @@ namespace video
 #endif
             VkSurfaceCapabilitiesKHR caps;
             vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_physical, s_surface, &caps);
-            int w, h;
-            SDL_GetWindowSizeInPixels(s_window, &w, &h);
-            s_swapExtent = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent
-                : VkExtent2D{ uint32_t(w), uint32_t(h) };
+            const VkExtent2D previous = s_swapExtent;
+            // A landscape-only iPhone takes no portrait swapchain under a
+            // landscape interface (swapchain_policy.h): the same size turned,
+            // while the view is fitted back to its window.
+            const Extent surface = SurfaceExtent(caps);
+            const ExtentChoice choice = ChooseExtent(surface, InterfaceNow(), LandscapeOnlyHere());
+            s_swapExtent = { choice.extent.width, choice.extent.height };
             if (s_swapExtent.width == 0 || s_swapExtent.height == 0)
                 return false;  // minimised
+            if (choice.refused)
+                fprintf(stderr, "[video] the surface is %ux%u, portrait, under a landscape interface: the swapchain is %ux%u instead\n",
+                    surface.width, surface.height, s_swapExtent.width, s_swapExtent.height);
             s_regionExtent.store(uint64_t(s_swapExtent.width) << 32 | s_swapExtent.height, std::memory_order_relaxed);
-            // The UI draws to the drawables' size, not the window's pixels
-            // (0, 0: they're the window's).
-            ui::SetFramebufferSize(s_presentScale < 1.0f ? s_swapExtent.width : 0, s_presentScale < 1.0f ? s_swapExtent.height : 0);
+            // The UI lays out at and draws to the swapchain's size (the
+            // drawables' with iOS's present scale), not the window's pixels.
+            ui::SetFramebufferSize(s_swapExtent.width, s_swapExtent.height);
 
             uint32_t count = 0;
             vkGetPhysicalDeviceSurfaceFormatsKHR(s_physical, s_surface, &count, nullptr);
@@ -440,6 +645,20 @@ namespace video
             s_swapReadable = (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
             info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
             info.preTransform = caps.currentTransform;
+#ifdef __ANDROID__
+            // Our final pass and ImGui render in the window's orientation.
+            // Matching currentTransform would claim we have pre-rotated both,
+            // making Android present landscape content sideways. Let the
+            // compositor perform the surface rotation until we implement
+            // pre-rotation for the final pass and the UI together.
+            if (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+                info.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+            int w = 0, h = 0;
+            SDL_GetWindowSizeInPixels(s_window, &w, &h);
+            fprintf(stderr, "[video] surface rotation: current %X, supported %X, selected %X; image %ux%u, window %dx%d\n",
+                unsigned(caps.currentTransform), unsigned(caps.supportedTransforms), unsigned(info.preTransform),
+                s_swapExtent.width, s_swapExtent.height, w, h);
+#endif
             info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
             // V-Sync off: mailbox (no tearing, newest frame) where there is
             // one, else immediate.
@@ -460,6 +679,7 @@ namespace video
             info.clipped = VK_TRUE;
             if (!Check(vkCreateSwapchainKHR(s_device, &info, nullptr, &s_swapchain), "vkCreateSwapchainKHR"))
                 return false;
+            ++s_swapCreations;
             {
                 // Once per change: the V-Sync setting's effect, in the log.
                 static int logged = -1;
@@ -479,12 +699,24 @@ namespace video
             }
             if (s_uiReady)
                 ui::SetFormat(s_swapFormat);
+            s_swapPolicy.Created({ s_swapExtent.width, s_swapExtent.height });
             static VkExtent2D logged{};
+            const char* reason = std::exchange(s_swapReason, nullptr);
             if (logged.width != s_swapExtent.width || logged.height != s_swapExtent.height)
             {
                 if (logged.width)  // the first one is logged with the device
-                    fprintf(stderr, "[video] swapchain %ux%u\n", s_swapExtent.width, s_swapExtent.height);
+                {
+                    fprintf(stderr, "[video] swapchain %ux%u (was %ux%u%s%s)%s\n", s_swapExtent.width, s_swapExtent.height, logged.width,
+                        logged.height, reason ? "; " : "", reason ? reason : "", GeometryNote().c_str());
+                    UpdateDisplayItem();
+                }
                 logged = s_swapExtent;
+            }
+            else if (reason && previous.width && s_sameSizeLogged < 10)
+            {
+                s_sameSizeLogged++;
+                fprintf(stderr, "[video] swapchain %ux%u again (%s)%s\n", s_swapExtent.width, s_swapExtent.height, reason,
+                    s_sameSizeLogged == 10 ? "; no more same-size rebuilds logged" : "");
             }
 
             vkGetSwapchainImagesKHR(s_device, s_swapchain, &count, nullptr);
@@ -683,13 +915,30 @@ void main()
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D src;
 layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
-layout(push_constant) uniform P { ivec2 size; float subpixel; float pad; } p;
+// band: the 16:9 band's columns x..y and rows z..w (video::BandOf), used
+// when bandOn is 1 (video/band_filter.h).
+layout(push_constant) uniform P { ivec2 size; float subpixel; uint bandOn; ivec4 band; } p;
 
 const float kEdgeMin = 0.0312;      // no AA on darker contrast than this
 const float kEdgeRelative = 0.125;  // ... or than this fraction of the local maximum
 
+// This pixel's span of the band's three along each axis, as uv: every fetch
+// stays between its first and last texel centres (band_filter.h's Clamp).
+vec2 spanLo = vec2(0.0), spanHi = vec2(1.0);
+
 float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
-vec3 at(vec2 uv) { return textureLod(src, uv, 0.0).rgb; }
+vec3 at(vec2 uv)
+{
+    if (p.bandOn != 0u)
+        uv = clamp(uv, spanLo, spanHi);
+    return textureLod(src, uv, 0.0).rgb;
+}
+
+// band_filter.h's SpanOf: [0, lo), [lo, hi) or [hi, size) holding t.
+vec2 spanOf(float t, int lo, int hi, int size)
+{
+    return t < float(lo) ? vec2(0.0, float(lo)) : t < float(hi) ? vec2(float(lo), float(hi)) : vec2(float(hi), float(size));
+}
 
 void main()
 {
@@ -698,6 +947,12 @@ void main()
         return;
     vec2 texel = 1.0 / vec2(p.size);
     vec2 uv = (vec2(pix) + 0.5) * texel;
+    if (p.bandOn != 0u)
+    {
+        vec2 sx = spanOf(float(pix.x) + 0.5, p.band.x, p.band.y, p.size.x), sy = spanOf(float(pix.y) + 0.5, p.band.z, p.band.w, p.size.y);
+        spanLo = (vec2(sx.x, sy.x) + 0.5) * texel;
+        spanHi = (vec2(sx.y, sy.y) - 0.5) * texel;
+    }
     vec3 center = at(uv);
     float lM = luma(center);
     float lN = luma(at(uv + vec2(0.0, -texel.y))), lS = luma(at(uv + vec2(0.0, texel.y)));
@@ -767,9 +1022,37 @@ void main()
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 color;
 layout(set = 0, binding = 0) uniform sampler2D src;
-layout(push_constant) uniform P { vec2 size; float sharpen; uint bicubic; } p;
+// band: the 16:9 band's columns x..y and rows z..w in texels (video::BandOf),
+// used when bandOn is 1 (video/band_filter.h).
+layout(push_constant) uniform P { vec2 size; float sharpen; uint bicubic; vec4 band; uint bandOn; } p;
 
-vec3 at(vec2 t) { return textureLod(src, t, 0.0).rgb; }
+// The span of the band's three along each axis that this pixel's centre
+// falls in, as uv: every tap stays between its first and last texel centres
+// (band_filter.h's Clamp), so a strip's pixel reads only the strip.
+vec2 spanLo = vec2(0.0), spanHi = vec2(1.0);
+
+vec3 at(vec2 t)
+{
+    if (p.bandOn != 0u)
+        t = clamp(t, spanLo, spanHi);
+    return textureLod(src, t, 0.0).rgb;
+}
+
+// band_filter.h's SpanOf: [0, lo), [lo, hi) or [hi, size) holding t.
+vec2 spanOf(float t, float lo, float hi, float size)
+{
+    return t < lo ? vec2(0.0, lo) : t < hi ? vec2(lo, hi) : vec2(hi, size);
+}
+
+void setSpan()
+{
+    if (p.bandOn == 0u)
+        return;
+    vec2 pos = uv * p.size;
+    vec2 sx = spanOf(pos.x, p.band.x, p.band.y, p.size.x), sy = spanOf(pos.y, p.band.z, p.band.w, p.size.y);
+    spanLo = (vec2(sx.x, sy.x) + 0.5) / p.size;
+    spanHi = (vec2(sx.y, sy.y) - 0.5) / p.size;
+}
 
 // Catmull-Rom bicubic from 9 bilinear taps: the middle two weights of each
 // axis are folded into one bilinear fetch.
@@ -791,6 +1074,7 @@ vec3 catmullRom(vec2 t, vec2 texel)
 
 void main()
 {
+    setSpan();
     if (p.bicubic == 0u)
     {
         color = vec4(at(uv), 1.0);
@@ -820,12 +1104,34 @@ void main()
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 color;
 layout(set = 0, binding = 0) uniform sampler2D src;
-layout(push_constant) uniform P { vec2 size; float sharpen; uint bicubic; } p;
+// band, bandOn: as kScaleFs's.
+layout(push_constant) uniform P { vec2 size; float sharpen; uint bicubic; vec4 band; uint bandOn; } p;
 
-vec3 at(vec2 t) { return textureLod(src, t, 0.0).rgb; }
+vec2 spanLo = vec2(0.0), spanHi = vec2(1.0);  // as kScaleFs's
+
+vec3 at(vec2 t)
+{
+    if (p.bandOn != 0u)
+        t = clamp(t, spanLo, spanHi);
+    return textureLod(src, t, 0.0).rgb;
+}
+
+vec2 spanOf(float t, float lo, float hi, float size)
+{
+    return t < lo ? vec2(0.0, lo) : t < hi ? vec2(lo, hi) : vec2(hi, size);
+}
 
 void main()
 {
+    vec2 sx = vec2(0.0), sy = vec2(0.0);
+    if (p.bandOn != 0u)
+    {
+        vec2 pos = uv * p.size;
+        sx = spanOf(pos.x, p.band.x, p.band.y, p.size.x);
+        sy = spanOf(pos.y, p.band.z, p.band.w, p.size.y);
+        spanLo = (vec2(sx.x, sy.x) + 0.5) / p.size;
+        spanHi = (vec2(sx.y, sy.y) - 0.5) / p.size;
+    }
     if (p.bicubic == 0u)
     {
         color = vec4(at(uv), 1.0);
@@ -846,6 +1152,15 @@ void main()
     vec2 mid = (c + 0.5) * texel;
     vec4 r = textureGather(src, mid, 0), gr = textureGather(src, mid, 1), b = textureGather(src, mid, 2);
     vec3 a = vec3(r.w, gr.w, b.w), e = vec3(r.z, gr.z, b.z), d = vec3(r.x, gr.x, b.x), h = vec3(r.y, gr.y, b.y);
+    if (p.bandOn != 0u)
+    {
+        // The gather's row or column past this pixel's span reads the
+        // span's edge one instead (band_filter.h's ClampTexel): rows a e
+        // (first) and d h, columns a d (first) and e h.
+        vec2 first = c - 0.5;
+        if (first.y < sy.x) { a = d; e = h; } else if (first.y + 1.0 >= sy.y) { d = a; h = e; }
+        if (first.x < sx.x) { a = e; d = h; } else if (first.x + 1.0 >= sx.y) { e = a; h = d; }
+    }
     vec3 middle = mix(mix(a, e, g.x), mix(d, h, g.x), g.y);
     vec3 bilinear = mix(mix(a, e, f.x), mix(d, h, f.x), f.y);
     float wN = w12.x * w0.y, wW = w0.x * w12.y, wM = w12.x * w12.y, wE = w3.x * w12.y, wS = w12.x * w3.y;
@@ -865,6 +1180,66 @@ void main()
         constexpr bool kFastScaleByDefault = false;
 #endif
         const bool s_fastScale = [] { const char* v = std::getenv("NFSMW_FAST_SCALE"); return v ? v[0] == '1' : kFastScaleByDefault; }();
+
+        // Brightness and the 360's display gamma (video/display_tone.h): the
+        // scale shader in use, its main renamed scaleMain, then this main,
+        // which looks each channel of its result up in the tone table (256
+        // entries for the values k/255, linear between them). The tables
+        // are made on the CPU. With Brightness 0 and the 360's gamma off the
+        // plain scale pipeline draws, so that picture (v0.1.3's) is the same,
+        // bit for bit, as without this.
+        const char* kToneGlsl = R"(
+layout(set = 0, binding = 1) uniform sampler2D toneTable;
+
+vec3 toneOf(vec3 c)
+{
+    vec3 t = clamp(c, 0.0, 1.0) * (255.0 / 256.0) + (0.5 / 256.0);
+    return vec3(textureLod(toneTable, vec2(t.r, 0.5), 0.0).r, textureLod(toneTable, vec2(t.g, 0.5), 0.0).g,
+        textureLod(toneTable, vec2(t.b, 0.5), 0.0).b);
+}
+
+void main()
+{
+    scaleMain();
+    color = vec4(toneOf(color.rgb), color.a);
+}
+)";
+
+        // The tone variant of a scale shader's source ("" if it hasn't
+        // exactly one main to rename).
+        std::string ToneVariant(const char* scaleGlsl)
+        {
+            std::string glsl = scaleGlsl;
+            const std::string_view kMain = "void main()";
+            size_t at = glsl.find(kMain);
+            if (at == std::string::npos || glsl.find(kMain, at + 1) != std::string::npos)
+                return {};
+            glsl.replace(at, kMain.size(), "void scaleMain()");
+            return glsl + kToneGlsl;
+        }
+
+        struct ToneState
+        {
+            bool tried = false, ready = false;
+            VkDescriptorSetLayout set = VK_NULL_HANDLE;
+            VkPipelineLayout layout = VK_NULL_HANDLE;
+            VkShaderModule fs = VK_NULL_HANDLE;
+            VkPipeline pipeline = VK_NULL_HANDLE;
+            VkFormat format = VK_FORMAT_UNDEFINED;  // the swapchain format the pipeline was made for
+            // The table: 256 x 1 RGBA16F, written from a host-visible buffer.
+            VkImage image = VK_NULL_HANDLE;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            VkImageView view = VK_NULL_HANDLE;
+            VkBuffer staging = VK_NULL_HANDLE;
+            VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+            void* stagingMapped = nullptr;
+            // What the table holds.
+            bool filled = false;
+            int32_t brightness = 0;
+            int32_t tint = 0;
+            bool ramp = false;
+            uint64_t rampGeneration = 0;
+        } s_tone;
 
         struct PostState
         {
@@ -904,17 +1279,13 @@ void main()
             return module;
         }
 
-        // The scale pipeline for the swapchain's format (made again if it changes).
-        bool EnsureScalePipeline()
+        // A scale pipeline (the plain one or the tone variant) for the
+        // swapchain's format; VK_NULL_HANDLE if it can't be made.
+        VkPipeline MakeScalePipeline(VkShaderModule fs, VkPipelineLayout layout)
         {
-            if (s_post.scale && s_post.scaleFormat == s_swapFormat)
-                return true;
-            if (s_post.scale)
-                vkDestroyPipeline(s_device, s_post.scale, nullptr);
-            s_post.scale = VK_NULL_HANDLE;
             VkPipelineShaderStageCreateInfo stages[2] = {
                 { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, s_post.vs, "main", nullptr },
-                { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, s_post.fs, "main", nullptr },
+                { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", nullptr },
             };
             VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
             VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
@@ -951,8 +1322,22 @@ void main()
             gpci.pMultisampleState = &ms;
             gpci.pColorBlendState = &cb;
             gpci.pDynamicState = &ds;
-            gpci.layout = s_post.scaleLayout;
-            if (vkCreateGraphicsPipelines(s_device, VK_NULL_HANDLE, 1, &gpci, nullptr, &s_post.scale) != VK_SUCCESS)
+            gpci.layout = layout;
+            VkPipeline pipeline = VK_NULL_HANDLE;
+            if (vkCreateGraphicsPipelines(s_device, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipeline) != VK_SUCCESS)
+                return VK_NULL_HANDLE;
+            return pipeline;
+        }
+
+        // The scale pipeline for the swapchain's format (made again if it changes).
+        bool EnsureScalePipeline()
+        {
+            if (s_post.scale && s_post.scaleFormat == s_swapFormat)
+                return true;
+            if (s_post.scale)
+                vkDestroyPipeline(s_device, s_post.scale, nullptr);
+            s_post.scale = MakeScalePipeline(s_post.fs, s_post.scaleLayout);
+            if (!s_post.scale)
                 return false;
             s_post.scaleFormat = s_swapFormat;
             return true;
@@ -986,7 +1371,7 @@ void main()
             dslci.bindingCount = 1;
             dslci.pBindings = &scaleBinding;
             vkCreateDescriptorSetLayout(s_device, &dslci, nullptr, &s_post.scaleSet);
-            VkPushConstantRange aaRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 16 }, scaleRange{ VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16 };
+            VkPushConstantRange aaRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 32 }, scaleRange{ VK_SHADER_STAGE_FRAGMENT_BIT, 0, 36 };
             VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
             plci.setLayoutCount = 1;
             plci.pSetLayouts = &s_post.aaSet;
@@ -1054,6 +1439,148 @@ void main()
             s_post.aaHeight = height;
         }
 
+        // The tone pipeline's pieces, made the first time Brightness or the
+        // 360's display gamma is in use (the gamma is on by default, so
+        // usually on the first frame).
+        bool EnsureTone()
+        {
+            if (s_tone.tried)
+            {
+                if (!s_tone.ready)
+                    return false;
+            }
+            else
+            {
+                s_tone.tried = true;
+                std::string glsl = ToneVariant(s_fastScale ? kScaleFastFs : kScaleFs);
+                if (glsl.empty())
+                {
+                    fprintf(stderr, "[video] tone: the scale shader has no single main to wrap; Brightness is off\n");
+                    return false;
+                }
+                VkDescriptorSetLayoutBinding bindings[2] = {
+                    { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },
+                    { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },
+                };
+                VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+                dslci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+                dslci.bindingCount = 2;
+                dslci.pBindings = bindings;
+                VkPushConstantRange range{ VK_SHADER_STAGE_FRAGMENT_BIT, 0, 36 };  // the scale shaders' P
+                VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+                plci.setLayoutCount = 1;
+                plci.pSetLayouts = &s_tone.set;
+                plci.pushConstantRangeCount = 1;
+                plci.pPushConstantRanges = &range;
+                if (!Check(vkCreateDescriptorSetLayout(s_device, &dslci, nullptr, &s_tone.set), "tone set layout") ||
+                    !Check(vkCreatePipelineLayout(s_device, &plci, nullptr, &s_tone.layout), "tone pipeline layout"))
+                    return false;
+                s_tone.fs = PostModule(glsl.c_str(), 1);
+                if (!s_tone.fs)
+                    return false;
+
+                VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+                ii.imageType = VK_IMAGE_TYPE_2D;
+                ii.format = VK_FORMAT_R16G16B16A16_SFLOAT;  // sampled with linear filtering on every Vulkan device
+                ii.extent = { 256, 1, 1 };
+                ii.mipLevels = 1;
+                ii.arrayLayers = 1;
+                ii.samples = VK_SAMPLE_COUNT_1_BIT;
+                ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+                ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                if (!Check(vkCreateImage(s_device, &ii, nullptr, &s_tone.image), "tone table image"))
+                    return false;
+                VkMemoryRequirements req;
+                vkGetImageMemoryRequirements(s_device, s_tone.image, &req);
+                VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                ai.allocationSize = req.size;
+                ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                if (ai.memoryTypeIndex == UINT32_MAX || !Check(vkAllocateMemory(s_device, &ai, nullptr, &s_tone.memory), "tone table memory"))
+                    return false;
+                vkBindImageMemory(s_device, s_tone.image, s_tone.memory, 0);
+                VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+                vci.image = s_tone.image;
+                vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                vci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+                vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                if (!Check(vkCreateImageView(s_device, &vci, nullptr, &s_tone.view), "tone table view"))
+                    return false;
+
+                VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+                bci.size = 256 * 4 * sizeof(uint16_t);
+                bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                if (!Check(vkCreateBuffer(s_device, &bci, nullptr, &s_tone.staging), "tone staging buffer"))
+                    return false;
+                vkGetBufferMemoryRequirements(s_device, s_tone.staging, &req);
+                ai.allocationSize = req.size;
+                ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                if (ai.memoryTypeIndex == UINT32_MAX || !Check(vkAllocateMemory(s_device, &ai, nullptr, &s_tone.stagingMemory), "tone staging memory"))
+                    return false;
+                vkBindBufferMemory(s_device, s_tone.staging, s_tone.stagingMemory, 0);
+                if (!Check(vkMapMemory(s_device, s_tone.stagingMemory, 0, VK_WHOLE_SIZE, 0, &s_tone.stagingMapped), "tone staging map"))
+                    return false;
+                s_tone.ready = true;
+            }
+            if (s_tone.pipeline && s_tone.format == s_swapFormat)
+                return true;
+            if (s_tone.pipeline)
+                vkDestroyPipeline(s_device, s_tone.pipeline, nullptr);
+            auto start = std::chrono::steady_clock::now();
+            s_tone.pipeline = MakeScalePipeline(s_tone.fs, s_tone.layout);
+            if (!s_tone.pipeline)
+            {
+                fprintf(stderr, "[video] tone: the pipeline couldn't be made; Brightness is off\n");
+                s_tone.ready = false;
+                return false;
+            }
+            s_tone.format = s_swapFormat;
+            fprintf(stderr, "[video] tone: pipeline made in %.0f ms\n",
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+            return true;
+        }
+
+        // Before the scale pass: whether this frame's picture goes through
+        // the tone table (Settings > Display > Brightness, Xbox 360 Display
+        // Gamma), with the table brought up to date in `cmd` when its inputs
+        // changed. At Brightness 0 with the gamma off it does nothing and
+        // returns false.
+        bool PrepareTone(VkCommandBuffer cmd)
+        {
+            const int32_t brightness = std::clamp(settings::GetInt(settings::Id::Brightness), tone::kBrightnessMin, tone::kBrightnessMax);
+            const bool useRamp = settings::GetBool(settings::Id::DisplayGamma);
+            const int32_t tint = std::clamp(settings::GetInt(settings::Id::YellowTint), tone::kTintMin, tone::kTintMax);
+            if (tone::Neutral(brightness, useRamp, tint) || !EnsureTone())
+                return false;
+            const uint64_t rampGeneration = useRamp ? display_gamma::Generation() : 0;
+            if (s_tone.filled && s_tone.brightness == brightness && s_tone.tint == tint && s_tone.ramp == useRamp && s_tone.rampGeneration == rampGeneration)
+                return true;
+            display_gamma::Table ramp;
+            const bool haveRamp = useRamp && display_gamma::Latest(ramp) != 0;
+            const tone::Lut lut = tone::BuildLut(brightness, haveRamp ? &ramp : nullptr, tint);
+            const auto texels = tone::ToHalfTexels(lut);
+            // The frames in flight may be reading the table: rare (a setting
+            // or the game's own ramp changed), so wait for them.
+            WaitIdle();
+            memcpy(s_tone.stagingMapped, texels.data(), sizeof(texels));
+            Barrier(cmd, s_tone.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            copy.imageExtent = { 256, 1, 1 };
+            vkCmdCopyBufferToImage(cmd, s_tone.staging, s_tone.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            Barrier(cmd, s_tone.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+            fprintf(stderr, "[video] tone: brightness %+d, yellow tint removal %d, Xbox 360 display gamma %s; 64->%.1f 128->%.1f 192->%.1f (8-bit levels, red)\n",
+                brightness, tint, !useRamp ? "off" : haveRamp ? std::format("on (the game's ramp #{})", rampGeneration).c_str() : "on (no ramp from the game yet)",
+                lut.entry[64][0] * 255.0, lut.entry[128][0] * 255.0, lut.entry[192][0] * 255.0);
+            s_tone.filled = true;
+            s_tone.brightness = brightness;
+            s_tone.tint = tint;
+            s_tone.ramp = useRamp;
+            s_tone.rampGeneration = rampGeneration;
+            return true;
+        }
+
         // Xenia's Tiled2D for 32x32-aligned pitches (texture_address.h).
         uint32_t Tiled2D(uint32_t x, uint32_t y, uint32_t pitchAligned, uint32_t bppLog2)
         {
@@ -1076,19 +1603,14 @@ void main()
             if (generation == s_settingsGeneration)
                 return;
             s_settingsGeneration = generation;
-            // Only when the setting itself changes: the window may have been
-            // toggled by the system since (and NFSMW_FULLSCREEN pins the setting).
-            bool fullscreen = settings::GetBool(settings::Id::Fullscreen);
-            if (fullscreen != s_fullscreenSetting && !FullscreenLocked())
+            // Only when the setting itself changes (the menu, Reset page; and
+            // NFSMW_FULLSCREEN pins it): the window then follows it. A change
+            // the system made since stays until then.
+            if (std::optional<bool> fullscreen = s_fullscreen.SettingIs(settings::GetBool(settings::Id::Fullscreen)))
             {
-                s_fullscreenSetting = fullscreen;
-                if (fullscreen != s_fullscreen)
-                {
-                    s_fullscreen = fullscreen;
-                    bool ok = SDL_SetWindowFullscreen(s_window, fullscreen);
-                    fprintf(stderr, "[video] fullscreen %s (setting)%s%s\n", fullscreen ? "on" : "off", ok ? "" : ": ",
-                        ok ? "" : SDL_GetError());
-                }
+                bool ok = SDL_SetWindowFullscreen(s_window, *fullscreen);
+                fprintf(stderr, "[video] fullscreen %s (setting)%s%s\n", *fullscreen ? "on" : "off", ok ? "" : ": ",
+                    ok ? "" : SDL_GetError());
             }
             bool rebuild = false;
             bool vsync = settings::GetBool(settings::Id::VSync);
@@ -1110,7 +1632,9 @@ void main()
             {
                 WaitIdle();
                 DestroySwapchain();
+                s_swapReason = "V-Sync or Screen Resolution";
                 CreateSwapchain();
+                s_swapReason = nullptr;
             }
         }
 
@@ -1135,10 +1659,87 @@ void main()
                 settings::Set(settings::Id::WindowHeight, h);
             }
         }
+
+        // The device extensions the game can't start without: Initialize
+        // enables them, and ChooseDevice puts a device with all of them first.
+        constexpr const char* kNeededDeviceExtensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+            VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,
+            VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME, VK_KHR_MULTIVIEW_EXTENSION_NAME, VK_KHR_MAINTENANCE_2_EXTENSION_NAME,
+            VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME };
+
+        // The Vulkan device to draw with (s_physical, s_queueFamily; left
+        // null when none can present to the window), and the log's one line
+        // listing every device the loader found, the one used and why
+        // (video/gpu_choice.h: a discrete GPU first, NFSMW_GPU=<index or part
+        // of a name> to pick another). Up to v0.1.1 it was the loader's first
+        // that could present, which on a laptop with two GPUs was usually the
+        // integrated one; where only one device can present it still is that
+        // one. A device's queue family is its first with graphics that can
+        // present to the window, as before.
+        void ChooseDevice(const std::vector<VkPhysicalDevice>& devices)
+        {
+            std::vector<GpuCandidate> candidates;
+            std::vector<uint32_t> families;
+            for (size_t i = 0; i < devices.size(); i++)
+            {
+                VkPhysicalDevice d = devices[i];
+                VkPhysicalDeviceProperties props;
+                vkGetPhysicalDeviceProperties(d, &props);
+                uint32_t qc = 0;
+                vkGetPhysicalDeviceQueueFamilyProperties(d, &qc, nullptr);
+                std::vector<VkQueueFamilyProperties> qs(qc);
+                vkGetPhysicalDeviceQueueFamilyProperties(d, &qc, qs.data());
+                uint32_t family = UINT32_MAX;
+                for (uint32_t f = 0; f < qc && family == UINT32_MAX; f++)
+                {
+                    VkBool32 present = VK_FALSE;
+                    vkGetPhysicalDeviceSurfaceSupportKHR(d, f, s_surface, &present);
+                    if ((qs[f].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present)
+                        family = f;
+                }
+                VkPhysicalDeviceMemoryProperties memory;
+                vkGetPhysicalDeviceMemoryProperties(d, &memory);
+                uint64_t local = 0;
+                for (uint32_t h = 0; h < memory.memoryHeapCount; h++)
+                    if (memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                        local += memory.memoryHeaps[h].size;
+                uint32_t extCount = 0;
+                vkEnumerateDeviceExtensionProperties(d, nullptr, &extCount, nullptr);
+                std::vector<VkExtensionProperties> exts(extCount);
+                vkEnumerateDeviceExtensionProperties(d, nullptr, &extCount, exts.data());
+                std::string lacks;
+                for (const char* needed : kNeededDeviceExtensions)
+                    if (lacks.empty() && std::none_of(exts.begin(), exts.end(),
+                            [needed](const VkExtensionProperties& e) { return strcmp(e.extensionName, needed) == 0; }))
+                        lacks = needed;
+                // Mesa's Dozen (Vulkan on Direct3D 12: Windows, WSL) lists GPUs
+                // a native driver may list too.
+                bool dozen = false;
+                if (props.apiVersion >= VK_API_VERSION_1_2)
+                {
+                    VkPhysicalDeviceDriverProperties driver{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+                    VkPhysicalDeviceProperties2 props2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+                    props2.pNext = &driver;
+                    vkGetPhysicalDeviceProperties2(d, &props2);
+                    dozen = driver.driverID == VK_DRIVER_ID_MESA_DOZEN;
+                }
+                candidates.push_back({ i, int(props.deviceType), dozen, props.deviceName, local, family != UINT32_MAX, lacks });
+                families.push_back(family);
+            }
+            GpuChoice choice = ChooseGpu(candidates, std::getenv("NFSMW_GPU"));
+            fprintf(stderr, "[video] %s\n", GpuLogLine(candidates, choice).c_str());
+            if (choice.pick == kNoGpu)
+                return;
+            s_physical = devices[choice.pick];
+            s_queueFamily = families[choice.pick];
+        }
     }
 
     bool Initialize()
     {
+#ifdef __ANDROID__
+        if (!platform::android::InitializeVulkanLoader()) return false;
+#endif
         if (const char* h = std::getenv("NFSMW_HEADLESS"); h && h[0] == '1')
             return false;
 #if defined(__APPLE__) && TARGET_OS_IOS
@@ -1176,8 +1777,7 @@ void main()
         // The size it had last time (NFSMW_WINDOW=<width>x<height> overrides).
         int windowW = settings::GetInt(settings::Id::WindowWidth), windowH = settings::GetInt(settings::Id::WindowHeight);
         s_gameMode = DetectGameMode();
-        s_fullscreenSetting = settings::GetBool(settings::Id::Fullscreen);
-        s_fullscreen = FullscreenLocked() || s_fullscreenSetting;
+        const bool startFullscreen = s_fullscreen.Launch(settings::GetBool(settings::Id::Fullscreen), FullscreenLocked());
         s_vsync = settings::GetBool(settings::Id::VSync);
 #if defined(__APPLE__) && TARGET_OS_IOS
         // Always fullscreen there (FullscreenLocked), which hides the status
@@ -1186,18 +1786,28 @@ void main()
         // the one swipe the windowed app had. ("2" defers them, if touch
         // players leave the game by accident.)
         SDL_SetHint(SDL_HINT_IOS_HIDE_HOME_INDICATOR, "0");
+        // On iPhone, landscape only to SDL too: else it turns its view
+        // portrait when a keyboard shows or hides (ios_ui.h).
+        platform::ios::PrepareOrientation();
 #endif
         s_window = SDL_CreateWindow("SpeedBreaker", windowW, windowH,
-            SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (s_fullscreen ? SDL_WINDOW_FULLSCREEN : 0));
+            SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (startFullscreen ? SDL_WINDOW_FULLSCREEN : 0));
         if (!s_window)
         {
             fprintf(stderr, "[video] SDL_CreateWindow: %s\n", SDL_GetError());
             return false;
         }
+#if defined(__APPLE__) && TARGET_OS_IOS
+        platform::ios::WatchKeyboards(s_window);
+#endif
 
+#ifdef __ANDROID__
+        std::vector<const char*> exts{VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME};
+#else
         Uint32 extCount = 0;
         const char* const* sdlExts = SDL_Vulkan_GetInstanceExtensions(&extCount);
         std::vector<const char*> exts(sdlExts, sdlExts + extCount);
+#endif
         exts.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
         // Portability enumeration is the Vulkan loader's (it lists MoltenVK
         // on macOS only when asked). iOS links MoltenVK itself, without a
@@ -1222,7 +1832,14 @@ void main()
         ici.ppEnabledExtensionNames = exts.data();
         if (!Check(vkCreateInstance(&ici, nullptr, &s_instance), "vkCreateInstance"))
             return false;
+#ifdef __ANDROID__
+        volkLoadInstance(s_instance);
+#endif
+#ifdef __ANDROID__
+        if (!platform::android::CreateVulkanSurface(s_window, s_instance, &s_surface))
+#else
         if (!SDL_Vulkan_CreateSurface(s_window, s_instance, nullptr, &s_surface))
+#endif
         {
             fprintf(stderr, "[video] SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
             return false;
@@ -1244,26 +1861,8 @@ void main()
         vkEnumeratePhysicalDevices(s_instance, &count, nullptr);
         std::vector<VkPhysicalDevice> devices(count);
         vkEnumeratePhysicalDevices(s_instance, &count, devices.data());
-        for (VkPhysicalDevice d : devices)
-        {
-            uint32_t qc = 0;
-            vkGetPhysicalDeviceQueueFamilyProperties(d, &qc, nullptr);
-            std::vector<VkQueueFamilyProperties> qs(qc);
-            vkGetPhysicalDeviceQueueFamilyProperties(d, &qc, qs.data());
-            for (uint32_t i = 0; i < qc; i++)
-            {
-                VkBool32 present = VK_FALSE;
-                vkGetPhysicalDeviceSurfaceSupportKHR(d, i, s_surface, &present);
-                if ((qs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present)
-                {
-                    s_physical = d;
-                    s_queueFamily = i;
-                    break;
-                }
-            }
-            if (s_physical)
-                break;
-        }
+        devices.resize(count);
+        ChooseDevice(devices);
         if (!s_physical)
         {
             fprintf(stderr, "[video] no Vulkan device can present to the window\n");
@@ -1275,17 +1874,31 @@ void main()
         // The renderer needs dynamic rendering, and imports guest memory as
         // a buffer where the device can (host-memory import; Turnip, the
         // Steam Frame's driver, can't: the renderer's GPU copy instead).
-        std::vector<const char*> devExts = { VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-            VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,
-            VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME, VK_KHR_MULTIVIEW_EXTENSION_NAME, VK_KHR_MAINTENANCE_2_EXTENSION_NAME,
-            VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME };
+        std::vector<const char*> devExts(std::begin(kNeededDeviceExtensions), std::end(kNeededDeviceExtensions));
         uint32_t extAvail = 0;
         vkEnumerateDeviceExtensionProperties(s_physical, nullptr, &extAvail, nullptr);
         std::vector<VkExtensionProperties> avail(extAvail);
         vkEnumerateDeviceExtensionProperties(s_physical, nullptr, &extAvail, avail.data());
-        bool presentId = false, presentWait = false, hostImport = false, shadingRate = false;
+        // Diagnose the exact unsupported capability, before device creation
+        // collapses it into VK_ERROR_EXTENSION_NOT_PRESENT.
+        bool missingRequiredExtension = false;
+        for (const char* required : devExts)
+        {
+            bool found = std::any_of(avail.begin(), avail.end(), [required](const VkExtensionProperties& e) {
+                return strcmp(e.extensionName, required) == 0;
+            });
+            if (!found)
+            {
+                fprintf(stderr, "[video] required renderer extension missing: %s (GPU: %s)\n", required, props.deviceName);
+                missingRequiredExtension = true;
+            }
+        }
+        if (missingRequiredExtension)
+            return false;
+        bool presentId = false, presentWait = false, hostImport = false, shadingRate = false, displayTiming = false;
         for (auto& e : avail)
         {
+            displayTiming |= strcmp(e.extensionName, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) == 0;
             if (strcmp(e.extensionName, "VK_KHR_portability_subset") == 0)
                 devExts.push_back("VK_KHR_portability_subset");
             hostImport |= strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) == 0;
@@ -1335,6 +1948,29 @@ void main()
             devExts.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
             devExts.push_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
         }
+#if defined(__APPLE__) && !TARGET_OS_IOS
+        {
+            // Frames shown at a time need the watchdog, which needs the
+            // present waiter (VK_KHR_present_wait).
+            const char* v = std::getenv("NFSMW_PRESENT_AT");
+            const double ms = v ? std::atof(v) : double(kShowAfterVblankNs) / 1e6;
+            s_showAfterVblankNs = int64_t(std::clamp(ms, 0.0, 100.0) * 1e6);
+            s_schedule = PresentSchedule(!v ? PresentSchedule::Mode::Auto : s_showAfterVblankNs > 0 ? PresentSchedule::Mode::On
+                                                                                                   : PresentSchedule::Mode::Off);
+            // Auto, on a display that isn't a 120 Hz one at launch (a 60 Hz
+            // monitor, the macOS 15 VM): the extension isn't even enabled, so
+            // the session's device and presents are v0.1.3's (it isn't asked
+            // for again should the window move to a 120 Hz display later).
+            const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(s_window));
+            PresentSchedule launch;
+            launch.SetDisplayHz(mode ? mode->refresh_rate : 0.0f);
+            const bool mayShowAtTime = s_schedule.GetMode() == PresentSchedule::Mode::On ||
+                (s_schedule.GetMode() == PresentSchedule::Mode::Auto && launch.FastDisplay());
+            s_displayTiming = displayTiming && s_presentTiming && (mayShowAtTime || std::getenv("NFSMW_VBLANK_LOG"));
+        }
+#endif
+        if (s_displayTiming)
+            devExts.push_back(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
 
         float priority = 1.0f;
         VkDeviceQueueCreateInfo qci{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
@@ -1351,6 +1987,19 @@ void main()
         features.depthClamp = supported.depthClamp;
         features.samplerAnisotropy = supported.samplerAnisotropy;
         features.textureCompressionBC = supported.textureCompressionBC;
+#ifdef __ANDROID__
+        if (!supported.textureCompressionBC)
+            fprintf(stderr, "[video] GPU lacks native BC compression; see [texture-bc] for the compute decoder policy\n");
+        for (VkFormat format : { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC2_UNORM_BLOCK,
+            VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC5_UNORM_BLOCK })
+        {
+            VkFormatProperties fp{};
+            vkGetPhysicalDeviceFormatProperties(s_physical, format, &fp);
+            fprintf(stderr, "[video] BC format=%d optimal sampled=%d transfer-dst=%d\n", int(format),
+                bool(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT),
+                bool(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_DST_BIT));
+        }
+#endif
         features.shaderInt16 = supported.shaderInt16;
         VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamicRendering{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR };
         dynamicRendering.dynamicRendering = VK_TRUE;
@@ -1409,17 +2058,44 @@ void main()
         dci.ppEnabledExtensionNames = devExts.data();
         if (!Check(vkCreateDevice(s_physical, &dci, nullptr, &s_device), "vkCreateDevice"))
             return false;
+#ifdef __ANDROID__
+        volkLoadDevice(s_device);
+        platform::android::ReportVulkanDriver(s_physical);
+#endif
         vkGetDeviceQueue(s_device, s_queueFamily, 0, &s_queue);
         if (s_presentTiming)
             s_waitForPresent = (PFN_vkWaitForPresentKHR)vkGetDeviceProcAddr(s_device, "vkWaitForPresentKHR");
         s_presentTiming = s_waitForPresent != nullptr;
+#if defined(__APPLE__) && !TARGET_OS_IOS
+        // No frame is shown at a time without the driver's reports and the
+        // present waiter that reads them (the watchdog).
+        if (s_displayTiming && s_presentTiming)
+            s_pastTiming = (PFN_vkGetPastPresentationTimingGOOGLE)vkGetDeviceProcAddr(s_device, "vkGetPastPresentationTimingGOOGLE");
+        if (!s_pastTiming)
+            s_displayTiming = false;
+#endif
         if (s_presentTiming)
         {
             if (const char* path = std::getenv("NFSMW_VBLANK_LOG"))
                 if ((s_timingLog = fopen(path, "w")))
+                {
                     fprintf(s_timingLog, "id,vblank,presented,on_screen,timed,fit_valid,period_ns,grid_ns,rms_ns\n");
+#if defined(__APPLE__) && !TARGET_OS_IOS
+                    if (s_pastTiming && (s_actualLog = fopen((std::string(path) + ".actual.csv").c_str(), "w")))
+                        fprintf(s_actualLog, "# steady_ns %lld uptime_raw_ns %llu\nid,actual_ns\n", (long long)NowNs(),
+                            (unsigned long long)clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+#endif
+                }
             std::thread(PresentWaiter).detach();
         }
+#if defined(__APPLE__) && !TARGET_OS_IOS
+        if (s_displayTiming && s_showAfterVblankNs > 0 && s_schedule.GetMode() != PresentSchedule::Mode::Off)
+            fprintf(stderr, "[vblank] new frames shown %.2f ms after their vblank %s (VK_GOOGLE_display_timing, watched; "
+                "NFSMW_PRESENT_AT=0: never)\n", double(s_showAfterVblankNs) / 1e6, s_schedule.GetMode() == PresentSchedule::Mode::On
+                    ? "on any display (NFSMW_PRESENT_AT)" : "on a 120 Hz display the vblank isn't locked to");
+        else if (s_schedule.GetMode() == PresentSchedule::Mode::Auto)
+            fprintf(stderr, "[vblank] new frames shown when ready: not a 120 Hz display at launch, or no VK_GOOGLE_display_timing (not used)\n");
+#endif
         fprintf(stderr, "[vblank] %s\n", s_presentTiming ? "presents are timed (VK_KHR_present_wait)"
             : timingOff ? "presents aren't timed (NFSMW_PRESENT_TIMING=0): the guest vblank can't lock to the display"
             : "no present timing (VK_KHR_present_wait) on this device: the guest vblank can't lock to the display");
@@ -1463,7 +2139,7 @@ void main()
             hostQueryReset.hostQueryReset ? (PFN_vkResetQueryPool)vkGetDeviceProcAddr(s_device, "vkResetQueryPool") : nullptr };
         s_contextReady = true;
         s_settingsGeneration = settings::Generation();
-        fprintf(stderr, "[video] %s, swapchain %ux%u\n", props.deviceName, s_swapExtent.width, s_swapExtent.height);
+        fprintf(stderr, "[video] %s, swapchain %ux%u%s\n", props.deviceName, s_swapExtent.width, s_swapExtent.height, GeometryNote().c_str());
 #if defined(__APPLE__) && TARGET_OS_IOS
         if (s_presentScale < 1.0f)
         {
@@ -1479,7 +2155,7 @@ void main()
             const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(s_window));
             auto [nativeW, nativeH] = NativeMonitorMode();
             fprintf(stderr, "[video] screen %dx%d%s, monitor %dx%d, %s\n", mode ? mode->w : 0, mode ? mode->h : 0,
-                s_fullscreen ? " (fullscreen)" : "", nativeW, nativeH, s_gameMode ? "Game Mode (gamescope)" : "desktop");
+                s_fullscreen.Window() ? " (fullscreen)" : "", nativeW, nativeH, s_gameMode ? "Game Mode (gamescope)" : "desktop");
             // For the logs' system summary and bug reports (report/system_info.cpp).
             {
                 const char* type = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? "discrete"
@@ -1501,15 +2177,7 @@ void main()
                     props.deviceName, type, props.vendorID, props.deviceID, driver, VK_API_VERSION_MAJOR(props.apiVersion),
                     VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion), VK_API_VERSION_MAJOR(loader),
                     VK_API_VERSION_MINOR(loader), VK_API_VERSION_PATCH(loader)));
-                int windowW = 0, windowH = 0;
-                SDL_GetWindowSizeInPixels(s_window, &windowW, &windowH);
-                const char* name = SDL_GetDisplayName(SDL_GetDisplayForWindow(s_window));
-                report::SetSystemItem("Display", std::format("{} {}x{} at {:.2f} Hz{}; window {}x{} pixels{}, "
-                    "swapchain {}x{}, V-Sync {}; SDL video driver {}; {}", name ? name : "?", mode ? mode->w : 0, mode ? mode->h : 0,
-                    mode ? mode->refresh_rate : 0.0f, nativeW > 0 ? std::format(", monitor {}x{}", nativeW, nativeH) : std::string(),
-                    windowW, windowH, s_fullscreen ? " (fullscreen)" : "",
-                    s_swapExtent.width, s_swapExtent.height, s_vsync ? "on" : "off", SDL_GetCurrentVideoDriver(),
-                    s_gameMode ? "Game Mode (gamescope)" : "desktop"));
+                UpdateDisplayItem();
             }
             if (s_gameMode && mode && nativeW > 0 && int64_t(mode->w) * mode->h < int64_t(nativeW) * nativeH)
                 s_resolutionHint = std::format("Steam gives this game {}x{} of your {}x{} display. For full sharpness, set this game's "
@@ -1523,6 +2191,34 @@ void main()
             ui::Toast(s_resolutionHint, 15.0);
         }
         return true;
+    }
+
+    namespace
+    {
+        // The bug report's "Display" line: at start, and again with each
+        // swapchain of a new size (it said what the window was at launch).
+        void UpdateDisplayItem()
+        {
+            const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(s_window));
+#if defined(__APPLE__) && !TARGET_OS_IOS
+            s_displayHz = mode ? mode->refresh_rate : 0.0f;
+            {
+                std::lock_guard lock(s_scheduleMutex);
+                s_schedule.SetDisplayHz(s_displayHz);
+            }
+#endif
+            static const std::pair<int, int> native = NativeMonitorMode();
+            const auto [nativeW, nativeH] = native;
+            int windowW = 0, windowH = 0;
+            SDL_GetWindowSizeInPixels(s_window, &windowW, &windowH);
+            const char* name = SDL_GetDisplayName(SDL_GetDisplayForWindow(s_window));
+            report::SetSystemItem("Display", std::format("{} {}x{} at {:.2f} Hz{}; window {}x{} pixels{}, "
+                "swapchain {}x{}, V-Sync {}; SDL video driver {}; {}", name ? name : "?", mode ? mode->w : 0, mode ? mode->h : 0,
+                mode ? mode->refresh_rate : 0.0f, nativeW > 0 ? std::format(", monitor {}x{}", nativeW, nativeH) : std::string(),
+                windowW, windowH, s_fullscreen.Window() ? " (fullscreen)" : "",
+                s_swapExtent.width, s_swapExtent.height, s_vsync ? "on" : "off", SDL_GetCurrentVideoDriver(),
+                s_gameMode ? "Game Mode (gamescope)" : "desktop"));
+        }
     }
 
     void ReleaseFrontImage(VkImage image)
@@ -1635,18 +2331,27 @@ void main()
     {
         // NFSMW_WINDOW_AT=<s>:<w>x<h>,...: resize the window at those seconds
         // (NFSMW_UI_KEYS's clock), to test what follows the window's size,
-        // such as the Auto internal resolution, without a person.
+        // such as the Auto internal resolution, without a person. A step of
+        // <s>:full or <s>:windowed toggles fullscreen there instead (on
+        // macOS a fullscreen Space, as the green button makes), as the system
+        // would: the Fullscreen setting stays as it is.
         void ScriptedWindowSizes()
         {
-            struct Step { double at; int w, h; };
+            struct Step { double at; int w, h; };  // w -1: fullscreen, -2: windowed
             static std::vector<Step> steps = [] {
                 std::vector<Step> out;
                 const char* v = std::getenv("NFSMW_WINDOW_AT");
                 for (const char* p = v; p && *p;)
                 {
                     Step step{};
+                    char word[16] = {};
                     if (sscanf(p, "%lf:%dx%d", &step.at, &step.w, &step.h) == 3 && step.w > 0 && step.h > 0)
                         out.push_back(step);
+                    else if (sscanf(p, "%lf:%15[a-z]", &step.at, word) == 2 && (!strcmp(word, "full") || !strcmp(word, "windowed")))
+                    {
+                        step.w = word[0] == 'f' ? -1 : -2;
+                        out.push_back(step);
+                    }
                     p = strchr(p, ',');
                     p = p ? p + 1 : nullptr;
                 }
@@ -1658,6 +2363,12 @@ void main()
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < steps[next].at)
                 return;
             const Step& step = steps[next++];
+            if (step.w < 0)
+            {
+                fprintf(stderr, "[video] NFSMW_WINDOW_AT: %s\n", step.w == -1 ? "fullscreen" : "windowed");
+                SDL_SetWindowFullscreen(s_window, step.w == -1);
+                return;
+            }
             fprintf(stderr, "[video] NFSMW_WINDOW_AT: window %dx%d\n", step.w, step.h);
             SDL_SetWindowSize(s_window, step.w, step.h);
         }
@@ -1676,10 +2387,26 @@ void main()
         {
             switch (e->type)
             {
+#ifdef __ANDROID__
+            case SDL_EVENT_WINDOW_FOCUS_LOST:
+                if (s_window && e->window.windowID == SDL_GetWindowID(s_window)) {
+                    s_androidLifecycle.Focus(false); SuspendGame();
+                }
+                break;
+            case SDL_EVENT_WINDOW_FOCUS_GAINED:
+                if (s_window && e->window.windowID == SDL_GetWindowID(s_window) && s_androidLifecycle.Focus(true)) ResumeGame();
+                break;
+#endif
             case SDL_EVENT_WILL_ENTER_BACKGROUND:
+#ifdef __ANDROID__
+                s_androidLifecycle.Background(true);
+#endif
                 SuspendGame();
                 break;
             case SDL_EVENT_DID_ENTER_BACKGROUND:
+#ifdef __ANDROID__
+                s_androidLifecycle.Background(true);
+#endif
                 // Suspended already, unless "will resign active" never came:
                 // Metal must be idle in the background either way.
                 SuspendGame();
@@ -1691,7 +2418,14 @@ void main()
                 report::FlushLog();
                 break;
             case SDL_EVENT_DID_ENTER_FOREGROUND:
+#ifdef __ANDROID__
+                // The document picker can replace Android's native window.
+                // Rebuild its Vulkan surface on the render thread before use.
+                s_androidSurfaceStale.store(true, std::memory_order_release);
+                if (s_androidLifecycle.Background(false)) ResumeGame();
+#else
                 ResumeGame();
+#endif
                 break;
             default:
                 // SDL_EVENT_WILL_ENTER_FOREGROUND among them: the app is
@@ -1803,6 +2537,8 @@ void main()
 
     void SuspendGame()
     {
+        if (s_window)
+            s_swapPolicy.Suspended();
         // 1. Every guest clock stops at one instant. The game's threads, its
         // timers, the vblank and the audio cadence then park on their own:
         // nothing here waits for them.
@@ -1847,6 +2583,8 @@ void main()
             std::lock_guard lock(s_queueMutex);
             held = s_background.exchange(false, std::memory_order_acq_rel);
         }
+        if (s_window)
+            s_swapPolicy.Resumed();  // the swapchain is checked against the surface for a while
         if (held)
         {
             s_foreground.notify_all();
@@ -1902,11 +2640,70 @@ void main()
         s_testEventsWaiting.store(true, std::memory_order_release);
     }
 
+    namespace
+    {
+        // Builds the swapchain again when the policy says so
+        // (swapchain_policy.h), or (iOS) fits SDL's view back to its window.
+        // Once a frame, before the acquire. Main thread.
+        void CheckSwapchain()
+        {
+            SurfaceState state;
+            state.active = !s_background.load(std::memory_order_acquire);
+            state.swapchain = s_swapchain ? Extent{ s_swapExtent.width, s_swapExtent.height } : Extent{};
+            if (s_swapPolicy.WantsSurface())  // active or not: the policy holds off while inactive
+            {
+                state.surfaceRead = true;
+                state.surface = SurfaceExtent();
+                state.interface = InterfaceNow();
+                state.landscapeOnly = LandscapeOnlyHere();
+#if defined(__APPLE__) && TARGET_OS_IOS
+                state.viewFitsWindow = platform::ios::ViewFitsWindow(s_window);
+                // Turning the phone over (landscape left and right) changes
+                // no size, so nothing else would say so.
+                static const char* lastScene = nullptr;
+                if (const char* scene = platform::ios::SceneOrientationName(s_window); scene != lastScene)
+                {
+                    if (lastScene)
+                        fprintf(stderr, "[video] the interface turned: %s -> %s (swapchain %ux%u, surface %ux%u)\n", lastScene, scene,
+                            s_swapExtent.width, s_swapExtent.height, state.surface.width, state.surface.height);
+                    lastScene = scene;
+                }
+#endif
+            }
+            const SwapDecision d = s_swapPolicy.Decide(state);
+            if (d.settled)
+                fprintf(stderr, "[video] %u frames after the resume: swapchain %ux%u, surface %ux%u%s\n", s_swapPolicy.Rules().settleFrames,
+                    s_swapExtent.width, s_swapExtent.height, state.surface.width, state.surface.height, GeometryNote().c_str());
+            if (d.action == SwapAction::RepairView)
+            {
+                fprintf(stderr, "[video] size check: %s (surface %ux%u, swapchain %ux%u, interface %s)\n", d.reason, state.surface.width,
+                    state.surface.height, state.swapchain.width, state.swapchain.height, OrientationName(state.interface));
+#if defined(__APPLE__) && TARGET_OS_IOS
+                platform::ios::FitViewToWindow(s_window);  // SDL's resize events follow; the next frames look again
+#endif
+            }
+            else if (d.action == SwapAction::Recreate)
+            {
+                auto started = std::chrono::steady_clock::now();
+                WaitIdle();
+                DestroySwapchain();
+                s_swapReason = d.reason;
+                CreateSwapchain();  // at ChooseExtent of the surface then (d.extent, unless it moved since)
+                s_swapReason = nullptr;
+                s_swapRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+            }
+        }
+    }
+
     bool RunFrame()
     {
         DeliverTestAppEvents();
         ui::Tick();
         platform::thermal::Poll();  // about once a second
+        memstatus::Poll();          // iOS: the memory footprint, once a minute
+#if defined(__APPLE__) && TARGET_OS_IOS
+        platform::ios::PollBattery();  // every 5 seconds
+#endif
         ScriptedWindowSizes();
         SDL_Event e;
         while (SDL_PollEvent(&e))
@@ -1915,20 +2712,20 @@ void main()
             hid::HandleEvent(e);
             if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED)
                 return false;
-            if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED)
+            if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED || e.type == SDL_EVENT_WINDOW_RESIZED ||
+                e.type == SDL_EVENT_WINDOW_METAL_VIEW_RESIZED || e.type == SDL_EVENT_DISPLAY_ORIENTATION)
             {
-                // No GPU work while the app is inactive: the first frame
-                // after the resume rebuilds it.
-                if (s_background.load(std::memory_order_acquire))
-                    s_swapchainStale = true;
-                else
-                {
-                    WaitIdle();
-                    DestroySwapchain();
-                    CreateSwapchain();
-                }
+                // Only a reason to look: CheckSwapchain compares the surface
+                // with the swapchain, once the app is active (a size seen
+                // while it isn't may be iOS's snapshot of it, or SDL's guess).
+                s_swapPolicy.SizeChanged();
+#if defined(__APPLE__) && TARGET_OS_IOS
+                if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED)
+                    fprintf(stderr, "[video] window pixels %dx%d%s%s\n", e.window.data1, e.window.data2,
+                        s_background.load(std::memory_order_acquire) ? " (app inactive: checked after the resume)" : "", GeometryNote().c_str());
+#endif
             }
-            else if (e.type == SDL_EVENT_WINDOW_RESIZED)
+            if (e.type == SDL_EVENT_WINDOW_RESIZED)
                 RememberWindowSize();
             else if (e.type == SDL_EVENT_WINDOW_FOCUS_GAINED || e.type == SDL_EVENT_WINDOW_FOCUS_LOST)
                 s_focused.store(e.type == SDL_EVENT_WINDOW_FOCUS_GAINED, std::memory_order_relaxed);
@@ -1939,10 +2736,16 @@ void main()
                 s_visible.store(true, std::memory_order_relaxed);
             else if (e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN || e.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)
             {
-                // Also when the system toggled it (the green button on macOS).
-                s_fullscreen = e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN;
-                if (!FullscreenLocked() && !settings::EnvOverride(settings::Id::Fullscreen))
-                    settings::Set(settings::Id::Fullscreen, s_fullscreen);
+                // The window's state only. A change the game didn't ask for
+                // (the green button or Window > Enter Full Screen on a Mac, a
+                // window manager's key, a macOS fullscreen Space that didn't
+                // open at launch) lasts this session: the Fullscreen setting,
+                // the player's choice, still decides the next launch.
+                const bool on = e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN;
+                if (s_fullscreen.WindowIs(on) == FullscreenPolicy::Change::System)
+                    fprintf(stderr, "[video] fullscreen %s by the system (the window's fullscreen button or menu, or the window "
+                        "manager), for this session; the Fullscreen setting (%s) is unchanged and decides the next launch\n",
+                        on ? "on" : "off", settings::GetBool(settings::Id::Fullscreen) ? "On" : "Off");
             }
         }
         // Without the queue lock: the command processor's submits take it,
@@ -1964,13 +2767,25 @@ void main()
             hid::Resume();  // the game's last rumble again
             s_inputSuspended = false;
         }
-        if (s_swapchainStale)
+#ifdef __ANDROID__
+        if (s_androidSurfaceStale.exchange(false, std::memory_order_acq_rel))
         {
-            s_swapchainStale = false;
             WaitIdle();
             DestroySwapchain();
-            CreateSwapchain();
+            if (s_surface) vkDestroySurfaceKHR(s_instance, s_surface, nullptr);
+            s_surface = VK_NULL_HANDLE;
+            if (!platform::android::CreateVulkanSurface(s_window, s_instance, &s_surface))
+            {
+                fprintf(stderr, "[video] Android surface not ready: %s\n", SDL_GetError());
+                s_androidSurfaceStale.store(true, std::memory_order_release);
+                SDL_Delay(16);
+                return true;
+            }
+            fprintf(stderr, "[video] rebuilt Android surface after foreground transition\n");
+            s_swapPolicy.SizeChanged();
         }
+#endif
+        CheckSwapchain();
         SuspendAudit();
         hid::SetBlocked(ui::CapturingInput());
         hid::Update();
@@ -2082,16 +2897,35 @@ void main()
         }
         uint32_t imageIndex;
         VkResult acquire = vkAcquireNextImageKHR(s_device, s_swapchain, UINT64_MAX, f.imageAvailable, VK_NULL_HANDLE, &imageIndex);
+#ifdef __ANDROID__
+        if (acquire == VK_ERROR_SURFACE_LOST_KHR)
+        {
+            s_androidSurfaceStale.store(true, std::memory_order_release);
+            std::lock_guard lock(s_captureMutex);
+            for (auto& promise : captures) s_captureRequests.push_back(std::move(promise));
+            return true;
+        }
+#endif
+        // Either is for the next frame's CheckSwapchain, which runs before
+        // its acquire (one decision a frame: the policy counts in frames).
+        if (acquire == VK_SUBOPTIMAL_KHR)
+        {
+            ++s_suboptimalReports;
+            s_swapPolicy.Reported(SurfaceResult::Suboptimal);  // this frame is drawn and presented anyway
+        }
         if (acquire == VK_ERROR_OUT_OF_DATE_KHR)
         {
-            WaitIdle();
-            DestroySwapchain();
-            CreateSwapchain();
+            s_swapPolicy.Reported(SurfaceResult::OutOfDate);
             // Screenshots wait for the next frame drawn.
             std::lock_guard lock(s_captureMutex);
             for (auto& promise : captures)
                 s_captureRequests.push_back(std::move(promise));
             return true;
+        }
+        if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR)
+        {
+            fprintf(stderr, "[video] swapchain image acquisition failed: %d\n", int(acquire));
+            return false;
         }
         vkResetFences(s_device, 1, &f.inFlight);
 
@@ -2154,6 +2988,7 @@ void main()
         // non-uniform internal resolution such as 3x2 they differ.)
         float frameW = float(aspectW ? aspectW : w), frameH = float(aspectH ? aspectH : h);
         int32_t dw = int32_t(frameW), dh = int32_t(frameH);
+        float frameScaleX = 1.0f, frameScaleY = 1.0f;  // the view scales this frame is shown for
         if (haveSource)
         {
             // A new frame decides (and tells the game for the next ones); a
@@ -2174,7 +3009,22 @@ void main()
                 fit = PlacePicture(s_swapExtent.width, s_swapExtent.height, frameW, frameH, s_lastScaleX, s_lastScaleY);
             dw = fit.width;
             dh = fit.height;
+            frameScaleX = fit.scaleX;
+            frameScaleY = fit.scaleY;
         }
+        // Under Hor+ and Vert+ the post-processing keeps to each side of the
+        // 16:9 band's edge (video/band_filter.h): the frame's band and the
+        // strips past it are filtered as if each were the whole image.
+        // NFSMW_BAND_FILTER=0 filters across it as before (an A/B switch).
+        static const bool s_bandFilter = [] {
+            const char* v = std::getenv("NFSMW_BAND_FILTER");
+            const bool on = !(v && v[0] == '0');
+            if (!on)
+                fprintf(stderr, "[video] NFSMW_BAND_FILTER=0: anti-aliasing and scaling read across the 16:9 band's edge\n");
+            return on;
+        }();
+        const video::FrameBand band = video::BandOf(w, h, frameScaleX, frameScaleY);
+        const bool bandOn = s_bandFilter && (band.x0 > 0 || band.x1 < int32_t(w) || band.y0 > 0 || band.y1 < int32_t(h));
         int32_t dx = (int32_t(s_swapExtent.width) - dw) / 2, dy = (int32_t(s_swapExtent.height) - dh) / 2;
         // The picture without its letterbox bars, for a screenshot.
         VkRect2D pictureRect{};
@@ -2231,7 +3081,14 @@ void main()
                         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &in, nullptr, nullptr },
                         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &out, nullptr, nullptr },
                     };
-                    struct { int32_t width, height; float subpixel, pad; } pc = { int32_t(w), int32_t(h), 0.5f, 0.0f };
+                    struct
+                    {
+                        int32_t width, height;
+                        float subpixel;
+                        uint32_t bandOn;
+                        int32_t band[4];
+                    } pc = { int32_t(w), int32_t(h), 0.5f, bandOn ? 1u : 0u, { band.x0, band.x1, band.y0, band.y1 } };
+                    static_assert(sizeof(pc) == 32);
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_post.aa);
                     s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_post.aaLayout, 0, 2, writes);
                     vkCmdPushConstants(cmd, s_post.aaLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -2244,6 +3101,10 @@ void main()
                     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_timestamps, s_frameIndex * 3 + 1);
             }
 
+            // Brightness and the 360's display gamma: false at Brightness 0
+            // with the gamma off, and then the scale pass below is exactly as
+            // before.
+            const bool tone = scaleInput && PrepareTone(cmd);
             Barrier(cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0,
                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
             VkRenderingAttachmentInfoKHR color{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR };
@@ -2265,14 +3126,32 @@ void main()
                 VkRect2D scissor{ { dx, dy }, { uint32_t(dw), uint32_t(dh) } };
                 vkCmdSetViewport(cmd, 0, 1, &viewport);
                 vkCmdSetScissor(cmd, 0, 1, &scissor);
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_post.scale);
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tone ? s_tone.pipeline : s_post.scale);
                 VkDescriptorImageInfo in{ s_post.sampler, scaleInput, VK_IMAGE_LAYOUT_GENERAL };
                 VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &in, nullptr, nullptr };
-                s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_post.scaleLayout, 0, 1, &write);
+                const VkPipelineLayout scaleLayout = tone ? s_tone.layout : s_post.scaleLayout;
+                if (tone)
+                {
+                    VkDescriptorImageInfo table{ s_post.sampler, s_tone.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                    VkWriteDescriptorSet writes[2] = { write, write };
+                    writes[1].dstBinding = 1;
+                    writes[1].pImageInfo = &table;
+                    s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scaleLayout, 0, 2, writes);
+                }
+                else
+                    s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_post.scaleLayout, 0, 1, &write);
                 bool bicubic = Bicubic();
-                struct { float width, height, sharpen; uint32_t bicubic; } pc = { float(w), float(h), Sharpen(), bicubic ? 1u : 0u };
-                vkCmdPushConstants(cmd, s_post.scaleLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+                struct
+                {
+                    float width, height, sharpen;
+                    uint32_t bicubic;
+                    float band[4];
+                    uint32_t bandOn;
+                } pc = { float(w), float(h), Sharpen(), bicubic ? 1u : 0u, { float(band.x0), float(band.x1), float(band.y0), float(band.y1) },
+                    bandOn ? 1u : 0u };
+                static_assert(sizeof(pc) == 36);
+                vkCmdPushConstants(cmd, scaleLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
                 vkCmdDraw(cmd, 3, 1, 0, 0);
                 if (!captures.empty() && pictureRect.extent.width)
                 {
@@ -2443,6 +3322,53 @@ void main()
             presentId.pPresentIds = &id;
             pi.pNext = &presentId;
         }
+#if defined(__APPLE__) && !TARGET_OS_IOS
+        VkPresentTimeGOOGLE presentTime{};
+        VkPresentTimesInfoGOOGLE presentTimes{ VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE };
+        if (s_displayTiming)
+        {
+            presentTime.presentID = s_presentTiming ? uint32_t(id) : ++s_displayTimingId;
+            // A new frame, at its vblank's time where present_schedule.h
+            // says so. A redraw (menus over a paused game): when ready.
+            if (frameVblank && s_showAfterVblankNs > 0)
+            {
+                const bool locked = GuestVblank().Locked();
+                bool wanted, tripped;
+                {
+                    std::lock_guard lock(s_scheduleMutex);
+                    wanted = s_schedule.Wanted(locked);
+                    tripped = s_schedule.Tripped();
+                    if (wanted)
+                    {
+                        const int64_t desired = frameVblank + s_showAfterVblankNs;
+                        s_scheduled[s_scheduledNext++ % std::size(s_scheduled)] = { presentTime.presentID, desired, false };
+                        presentTime.desiredPresentTime = uint64_t(std::max<int64_t>(desired - HostToSteadyNs(), 0));
+                    }
+                }
+                // A line when it changes (the first few).
+                static int last = -1, lines = 0;
+                if (int(wanted) != last && lines < 8)
+                {
+                    lines++;
+                    fprintf(stderr, "[vblank] new frames shown %s\n", wanted ? "at their vblank's time"
+                        : tripped ? "when ready (the watchdog)"
+                        : locked ? "when ready: the vblank is locked to the display"
+                        : std::format("when ready: a {:.2f} Hz display", s_displayHz).c_str());
+                }
+                last = int(wanted);
+            }
+            // Only a frame shown at a time carries the driver's present
+            // times (and, for NFSMW_VBLANK_LOG, every present): the rest are
+            // presented exactly as in v0.1.3.
+            if (presentTime.desiredPresentTime || s_actualLog)
+            {
+                presentTimes.swapchainCount = 1;
+                presentTimes.pTimes = &presentTime;
+                presentTimes.pNext = pi.pNext;
+                pi.pNext = &presentTimes;
+            }
+        }
+#endif
         int64_t presented = NowNs();
         VkResult present = vkQueuePresentKHR(s_queue, &pi);
         queueLock.unlock();
@@ -2491,12 +3417,27 @@ void main()
             vkDestroyBuffer(s_device, captureBuffer, nullptr);
             vkFreeMemory(s_device, captureMemory, nullptr);
         }
+#ifdef __ANDROID__
+        if (present == VK_ERROR_SURFACE_LOST_KHR)
+            s_androidSurfaceStale.store(true, std::memory_order_release);
+        else
+#endif
+        // The next frame's CheckSwapchain builds again (before its acquire).
         if (present == VK_ERROR_OUT_OF_DATE_KHR || present == VK_SUBOPTIMAL_KHR)
         {
-            WaitIdle();
-            DestroySwapchain();
-            CreateSwapchain();
+            s_suboptimalReports += present == VK_SUBOPTIMAL_KHR;
+            s_swapPolicy.Reported(present == VK_ERROR_OUT_OF_DATE_KHR ? SurfaceResult::OutOfDate : SurfaceResult::Suboptimal);
         }
+#ifdef __ANDROID__
+        static auto lastSurfaceLog = std::chrono::steady_clock::now();
+        if (auto now = std::chrono::steady_clock::now(); now - lastSurfaceLog >= std::chrono::seconds(5))
+        {
+            fprintf(stderr, "[surface-health] creates %llu suboptimal_reports %llu policy_rebuild_ms %.3f follow_suboptimal %d (cumulative)\n",
+                (unsigned long long)s_swapCreations, (unsigned long long)s_suboptimalReports, s_swapRebuildMs,
+                int(s_swapPolicy.Rules().followSuboptimal));
+            lastSurfaceLog = now;
+        }
+#endif
         s_frameIndex = (s_frameIndex + 1) % FRAMES_IN_FLIGHT;
         return true;
     }
@@ -2588,6 +3529,16 @@ void main()
         return s_contextReady ? &s_context : nullptr;
     }
 
+    bool WindowFullscreen()
+    {
+        return s_fullscreen.Window();
+    }
+
+    bool FullscreenWindowDiffers()
+    {
+        return s_fullscreen.WindowDiffers();
+    }
+
     bool FullscreenLocked()
     {
 #if defined(__APPLE__) && TARGET_OS_IOS
@@ -2597,6 +3548,11 @@ void main()
 #else
         return s_gameMode;
 #endif
+    }
+
+    bool GameMode()
+    {
+        return s_gameMode;
     }
 
     void FrameRegion(uint32_t& width, uint32_t& height)

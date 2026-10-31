@@ -27,7 +27,7 @@ PREFIX="$(cd "$PREFIX" && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ffmpeg-xma.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-tar -xf "$TARBALL" -C "$WORK"
+tar --no-same-owner -xf "$TARBALL" -C "$WORK"
 SRC="$(find "$WORK" -mindepth 1 -maxdepth 1 -type d -name 'ffmpeg-*' | head -1)"
 [ -n "$SRC" ] || { echo "build_ffmpeg_xma.sh: no ffmpeg-* folder in $TARBALL" >&2; exit 1; }
 cd "$SRC"
@@ -35,7 +35,8 @@ for p in "$ROOT"/patches/ffmpeg/*.patch; do patch -s -p1 < "$p"; done
 ./configure --disable-everything --disable-programs --disable-doc --disable-debug \
     --disable-network --disable-autodetect --disable-avdevice --disable-avformat --disable-swscale \
     --disable-swresample --disable-postproc --disable-avfilter \
-    --enable-decoder=xma1,xma2,wmapro --enable-static --disable-shared --enable-pic "$@" > "$WORK/configure.log"
+    --enable-decoder=xma1,xma2,wmapro --enable-static --disable-shared --enable-pic "$@" > "$WORK/configure.log" \
+  || { tail -5 "$WORK/configure.log"; tail -15 ffbuild/config.log; echo "build_ffmpeg_xma.sh: configure failed"; exit 1; } >&2
 make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)" > "$WORK/make.log"
 make install DESTDIR="$WORK/stage" > "$WORK/install.log"
 # The default prefix (/usr/local) inside the stage, moved to its place.

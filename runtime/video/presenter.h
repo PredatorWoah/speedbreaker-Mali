@@ -153,6 +153,17 @@ namespace video
     // there.
     bool FullscreenLocked();
 
+    // Main thread: whether the window is fullscreen now, and whether that
+    // differs from Settings > Display > Fullscreen because the system changed
+    // it this session (the green button; video/fullscreen_policy.h).
+    bool WindowFullscreen();
+    bool FullscreenWindowDiffers();
+
+    // SteamOS Game Mode (gamescope; NFSMW_GAME_MODE=1|0 says otherwise), as
+    // detected when the window was made. No desktop is on screen there, so a
+    // system file dialog can't be seen either.
+    bool GameMode();
+
     // NFSMW_PRESENT_SCALE (iOS): the present scale it sets for this run, over
     // Settings > Display > Screen Resolution; 0 when it isn't set.
     float PresentScaleOverride();

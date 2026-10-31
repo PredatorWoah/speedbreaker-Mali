@@ -9,8 +9,22 @@
 #include <debug/timeline.h>
 #include <unordered_set>
 #include "block_ranges.h"
+#include "bc_decode_glsl.h"
+#include "edge_bars.h"
+#include "memory_plan.h"
+#include "pipeline_cache_header.h"
 #include "shader_translator.h"
 #include "zpd_report.h"
+#include "visual_capture.h"
+#include <report/zip.h>
+#include "depth24_glsl.h"
+#include "depth_only.h"
+#include "depth_stage.h"
+#include "early_depth.h"
+#include "android_schedule.h"
+#include "performance_window.h"
+#include "pass_timing.h"
+#include "render_scale.h"
 #include "shared_memory_glsl.h"
 #include "xenos/registers.h"
 
@@ -18,7 +32,9 @@
 #include <kernel/write_watch.h>
 #include <video/presenter.h>
 #include <video/picture_fit.h>
+#include <video/scale_budget.h>
 #include <user/paths.h>
+#include <report/report.h>
 #include <user/settings.h>
 #include <game/ultrawide.h>
 
@@ -26,6 +42,8 @@
 #include <glslang/Public/resource_limits_c.h>
 
 #include <array>
+#include <ctime>
+#include <fstream>
 #include <cmath>
 #include <condition_variable>
 #include <cstdarg>
@@ -167,16 +185,6 @@ namespace gpu::renderer
             return 0;
         }
 
-        // `prefer` when some type has it (e.g. device-local and host-visible:
-        // VRAM the CPU can write, with resizable BAR), else `want`.
-        uint32_t FindMemoryTypePreferring(uint32_t bits, VkMemoryPropertyFlags prefer, VkMemoryPropertyFlags want)
-        {
-            for (uint32_t i = 0; i < s_memProps.memoryTypeCount; i++)
-                if ((bits & (1u << i)) && (s_memProps.memoryTypes[i].propertyFlags & prefer) == prefer)
-                    return i;
-            return FindMemoryType(bits, want);
-        }
-
         // Guest physical memory (512 MB), imported without a copy.
         constexpr VkDeviceSize kSharedSize = 512ull << 20;
         VkBuffer s_shared = VK_NULL_HANDLE;
@@ -233,11 +241,13 @@ namespace gpu::renderer
         {
             return { buffer ? buffer : s_shared, 0, buffer || !s_splitMemory ? VK_WHOLE_SIZE : kSharedPart };
         }
-        // Discrete GPUs, and drivers that can't import the guest's memory
-        // (amdgpu imports only anonymous memory, and guest physical memory is
-        // a shared mapping, mirrored three times): the GPU gets its own copy
-        // (VRAM the CPU writes through resizable BAR when there is one), kept
-        // current page by page from the write watch (writewatch::SyncShadow).
+        // Discrete GPUs whose CPU-mapped VRAM holds it, and drivers that can't
+        // import the guest's memory (amdgpu imports only anonymous memory, and
+        // guest physical memory is a shared mapping, mirrored three times;
+        // Intel's Linux driver loses the device when the write watch protects
+        // imported pages): the GPU gets its own copy, kept current page by
+        // page from the write watch (writewatch::SyncShadow). Where it goes,
+        // and when guest memory is imported instead: gpu/memory_plan.h.
         // NFSMW_SHARED_MEMORY=import|shadow overrides the choice.
         bool s_shadowMode = false;
         bool s_shadowInVram = false;  // (the "ready" line)
@@ -253,7 +263,16 @@ namespace gpu::renderer
         // Upload ring: draw constants, converted indices and texture staging.
         // One slot per in-flight submission, so a slot is reused only after
         // the GPU finished with it.
-        constexpr uint32_t kSlots = 12;
+        // The ring is also bound as one storage-buffer descriptor. Vulkan's
+        // minimum maxStorageBufferRange is 128 MiB (also the RP6's limit), so
+        // the old 12 x 16 MiB descriptor exceeded that device's limit.
+        // Begin waits for the slot's fence before reusing it, including when
+        // a busy frame wraps this smaller Android ring more than once.
+#ifdef __ANDROID__
+        constexpr uint32_t kSlots = 4;
+#else
+        constexpr uint32_t kSlots = 8;
+#endif
         constexpr VkDeviceSize kSlotSize = 16ull << 20;
         constexpr VkDeviceSize kRingSize = kSlots * kSlotSize;
         VkBuffer s_ring = VK_NULL_HANDLE;
@@ -261,9 +280,45 @@ namespace gpu::renderer
         uint8_t* s_ringHost = nullptr;
         VkDeviceSize s_ringOffset = 0;
 
-        // XenosConstants (shader_translator.cpp): c[512], fetch[48], bools[2],
-        // loops[8], drawInfo[4], each a vec4/uvec4.
-        constexpr uint32_t kConstantsSize = (512 + 48 + 2 + 8 + 4) * 16;
+        // XenosConstants (shader_translator.cpp): fetch[48], bools[2], loops[8],
+        // drawInfo[4], textureReciprocal[32], then c[512], each a vec4/uvec4.
+        // An upload is the fixed part and the float constants the draw's two
+        // shaders read (packed: ~20 each, else 256), not all 512; the
+        // descriptor still spans kConstantsSize, so the ring has that much
+        // after its last upload (CreateRing). The rest is never read.
+        constexpr uint32_t kFetchOffset = 0;
+        constexpr uint32_t kBoolsOffset = 48 * 16;
+        constexpr uint32_t kLoopsOffset = (48 + 2) * 16;
+        constexpr uint32_t kDrawInfoOffset = (48 + 2 + 8) * 16;
+        constexpr uint32_t kTextureReciprocalOffset = (48 + 2 + 8 + 4) * 16;
+        constexpr uint32_t kFloatConstOffset = (48 + 2 + 8 + 4 + 32) * 16;
+        constexpr uint32_t kConstantsSize = kFloatConstOffset + 512 * 16;
+
+        // Vertex snapshot reuse. A draw copies each small vertex range it reads
+        // into the ring (the shader reads the copy); the same meshes come
+        // again in the same submission (each shadow cascade, the mirror, the
+        // main view), ~14 MB of copies a frame in free roam. NFSMW_SNAPSHOT_REUSE:
+        // 0 (default) copies every time; 1 serves a repeat from the earlier copy
+        // in this submission's slot while the guest has not written the range;
+        // 2 only measures (what share of repeats would have been identical),
+        // reading the ring back, so a profiling mode.
+        // A range is watched only from its second copy in a submission (a
+        // watched page's CPU write faults, which the per-frame dynamic buffers
+        // would pay every frame); the third draw on is served from the copy.
+        // Watch first, then Current(), then the copy: a write after Watch
+        // moves the range's sequence past Current(), so it is never missed.
+        const uint32_t s_snapshotMode = [] { const char* v = std::getenv("NFSMW_SNAPSHOT_REUSE"); return v ? uint32_t(std::atoi(v)) : 0u; }();
+        struct SnapshotEntry
+        {
+            uint64_t key = 0;         // base << 32 | size
+            uint64_t submission = 0;  // s_submissionCounter of the copy (its ring slot is only good while that one records)
+            VkDeviceSize offset = 0;  // ring offset of the copy
+            uint64_t sequence = 0;    // writewatch::Current() before the watched copy
+            uint8_t stage = 0;        // 1: copied once, 2: watched
+        };
+        constexpr uint32_t kSnapshotEntries = 2048;
+        SnapshotEntry s_snapshotTable[kSnapshotEntries];
+        inline SnapshotEntry& SnapshotSlot(uint64_t key) { return s_snapshotTable[(key * 0x9E3779B97F4A7C15ull) >> 53]; }
 
         // Image memory. Images are bound at offsets into blocks of device
         // memory (64 MB; gpu/block_ranges.h keeps each block's free ranges),
@@ -307,7 +362,12 @@ namespace gpu::renderer
         const bool s_imagePool = [] { const char* v = std::getenv("NFSMW_IMAGE_POOL"); return !v || v[0] != '0'; }();
         const VkDeviceSize s_blockSize = [] {
             const char* v = std::getenv("NFSMW_IMAGE_BLOCK_MB");
-            return VkDeviceSize(v ? std::clamp(std::atoi(v), 16, 1024) : 64) << 20;
+#ifdef __ANDROID__
+            constexpr int defaultMb = 32;
+#else
+            constexpr int defaultMb = 64;
+#endif
+            return VkDeviceSize(v ? std::clamp(std::atoi(v), 16, 1024) : defaultMb) << 20;
         }();
         std::vector<std::unique_ptr<ImageBlock>> s_blocks;  // in use (command processor)
         // Empty blocks by memory type, the newest last, under s_spareMutex:
@@ -636,11 +696,40 @@ namespace gpu::renderer
         // and end (2 queries per slot).
         VkQueryPool s_timestamps = VK_NULL_HANDLE;  // NFSMW_GPU_TIMING=1 (each costs a blit encoder on MoltenVK)
         double s_timestampPeriod = 1.0;
+        uint32_t s_timestampBits = 0;
 
+        // Sample normal racing without readbacks, Flush or extra submissions.
+        // Each pool belongs to a command-buffer slot, reset only after its fence
+        // and harvested before that slot is released. Ordered timestamp markers
+        // can perturb overlap; sampled frames are explicitly marked in the CSV.
+        bool s_passTimingEnabled = false, s_passTimingSample = false;
+        uint64_t s_passTimingFrame = 0;
+        gpu::timing::Schedule s_passTimingSchedule;
+        struct TimedRegion
+        {
+            const char* kind = "unknown";
+            uint64_t frame = 0, vs = 0, ps = 0, firstVs = 0, firstPs = 0;
+            uint32_t width = 0, height = 0, base = 0, format = 0;
+            uint32_t depthBase = 0, colorMask = 0, draws = 0, depthOnlyDraws = 0;
+            uint32_t loadMask = 0, storeMask = 0, alphaDraws = 0;
+            uint64_t bytes = 0, vertices = 0, indices = 0;
+            uint32_t noFragmentDraws = 0, eligibleDepthDraws = 0, snapshotDraws = 0, snapshotRanges = 0;
+            uint64_t snapshotBytes = 0;
+        };
+        struct TimedSlot
+        {
+            VkQueryPool pool = VK_NULL_HANDLE;
+            gpu::timing::Ledger ledger;
+            std::array<TimedRegion, gpu::timing::MaxRegions> regions;
+        } s_timedSlots[kSlots];
+        int s_timedPass = -1;
+        uint64_t s_timingSampledInWindow = 0;
         // NFSMW_PASS_PROFILE=<frame>: time every render pass of one frame and
         // print them (targets, area, draws, GPU us). 256 passes max.
         const int s_profileFrame = [] { const char* v = std::getenv("NFSMW_PASS_PROFILE"); return v ? std::atoi(v) : -1; }();
         VkQueryPool s_passQueries = VK_NULL_HANDLE;
+        visual::Capture s_visual;
+        uint64_t s_visualDepthResolves = 0;
         // Per profiled pass, also what was recorded in the gap before it:
         // resolves, texture uploads, submissions, guest memory synced to the
         // GPU copy (KB).
@@ -659,6 +748,7 @@ namespace gpu::renderer
         uint64_t s_lastConstantsSubmission = 0; // submission holding s_lastConstantsOffset
         const void* s_lastConstLayoutVs = nullptr;  // the layout of that upload (see Draw)
         const void* s_lastConstLayoutPs = nullptr;
+        bool s_lastNeutralCurve = false;  // the last upload had the yellow filter's blue raised (Remove Game Yellow Filter)
         VkCommandBuffer s_cmd = VK_NULL_HANDLE;
         bool s_recording = false;
         std::chrono::steady_clock::time_point s_recordStart;
@@ -668,6 +758,76 @@ namespace gpu::renderer
         // NFSMW_LOG_LATENCY: time with nothing in flight (under s_submitMutex).
         std::chrono::steady_clock::time_point s_emptySince = std::chrono::steady_clock::now();
         double s_emptyUs = 0;
+
+        int TimingBegin(const char* kind, uint32_t width = 0, uint32_t height = 0,
+                        uint32_t base = 0, uint32_t format = 0, uint64_t bytes = 0)
+        {
+            if (!s_passTimingSample || !s_recording) return -1;
+            auto& slot = s_timedSlots[s_slot];
+            if (!slot.pool) return -1;
+            int index = slot.ledger.Add();
+            if (index < 0) return -1;
+            slot.regions[index] = { .kind = kind, .frame = s_passTimingFrame,
+                .width = width, .height = height, .base = base, .format = format, .bytes = bytes };
+            vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, slot.pool, uint32_t(index) * 2);
+            return index;
+        }
+        void TimingEnd(int index)
+        {
+            if (index >= 0)
+                vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                    s_timedSlots[s_slot].pool, uint32_t(index) * 2 + 1);
+        }
+        void TimingHarvest(uint32_t index, uint64_t submission, double submissionUs)
+        {
+            const auto& slot = s_timedSlots[index];
+            if (!slot.ledger.used && !slot.ledger.dropped) return;
+            uint64_t results[gpu::timing::MaxRegions * 4] = {};
+            VkResult status = vkGetQueryPoolResults(s_dev, slot.pool, 0, slot.ledger.used * 2,
+                slot.ledger.used * 4 * sizeof(uint64_t), results, 2 * sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            const bool readable = status == VK_SUCCESS || status == VK_NOT_READY;
+            static uint32_t rows = 0;
+            static FILE* csv = [] {
+                auto path = GetUserPath() / "logs" / ("gpu-passes-" + std::to_string(std::time(nullptr)) + ".csv");
+                std::error_code error; std::filesystem::create_directories(path.parent_path(), error);
+                FILE* out = fopen(path.c_str(), "w");
+                if (out) fputs("frame,submission,slot,region,kind,status,gpu_us,gap_before_us,width,height,base,format,depth_base,color_mask,draws,depth_only_draws,last_vs_hash,last_ps_hash,bytes,dropped_regions,submission_gpu_us,attachment_load_mask,attachment_store_mask,alpha_test_draws,no_fragment_requested_draws,eligible_no_fragment_draws,nonindexed_vertices,index_elements,first_vs_hash,first_ps_hash,snapshot_draws,snapshot_upload_ranges,snapshot_upload_bytes\n", out);
+                fprintf(stderr, "[gpu-pass] output %s (%s); ordered GPU intervals, sampled frames may be perturbed; no readbacks or waits\n",
+                    path.string().c_str(), out ? "ready" : "FAILED");
+                return out;
+            }();
+            double total = 0; uint32_t unavailable = 0;
+            uint64_t last = 0; bool lastReady = false;
+            for (uint32_t i = 0; i < slot.ledger.used; ++i)
+            {
+                const auto& region = slot.regions[i];
+                const uint64_t* ts = results + i * 4;
+                bool ready = readable && ts[1] && ts[3];
+                double us = gpu::timing::Microseconds(ts[0], ts[2], ready, ready, s_timestampBits, s_timestampPeriod);
+                double gap = gpu::timing::Microseconds(last, ts[0], lastReady, ready, s_timestampBits, s_timestampPeriod);
+                if (us < 0) ++unavailable; else total += us;
+                if (csv && rows < 40000)
+                {
+                    fprintf(csv, "%llu,%llu,%u,%u,%s,%d,%.3f,%.3f,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%016llx,%llu,%u,%.3f,%u,%u,%u,%u,%u,%llu,%llu,%016llx,%016llx,%u,%u,%llu\n",
+                        (unsigned long long)region.frame, (unsigned long long)submission, index, i, region.kind,
+                        ready ? 0 : int(status == VK_SUCCESS ? VK_NOT_READY : status), us, gap,
+                        region.width, region.height, region.base, region.format, region.depthBase, region.colorMask,
+                        region.draws, region.depthOnlyDraws, (unsigned long long)region.vs, (unsigned long long)region.ps,
+                        (unsigned long long)region.bytes, slot.ledger.dropped, submissionUs, region.loadMask, region.storeMask, region.alphaDraws,
+                        region.noFragmentDraws, region.eligibleDepthDraws,
+                        (unsigned long long)region.vertices, (unsigned long long)region.indices,
+                        (unsigned long long)region.firstVs, (unsigned long long)region.firstPs,
+                        region.snapshotDraws, region.snapshotRanges, (unsigned long long)region.snapshotBytes);
+                    ++rows;
+                }
+                last = ts[2]; lastReady = ready;
+            }
+            if (csv) fflush(csv);
+            fprintf(stderr, "[gpu-pass] submission %llu: %u regions %.3f ms (submission %.3f ms), %u unavailable, %u dropped (sampled)\n",
+                (unsigned long long)submission, slot.ledger.used, total / 1000.0, submissionUs / 1000.0, unavailable, slot.ledger.dropped);
+        }
+
 
         // Occlusion queries counted on the GPU (NFSMW_OCCLUSION=1; the
         // presenter decides: VulkanContext::occlusionCounting). Command
@@ -817,6 +977,10 @@ namespace gpu::renderer
             s_recording = true;
             s_stateEpoch++;
             s_recordStart = std::chrono::steady_clock::now();
+            auto& timing = s_timedSlots[s_slot];
+            timing.ledger = {};
+            if (timing.pool)
+                vkCmdResetQueryPool(s_cmd, timing.pool, 0, gpu::timing::MaxRegions * 2);
             if (s_timestamps)
             {
                 vkCmdResetQueryPool(s_cmd, s_timestamps, s_slot * 2, 2);
@@ -1055,15 +1219,20 @@ namespace gpu::renderer
                 if (now > start)
                     s_gpuBusyUs += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - start).count());
                 s_lastCompletion = now;
+                double submissionUs = -1;
                 if (s_timestamps)
                 {
                     uint64_t ts[2];
                     if (vkGetQueryPoolResults(s_dev, s_timestamps, slot * 2, 2, sizeof(ts), ts, sizeof(uint64_t),
-                            VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] > ts[0])
-                        s_gpuExecNs += uint64_t(double(ts[1] - ts[0]) * s_timestampPeriod);
+                            VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+                    {
+                        submissionUs = gpu::timing::Microseconds(ts[0], ts[1], true, true, s_timestampBits, s_timestampPeriod);
+                        s_gpuExecNs += uint64_t(submissionUs * 1000.0);
+                    }
                 }
                 if (!sub.zpdSegments.empty())
                     ZpdHarvest(slot, sub);
+                TimingHarvest(slot, sub.number, submissionUs);
                 {
                     // Writes run under the lock so QueueWrite can't append to
                     // a submission that is being retired.
@@ -1192,6 +1361,25 @@ namespace gpu::renderer
             s_vertexPendingTextures.clear();
             s_narrowPassEnds = 0;
         }
+
+#ifdef __ANDROID__
+        int s_androidScheduling = -1;
+        void ApplyAndroidScheduling(uint64_t nextFrame)
+        {
+            // Explicit legacy environment overrides keep their old behavior.
+            if (std::getenv("NFSMW_PASS_BARRIER")) return;
+            const int mode = settings::GetInt(settings::Id::GpuScheduling);
+            const uint32_t level = gpu::AndroidBarrierLevel(mode, nextFrame);
+            if (mode == s_androidScheduling && level == s_passBarrier) return;
+            // Changes occur between frames. Retain a complete dependency for
+            // any work still recorded under the preceding policy.
+            if (s_recording) { EndPass(); FullBarrier(); }
+            s_androidScheduling = mode;
+            s_passBarrier = level;
+            fprintf(stderr, "[schedule] frame %llu mode %d barrier %u (0 conservative, 2 overlap, 4 compare)\n",
+                (unsigned long long)nextFrame, mode, level);
+        }
+#endif
 
         // `src` stages' work (and, in Vulkan, everything logically earlier)
         // -> every stage after but the vertex ones: on MoltenVK nothing waits
@@ -1339,14 +1527,38 @@ namespace gpu::renderer
             uint64_t hash;
             TranslatedShader info;         // immutable once loaded
             std::mutex compileMutex;
-            bool vertexCompiled = false;
-            VkShaderModule module = VK_NULL_HANDLE;  // VS
+            // VS variants by primitive expansion mode. Ordinary triangle/line
+            // draws do not carry the rectangle synthesis path into the driver.
+            std::unordered_map<uint32_t, VkShaderModule> vertices;
             // PS variants by (colour outputs, interpolator inputs, alpha test).
             std::unordered_map<uint32_t, VkShaderModule> variants;
         };
         std::unordered_map<uint64_t, std::unique_ptr<Shader>> s_shaders;
         Shader* s_vs = nullptr;
         Shader* s_ps = nullptr;
+
+        // Depth-only draws run no pixel shader on Xenos (depth_only.h): they
+        // get this empty one instead of the guest's bound one, left over from
+        // earlier draws. NFSMW_DEPTH_ONLY_PS=1 runs the bound one, as up to
+        // v0.1.2 (A/B only).
+        bool s_depthStageReduction = false;
+        constexpr uint64_t kDepthOnlyPsHash = 0xDE97400000000001ull;  // (a guest shader hashing to it: a 2^-64 chance)
+        const bool s_depthOnlyGuestPs = [] { const char* v = std::getenv("NFSMW_DEPTH_ONLY_PS"); return v && v[0] == '1'; }();
+
+        Shader* DepthOnlyPixelShader()
+        {
+            static Shader* const ps = [] {
+                auto& slot = s_shaders[kDepthOnlyPsHash];
+                slot = std::make_unique<Shader>();
+                slot->stage = ShaderStage::Pixel;
+                slot->hash = kDepthOnlyPsHash;
+                slot->info.ok = true;
+                slot->info.constPacked = true;  // (reads no constants: none uploaded for it)
+                slot->info.glsl = gpu::kEmptyPixelShaderGlsl;
+                return slot.get();
+            }();
+            return ps;
+        }
 
         // IM_LOAD shaders by where they are (LoadShader). A dense frame loads
         // thousands, the same few hundred from the same addresses, and
@@ -1384,14 +1596,19 @@ namespace gpu::renderer
         // NFSMW_SHADER_CACHE=0 disables it.
         const bool s_shaderCacheEnabled = [] { const char* v = std::getenv("NFSMW_SHADER_CACHE"); return !v || v[0] != '0'; }();
 
-        std::filesystem::path ShaderCacheFile(const std::string& source, glslang_stage_t stage, const std::string& preamble)
+        std::filesystem::path ShaderCacheFile(const std::string& source, glslang_stage_t stage, const std::string& preamble,
+            bool legacySpirv = false)
         {
             uint64_t h = 0xCBF29CE484222325ull;
             auto mix = [&](const void* data, size_t size) {
                 for (size_t i = 0; i < size; i++)
                     h = (h ^ static_cast<const uint8_t*>(data)[i]) * 0x100000001B3ull;
             };
-            const uint32_t format = 1;  // bump when the compile options below change
+#ifdef __ANDROID__
+            const uint32_t format = legacySpirv ? 3 : 2;  // optimized SPIR-V 1.3 / 1.5
+#else
+            const uint32_t format = 1;
+#endif
             mix(&format, sizeof(format));
             mix(&stage, sizeof(stage));
             mix(preamble.data(), preamble.size());
@@ -1401,16 +1618,16 @@ namespace gpu::renderer
         }
 
         std::vector<uint32_t> CompileGlslUncached(const std::string& source, glslang_stage_t stage, std::string& log,
-            const std::string& preamble);
+            const std::string& preamble, bool legacySpirv = false);
         std::atomic<uint64_t> s_shaderCacheHits{ 0 };
 
         std::vector<uint32_t> CompileGlsl(const std::string& source, glslang_stage_t stage, std::string& log,
-            const std::string& shaderPreamble = {})
+            const std::string& shaderPreamble = {}, bool legacySpirv = false)
         {
             const std::string preamble = s_splitMemory ? "#define SPLIT_MEMORY\n" + shaderPreamble : shaderPreamble;
             if (!s_shaderCacheEnabled)
-                return CompileGlslUncached(source, stage, log, preamble);
-            std::filesystem::path file = ShaderCacheFile(source, stage, preamble);
+                return CompileGlslUncached(source, stage, log, preamble, legacySpirv);
+            std::filesystem::path file = ShaderCacheFile(source, stage, preamble, legacySpirv);
             if (FILE* f = fopen(file.c_str(), "rb"))
             {
                 std::vector<uint32_t> spirv;
@@ -1430,7 +1647,7 @@ namespace gpu::renderer
                     return spirv;
                 }
             }
-            std::vector<uint32_t> spirv = CompileGlslUncached(source, stage, log, preamble);
+            std::vector<uint32_t> spirv = CompileGlslUncached(source, stage, log, preamble, legacySpirv);
             if (!spirv.empty())
             {
                 std::error_code ec;
@@ -1452,15 +1669,15 @@ namespace gpu::renderer
         }
 
         std::vector<uint32_t> CompileGlslUncached(const std::string& source, glslang_stage_t stage, std::string& log,
-            const std::string& preamble)
+            const std::string& preamble, bool legacySpirv)
         {
             glslang_input_t input{};
             input.language = GLSLANG_SOURCE_GLSL;
             input.stage = stage;
             input.client = GLSLANG_CLIENT_VULKAN;
-            input.client_version = GLSLANG_TARGET_VULKAN_1_2;
+            input.client_version = legacySpirv ? GLSLANG_TARGET_VULKAN_1_1 : GLSLANG_TARGET_VULKAN_1_2;
             input.target_language = GLSLANG_TARGET_SPV;
-            input.target_language_version = GLSLANG_TARGET_SPV_1_5;
+            input.target_language_version = legacySpirv ? GLSLANG_TARGET_SPV_1_3 : GLSLANG_TARGET_SPV_1_5;
             input.code = source.c_str();
             input.default_version = 460;
             input.default_profile = GLSLANG_NO_PROFILE;
@@ -1485,7 +1702,19 @@ namespace gpu::renderer
             }
             else
             {
+#ifdef __ANDROID__
+                // The C API's default explicitly disables optimization. Feed
+                // Adreno SSA/simplified code instead of large register arrays,
+                // helper functions and dead stage resources. ENABLE_OPT is
+                // required by the Android dependency build.
+                glslang_spv_options_t options{};
+                options.strip_debug_info = true;
+                options.optimize_size = true;
+                options.validate = true;
+                glslang_program_SPIRV_generate_with_options(program, stage, &options);
+#else
                 glslang_program_SPIRV_generate(program, stage);
+#endif
                 spirv.resize(glslang_program_SPIRV_get_size(program));
                 glslang_program_SPIRV_get(program, spirv.data());
             }
@@ -1494,9 +1723,8 @@ namespace gpu::renderer
             return spirv;
         }
 
-        // Vulkan pipeline cache, persisted as GetCachePath()/pipelines.bin (the
-        // driver validates the header: another GPU or driver version starts
-        // empty). Saved every 600 frames when new pipelines appeared, and at exit.
+        // Vulkan pipeline cache, persisted as GetCachePath()/pipelines.bin.
+        // Saved every 600 frames when new pipelines appeared, and at exit.
         VkPipelineCache s_pipelineCache = VK_NULL_HANDLE;
         uint32_t s_pipelinesAtSave = 0;
 
@@ -1517,6 +1745,29 @@ namespace gpu::renderer
                     }
                     fclose(f);
                 }
+            // A cache another GPU, driver or OS version made is set aside by
+            // the driver without a word (MoltenVK's device ID carries the
+            // macOS version, so every macOS update does it), and the first
+            // drive afterwards stutters while the pipelines compile again.
+            // The header says so in advance (gpu/pipeline_cache_header.h): one
+            // line for the log, and the stale data isn't handed over. The
+            // next save writes this device's header, so it's said once. No
+            // toast: it isn't something to act on, it would come after every
+            // SteamOS and macOS update, and the stutter is a frame or two at
+            // the first world entry (a first run with no cache at all has
+            // more, and says nothing either).
+            {
+                VkPhysicalDeviceProperties props;
+                vkGetPhysicalDeviceProperties(s_vk->physical, &props);
+                gpu::pipeline_cache::Maker device{ props.vendorID, props.deviceID, {} };
+                std::memcpy(device.uuid.data(), props.pipelineCacheUUID, device.uuid.size());
+                const auto check = gpu::pipeline_cache::CheckHeader(data.data(), data.size(), device);
+                if (const std::string line = gpu::pipeline_cache::LogLine(check, device); !line.empty())
+                {
+                    fprintf(stderr, "%s\n", line.c_str());
+                    data.clear();
+                }
+            }
             VkPipelineCacheCreateInfo pcci{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
             pcci.initialDataSize = data.size();
             pcci.pInitialData = data.empty() ? nullptr : data.data();
@@ -1579,30 +1830,32 @@ namespace gpu::renderer
         // A pixel shader variant: colour outputs only for bound attachments
         // (Metal rejects others), inputs only for interpolators the vertex
         // shader writes, and the alpha test compiled in only when enabled.
-        VkShaderModule VertexModule(Shader& vs)
+        std::string VertexPreamble(uint32_t primitiveMode)
         {
-            std::lock_guard lock(vs.compileMutex);
-            if (!vs.vertexCompiled)
-            {
-                vs.vertexCompiled = true;
-                std::string log;
-                auto spirv = CompileGlsl(vs.info.glsl, GLSLANG_STAGE_VERTEX, log);
-                if (spirv.empty())
-                    fprintf(stderr, "[renderer] vs_%016llx: GLSL compile failed:\n%s\n", (unsigned long long)vs.hash, log.c_str());
-                else
-                    vs.module = CreateModule(spirv);
-            }
-            return vs.module;
+            return std::format("#define VERTEX_PRIMITIVE_MODE {}\n", primitiveMode);
         }
 
-        VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest)
+        VkShaderModule VertexModule(Shader& vs, uint32_t primitiveMode, bool legacySpirv = false, bool positionOnly = false)
         {
-            uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0);
-            std::lock_guard lock(ps.compileMutex);
-            auto it = ps.variants.find(key);
-            if (it != ps.variants.end())
+            uint32_t key = primitiveMode | (legacySpirv ? 4u : 0u) | (positionOnly ? 8u : 0u);
+            std::lock_guard lock(vs.compileMutex);
+            if (auto it = vs.vertices.find(key); it != vs.vertices.end())
                 return it->second;
-            std::string preamble;
+            std::string log;
+            auto spirv = CompileGlsl(vs.info.glsl, GLSLANG_STAGE_VERTEX, log, VertexPreamble(primitiveMode) + (positionOnly ? "#define POSITION_ONLY\n" : ""), legacySpirv);
+            VkShaderModule module = VK_NULL_HANDLE;
+            if (spirv.empty())
+                fprintf(stderr, "[renderer] vs_%016llx (primitive %u): GLSL compile failed:\n%s\n",
+                    (unsigned long long)vs.hash, primitiveMode, log.c_str());
+            else
+                module = CreateModule(spirv);
+            vs.vertices[key] = module;
+            return module;
+        }
+
+        std::string PixelPreamble(uint32_t outputs, uint32_t inputs, bool alphaTest, bool earlyDepth = false)
+        {
+            std::string preamble = earlyDepth ? "#define EARLY_DEPTH\n" : "";
             for (int i = 0; i < 4; i++)
                 if (outputs & (1u << i))
                     preamble += std::format("#define OUT{}\n", i);
@@ -1611,8 +1864,19 @@ namespace gpu::renderer
                     preamble += std::format("#define IN{}\n", i);
             if (alphaTest)
                 preamble += "#define ALPHA_TEST\n";
+            return preamble;
+        }
+
+        VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest, bool legacySpirv = false, bool earlyDepth = false)
+        {
+            uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0) | (legacySpirv ? 1u << 21 : 0) | (earlyDepth ? 1u << 22 : 0);
+            std::lock_guard lock(ps.compileMutex);
+            auto it = ps.variants.find(key);
+            if (it != ps.variants.end())
+                return it->second;
+            std::string preamble = PixelPreamble(outputs, inputs, alphaTest, earlyDepth);
             std::string log;
-            auto spirv = CompileGlsl(ps.info.glsl, GLSLANG_STAGE_FRAGMENT, log, preamble);
+            auto spirv = CompileGlsl(ps.info.glsl, GLSLANG_STAGE_FRAGMENT, log, preamble, legacySpirv);
             VkShaderModule module = VK_NULL_HANDLE;
             if (spirv.empty())
                 fprintf(stderr, "[renderer] ps_%016llx (variant %x): GLSL compile failed:\n%s\n",
@@ -1710,9 +1974,9 @@ namespace gpu::renderer
             uint32_t base, format, pitch;
             bool depth;
             bool wide;                         // side-by-side tiles drawn untiled (see GetTarget)
-            uint32_t width, height;            // host pixels (guest x scale)
+            uint32_t width, height;            // host pixels (guest x scale, rounded up)
             uint32_t guestWidth, guestHeight;  // guest pixels
-            uint32_t scaleX = 1, scaleY = 1;
+            gpu::RenderScale scale;            // host pixels per guest pixel (gpu/render_scale.h)
             VkFormat vkFormat;
             bool blendable;
             Image image;
@@ -1790,11 +2054,26 @@ namespace gpu::renderer
         // and each shader pair keeping the whole target, once.
         // On by default with kLighterPasses (Apple: iPad Pro M2 GPU-bound at
         // 2x, same-run windows: executing -1.0 ms), else off; =0 turns it off.
+        // Android 0.1.4: trial the existing guarded viewport-area path on
+        // stock Adreno. Keep barrier policy independent (kLighterPasses).
+        // NFSMW_UNTILED_AREA=0 restores 0.1.3; RP6 timing is unverified.
+#ifdef __ANDROID__
+        constexpr bool kViewportAreaDefault = true;
+#else
+        constexpr bool kViewportAreaDefault = kLighterPasses;
+#endif
         const uint32_t s_untiledArea = [] {
             const char* v = std::getenv("NFSMW_UNTILED_AREA");
-            return !v ? (kLighterPasses ? 1u : 0u) : v[0] == '1' ? 1u : strcmp(v, "alt") == 0 ? 2u : 0u;
+            return !v ? (kViewportAreaDefault ? 1u : 0u) : v[0] == '1' ? 1u : strcmp(v, "alt") == 0 ? 2u : 0u;
         }();
-        const bool s_logUntiledArea = [] { const char* v = std::getenv("NFSMW_LOG_UNTILED_AREA"); return v && v[0] == '1'; }();
+        const bool s_logUntiledArea = [] {
+            const char* v = std::getenv("NFSMW_LOG_UNTILED_AREA");
+#ifdef __ANDROID__
+            return !v || v[0] == '1';
+#else
+            return v && v[0] == '1';
+#endif
+        }();
         struct UntiledAreaCounts
         {
             uint64_t cut = 0, whole = 0, clipOff = 0, noViewport = 0, wholeArea = 0, empty = 0, restarts = 0;
@@ -1813,34 +2092,43 @@ namespace gpu::renderer
         // colour grade visibly changed with 320 scaled), and they are blurry
         // by design anyway. Draws keep the guest's viewport transform in guest pixels
         // and scale only the host viewport and scissor; resolves average each
-        // sx x sy block down into guest memory (depth takes one sample), so
-        // the game and the texture cache see 1x data as before.
-        // NFSMW_RENDER_SCALE=<n> or <sx>x<sy> (1-4; default 1).
+        // guest pixel's host pixels down into guest memory (depth takes one
+        // sample), so the game and the texture cache see 1x data as before.
+        // The scale is a ratio on each axis (gpu/render_scale.h): 1, 1.5
+        // (3 host pixels for every 2 guest ones: 1920x1080), 2, 3, 4.
+        // NFSMW_RENDER_SCALE=<n> or <sx>x<sy> (1, 1.5, 2, 3 or 4; default 1).
         // The setting applies live (ApplyLiveSettings): every scaled target,
         // the scaled resolve memory and the scaled textures are made again at
         // the new scale between two frames, and Auto follows the picture's
         // size (the window, fullscreen, the aspect ratio setting).
-        uint32_t s_renderScaleX = 1, s_renderScaleY = 1;
+        gpu::RenderScale s_renderScale;
         uint32_t s_scalePitchMin = 640, s_scalePitchMax = 1280;
         uint32_t s_scaleBudget = 6;  // Auto's most host pixels per guest pixel
         bool s_scaleFixed = false;   // NFSMW_RENDER_SCALE: no live changes
 
         // What the Internal Resolution setting asks for with the picture
         // covering `regionW` x `regionH` of the swapchain.
-        void WantedRenderScale(int32_t setting, uint32_t regionW, uint32_t regionH, uint32_t& sx, uint32_t& sy)
+        // The setting's value is the scale in half steps (settings.h: 2 is
+        // 1x, 3 is 1.5x, 4 is 2x, 6 is 3x). Auto (whole scales only, for
+        // now: video::AutoRenderScale) could pick 1.5x by returning one.
+        gpu::RenderScale WantedRenderScale(int32_t setting, uint32_t regionW, uint32_t regionH)
         {
             if (setting > 0)
             {
-                sx = sy = uint32_t(std::clamp(setting, 1, 3));
-                return;
+                gpu::AxisScale a = gpu::AxisFromHalves(uint32_t(std::clamp(setting, 2, 6)));
+                return { a, a };
             }
+            uint32_t sx = 1, sy = 1;
             // Auto: enough host pixels to cover the screen area the frame
             // fills (video/picture_fit: 3440x1440 filled: 3x2; a 1440p 16:9
             // box: 2x2; a Steam Deck's 1280x800 filled with Vert+: 1x1),
             // within a budget of sx x sy host pixels per guest pixel: 6 on a
             // discrete GPU, 4 on an integrated one (the M1 Pro holds a race
-            // at 2x2), 9 on a Mac with an M3 or later Max or Ultra.
+            // at 2x2), 9 on a Mac with an M3 or later Max or Ultra, and on an
+            // iPhone or iPad the chip's (video/scale_budget: 1 on every chip
+            // measured so far).
             video::AutoRenderScale(regionW, regionH, s_scaleBudget, sx, sy);
+            return gpu::RenderScale::Whole(sx, sy);
         }
 
         std::string ScaleReason(int32_t setting, uint32_t regionW, uint32_t regionH)
@@ -1858,10 +2146,18 @@ namespace gpu::renderer
             // (<n> or <sx>x<sy>, developer override) wins.
             s_scaleBudget = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 6 : 4;
 #if defined(__APPLE__) && TARGET_OS_IOS
-            // iPhones and iPads hold a race at 60 fps at 1x only. Scripted
-            // drive, GPU time a frame: iPhone 15 Pro Max (A17 Pro) 15 ms at
-            // 1x, 36-40 at 2x; iPad Pro M2 20 ms at 2x (43-50 fps).
-            s_scaleBudget = 1;
+            // iPhones and iPads: chip by chip (video/scale_budget), more than
+            // 1x1 only where a chip was measured to hold a race at 60 fps with
+            // it and stay out of serious thermal throttling (none yet: the A20
+            // Pro gets hot at 1x1 already), and 1x1 on a chip not measured.
+            // Scripted drive, GPU time a frame: iPhone 15 Pro Max (A17 Pro)
+            // 15 ms at 1x, 36-40 at 2x; iPad Pro M2 20 ms at 2x (43-50 fps).
+            {
+                const video::ScaleBudget mobile = video::MobileScaleBudget(props.deviceName);
+                s_scaleBudget = mobile.pixels;
+                fprintf(stderr, "[renderer] Auto internal resolution: at most %u host pixel%s per guest pixel on the %s (%s)\n",
+                    s_scaleBudget, s_scaleBudget == 1 ? "" : "s", props.deviceName, mobile.reason);
+            }
 #elif defined(__APPLE__)
             // Apple GPUs are all integrated, but a recent Max or Ultra has
             // the headroom for 3x3 (4K). Scripted race, GPU time a frame, M4
@@ -1885,24 +2181,21 @@ namespace gpu::renderer
 #endif
             int32_t setting = settings::GetInt(settings::Id::InternalResolution);
             uint32_t regionW = 0, regionH = 0;
-            if (const char* v = std::getenv("NFSMW_RENDER_SCALE"))
-            {
-                unsigned x = 1, y = 0;
-                if (sscanf(v, "%ux%u", &x, &y) < 2)
-                    y = x;
-                s_renderScaleX = std::clamp(x, 1u, 4u);
-                s_renderScaleY = std::clamp(y, 1u, 4u);
+            const char* fixed = std::getenv("NFSMW_RENDER_SCALE");
+            if (fixed && gpu::ParseRenderScale(fixed, s_renderScale))
                 s_scaleFixed = true;
-            }
             else
             {
+                if (fixed)
+                    fprintf(stderr, "[renderer] NFSMW_RENDER_SCALE=%s ignored: each axis takes 1, 1.5, 2, 3 or 4 (\"1.5\", \"3x2\")\n", fixed);
                 video::FrameRegion(regionW, regionH);
-                WantedRenderScale(setting, regionW, regionH, s_renderScaleX, s_renderScaleY);
+                s_renderScale = WantedRenderScale(setting, regionW, regionH);
             }
             if (const char* v = std::getenv("NFSMW_SCALE_PITCH"))
                 sscanf(v, "%u-%u", &s_scalePitchMin, &s_scalePitchMax);
-            fprintf(stderr, "[renderer] internal resolution %ux%u (%ux%u, %s; surface pitches %u-%u)\n", s_renderScaleX, s_renderScaleY,
-                1280 * s_renderScaleX, 720 * s_renderScaleY, ScaleReason(setting, regionW, regionH).c_str(), s_scalePitchMin, s_scalePitchMax);
+            fprintf(stderr, "[renderer] internal resolution %s (%ux%u, %s; surface pitches %u-%u)\n", gpu::ScaleName(s_renderScale).c_str(),
+                s_renderScale.x.Size(1280), s_renderScale.y.Size(720), ScaleReason(setting, regionW, regionH).c_str(), s_scalePitchMin,
+                s_scalePitchMax);
         }
 
         bool ScaledPitch(uint32_t pitch)
@@ -1940,12 +2233,11 @@ namespace gpu::renderer
             rt->guestWidth = wide ? kUntiledWidth : pitch;
             rt->guestHeight = rows;
             if (ScaledPitch(pitch))
-            {
-                rt->scaleX = s_renderScaleX;
-                rt->scaleY = s_renderScaleY;
-            }
-            rt->width = rt->guestWidth * rt->scaleX;
-            rt->height = rt->guestHeight * rt->scaleY;
+                rt->scale = s_renderScale;
+            // (Rounded up: a pitch that isn't whole blocks at 1.5x still
+            // has room for its last host column.)
+            rt->width = rt->scale.x.Size(rt->guestWidth);
+            rt->height = rt->scale.y.Size(rt->guestHeight);
             rt->vkFormat = depth ? VK_FORMAT_D32_SFLOAT_S8_UINT : ColorFormat(format);
             VkFormatProperties fp;
             vkGetPhysicalDeviceFormatProperties(s_vk->physical, rt->vkFormat, &fp);
@@ -1974,6 +2266,7 @@ namespace gpu::renderer
             Begin();
             ToGeneral(rt->image.image, aspect, 1);
             VkImageSubresourceRange range{ aspect, 0, 1, 0, 1 };
+            int clearTiming = TimingBegin("target_clear", rt->width, rt->height, base, format);
             if (depth)
             {
                 VkClearDepthStencilValue v{ 0.0f, 0 };
@@ -1984,11 +2277,12 @@ namespace gpu::renderer
                 VkClearColorValue v{};
                 vkCmdClearColorImage(s_cmd, rt->image.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
             }
+            TimingEnd(clearTiming);
             FullBarrier();
 
             fprintf(stderr, "[renderer] EDRAM target: base %u %s format %u pitch %u -> %ux%u%s\n",
                 base, depth ? "depth" : "color", format, pitch, rt->guestWidth, rt->guestHeight,
-                rt->scaleX * rt->scaleY > 1 ? std::format(" (host {}x{})", rt->width, rt->height).c_str() : "");
+                !rt->scale.IsOne() ? std::format(" (host {}x{})", rt->width, rt->height).c_str() : "");
             return rt;
         }
 
@@ -2039,10 +2333,77 @@ namespace gpu::renderer
             ZpdEndSegment();  // a segment never outlives its pass
             s_vk->cmdEndRendering(s_cmd);
             s_passActive = false;
-            if (s_profiling && !s_passInfos.empty() && s_passInfos.back().query + 1 < s_passQueryNext)
+            TimingEnd(s_timedPass);
+            s_timedPass = -1;
+            if (s_profiling && s_passQueries && !s_passInfos.empty() && s_passInfos.back().query + 1 < s_passQueryNext)
                 vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_passQueries, s_passInfos.back().query + 1);
             PassEndBarrier();
             SignalWrites();
+        }
+
+        void VisualImage(VkImage image, uint32_t width, uint32_t height, VkImageAspectFlags aspect,
+                         const std::string& name, bool floats)
+        {
+            const uint64_t size = uint64_t(width) * height * 4;
+            if (!s_visual.active || !image || !width || !height || size > (12ull << 20) ||
+                s_visual.bytes + size * 3 > visual::Capture::limit || s_visual.images >= 12)
+            {
+                if (s_visual.active) s_visual.text("summary.txt", name + ": skipped (image/count/budget limit)\n", true);
+                return;
+            }
+            EndPass();
+            VkDeviceSize at = RingAllocate(size);
+            if (at == ~VkDeviceSize(0))
+            {
+                s_visual.text("summary.txt", name + ": staging slot unavailable\n", true);
+                return;
+            }
+            FullBarrier();
+            VkBufferImageCopy region{};
+            region.bufferOffset = at;
+            region.imageSubresource = { aspect, 0, 0, 1 };
+            region.imageExtent = { width, height, 1 };
+            {
+                int timed = TimingBegin("transfer");
+                vkCmdCopyImageToBuffer(s_cmd, image, VK_IMAGE_LAYOUT_GENERAL, s_ring, 1, &region);
+                TimingEnd(timed);
+            }
+            VkMemoryBarrier host{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+            host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                                 0, 1, &host, 0, nullptr, 0, nullptr);
+            Flush(); // Fence completion before reading coherent mapped staging; no deferred pointers.
+            std::vector<uint8_t> raw(s_ringHost + at, s_ringHost + at + size);
+            s_visual.write(name + (floats ? ".f32" : ".rgba8"), raw.data(), raw.size());
+            std::vector<uint8_t> rgb(size_t(width) * height * 3);
+            double minimum = 1.0, maximum = 0.0; uint64_t finite = 0;
+            for (size_t i = 0; i < size_t(width) * height; ++i)
+                if (floats)
+                {
+                    float value; memcpy(&value, raw.data() + i * 4, 4);
+                    uint8_t gray = 0;
+                    if (std::isfinite(value))
+                    { minimum = std::min(minimum, double(value)); maximum = std::max(maximum, double(value));
+                      ++finite; gray = uint8_t(std::clamp(value, 0.0f, 1.0f) * 255.0f); }
+                    rgb[i * 3] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = gray;
+                }
+                else memcpy(rgb.data() + i * 3, raw.data() + i * 4, 3);
+            auto png = report::EncodePng(rgb.data(), width, height);
+            s_visual.write(name + ".png", png.data(), png.size());
+            if (!floats && s_visual.write("final-frame.png", png.data(), png.size())) s_visual.finalFrame = s_visual.frame;
+            s_visual.text("summary.txt", std::format("{}: {}x{}, raw little-endian {}, finite {}, min {}, max {}\n",
+                name, width, height, floats ? "float32" : "RGBA8", finite, minimum, maximum), true);
+            ++s_visual.images;
+        }
+
+        // Guest rectangle [x0, x1) x [y0, y1) in host pixels at `scale`: its
+        // edges' (gpu/render_scale.h; a negative edge is 0), so rectangles
+        // that share a guest edge share the host one.
+        VkRect2D HostRect(const gpu::RenderScale& scale, int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+        {
+            const int32_t hx0 = scale.x.EdgeAt(x0), hy0 = scale.y.EdgeAt(y0), hx1 = scale.x.EdgeAt(x1), hy1 = scale.y.EdgeAt(y1);
+            return { { hx0, hy0 }, { uint32_t(std::max(hx1 - hx0, 0)), uint32_t(std::max(hy1 - hy0, 0)) } };
         }
 
         bool Contains(const VkRect2D& outer, const VkRect2D& inner)
@@ -2249,21 +2610,48 @@ namespace gpu::renderer
             ri.pStencilAttachment = depth ? &ds : nullptr;
             if (s_profiling && s_passQueryNext + 2 <= 512)
             {
-                char desc[256];
-                int n = snprintf(desc, sizeof(desc), "area %ux%u@%d,%d", s_passArea.extent.width, s_passArea.extent.height,
-                    s_passArea.offset.x, s_passArea.offset.y);
-                for (int i = 0; i < 4; i++)
-                    if (color[i])
-                        n += snprintf(desc + n, sizeof(desc) - n, " C%d[b%u f%u p%u]", i, color[i]->base, color[i]->format, color[i]->pitch);
-                if (depth)
-                    n += snprintf(desc + n, sizeof(desc) - n, " D[b%u p%u]", depth->base, depth->pitch);
-                vkCmdResetQueryPool(s_cmd, s_passQueries, s_passQueryNext, 2);
-                vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_passQueries, s_passQueryNext);
+                std::string desc = std::format("area {}x{}@{},{}", s_passArea.extent.width, s_passArea.extent.height, s_passArea.offset.x, s_passArea.offset.y);
+                for (int i = 0; i < 4; ++i)
+                    if (color[i]) desc += std::format(" C{}[b{} f{} vk{} {}x{} p{}]", i, color[i]->base, color[i]->format, int(color[i]->vkFormat), color[i]->width, color[i]->height, color[i]->pitch);
+                if (depth) desc += std::format(" D[b{} f{} vk{} {}x{} p{}]", depth->base, depth->format, int(depth->vkFormat), depth->width, depth->height, depth->pitch);
+                if (s_passQueries)
+                {
+                    vkCmdResetQueryPool(s_cmd, s_passQueries, s_passQueryNext, 2);
+                    vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_passQueries, s_passQueryNext);
+                }
                 GapCounters now{ s_stats.resolves, s_stats.uploads, s_stats.submits, writewatch::GetGuardStats().uploadBytes };
                 s_passInfos.push_back({ desc, 0, s_slot, s_passQueryNext, uint32_t(now.resolves - s_gapLast.resolves),
                     uint32_t(now.uploads - s_gapLast.uploads), uint32_t(now.submits - s_gapLast.submits), (now.shadowBytes - s_gapLast.shadowBytes) / 1024 });
                 s_gapLast = now;
                 s_passQueryNext += 2;
+            }
+            s_timedPass = TimingBegin("render", s_passArea.extent.width, s_passArea.extent.height);
+            if (s_timedPass >= 0)
+            {
+                auto& timed = s_timedSlots[s_slot].regions[s_timedPass];
+                timed.depthBase = depth ? depth->base : 0;
+                uint64_t bpp = depth ? 5 : 0;
+                if (depth)
+                {
+                    timed.loadMask |= ds.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 16u : 0u;
+                    timed.storeMask |= ds.storeOp == VK_ATTACHMENT_STORE_OP_STORE ? 16u : 0u;
+                }
+                for (uint32_t i = 0; i < 4; ++i)
+                    if (color[i])
+                    {
+                        timed.colorMask |= 1u << i;
+                        timed.loadMask |= colors[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 1u << i : 0u;
+                        timed.storeMask |= colors[i].storeOp == VK_ATTACHMENT_STORE_OP_STORE ? 1u << i : 0u;
+                        bpp += Is64bpp(color[i]->format) ? 8 : 4;
+                        if (!i) { timed.base = color[i]->base; timed.format = color[i]->format; }
+                    }
+                // Structural upper estimate, not measured bus traffic/compression.
+                timed.bytes = uint64_t(s_passArea.extent.width) * s_passArea.extent.height * bpp * 2;
+                if (!timed.colorMask && depth)
+                {
+                    timed.kind = "render_depth_only";
+                    timed.base = depth->base; timed.format = depth->format;
+                }
             }
             s_vk->cmdBeginRendering(s_cmd, &ri);
             s_passActive = true;
@@ -2348,6 +2736,13 @@ namespace gpu::renderer
                 return it != s_vertexPending.end() && it->first < end;
             };
             int why = -1;
+#ifdef __ANDROID__
+            // A vertex fetch may sample mips or an alias of a resolved range.
+            // Exact base matching alone is insufficient proof of independence.
+            // Keep a full dependency for any vertex texture after a resolve;
+            // ordinary vertex/index buffers retain the range checks below.
+            if (vsMasks[0] || vsMasks[1] || vsMasks[2]) why = 2;
+#endif
             // (A texture's cache entry and image are keyed by its guest base.)
             for (uint32_t d = 0; d < 3 && why < 0 && !s_vertexPendingTextures.empty(); d++)
                 for (uint32_t bits = vsMasks[d]; bits && why < 0; bits &= bits - 1)
@@ -2393,7 +2788,7 @@ namespace gpu::renderer
             uint32_t colorMask;      // 4 bits per target
             uint32_t depthControl;   // RB_DEPTHCONTROL (0 without a depth target, or one attached for the pass only)
             uint32_t raster;         // cull | front CW << 2 | depth clamp << 3 | depth bias << 4
-            uint32_t pad;
+            uint32_t primitiveMode;  // vertex expansion: 0 ordinary, 1 rectangle, 2 quad
 
             bool operator==(const PipelineKey& o) const { return memcmp(this, &o, sizeof(*this)) == 0; }
         };
@@ -2448,12 +2843,71 @@ namespace gpu::renderer
             }
         }
 
+        // Keep the exact sources/variants and pipeline state for rejected
+        // Android pipelines beside the session logs. Driver -13 alone does
+        // not tell us which shader or interface failed. Bound disk output to
+        // 16 unique failures per process; never dump the ISO or guest memory.
+        void DumpPipelineFailure(const PipelineKey& key, const Shader& vs, const Shader& ps,
+            uint32_t outputs, uint32_t inputs, VkResult result, bool legacySpirv)
+        {
+#ifdef __ANDROID__
+            static std::mutex mutex;
+            static std::unordered_set<PipelineKey, PipelineKeyHash> dumped;
+            std::lock_guard lock(mutex);
+            if (dumped.size() >= 16 || !dumped.insert(key).second)
+                return;
+            auto dir = GetUserPath() / "logs" / "pipeline_failures" / report::SessionName();
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (ec)
+                return;
+            auto stem = std::format("{:016x}_{:016x}_{:016x}", key.vs, key.ps, uint64_t(PipelineKeyHash{}(key)));
+            bool ok = true;
+            auto write = [&](const std::string& suffix, const void* data, size_t bytes) {
+                FILE* f = fopen((dir / (stem + suffix)).c_str(), "wb");
+                if (!f) { ok = false; return; }
+                bool written = fwrite(data, 1, bytes, f) == bytes;
+                ok = (fclose(f) == 0 && written) && ok;
+            };
+            auto shader = [&](const Shader& sh, glslang_stage_t stage, const std::string& variant, const char* suffix) {
+                std::string preamble = s_splitMemory ? "#define SPLIT_MEMORY\n" + variant : variant;
+                std::string source = sh.info.glsl;
+                // #version must remain first in the standalone GLSL file.
+                source.insert(source.find('\n') + 1, preamble);
+                write(std::string(suffix) + ".glsl", source.data(), source.size());
+                // CompileGlsl cached these exact modules before linking. Copy
+                // that cache entry without recompiling or retaining SPIR-V.
+                auto cache = ShaderCacheFile(sh.info.glsl, stage, preamble, legacySpirv);
+                if (s_shaderCacheEnabled && std::filesystem::exists(cache, ec))
+                {
+                    std::filesystem::copy_file(cache, dir / (stem + suffix + ".spv"),
+                        std::filesystem::copy_options::overwrite_existing, ec);
+                    if (ec) ok = false;
+                }
+            };
+            shader(vs, GLSLANG_STAGE_VERTEX, VertexPreamble(key.primitiveMode) +
+                ((s_depthStageReduction && (key.raster & 128u)) ? "#define POSITION_ONLY\n" : ""), ".vert");
+            shader(ps, GLSLANG_STAGE_FRAGMENT, PixelPreamble(outputs, inputs, (key.raster >> 5) & 1, (key.raster >> 6) & 1), ".frag");
+            auto state = std::format("result={}\nvs={:016x}\nps={:016x}\ntopology={}\nrestart={}\ncolorFormats={},{},{},{}\ndepthFormat={}\nraster={:08x}\ndepthControl={:08x}\ncolorMask={:08x}\noutputs={:x}\ninputs={:x}\nblend={:08x},{:08x},{:08x},{:08x}\n",
+                int(result), key.vs, key.ps, key.topology, key.restart,
+                key.colorFormats[0], key.colorFormats[1], key.colorFormats[2], key.colorFormats[3],
+                key.depthFormat, key.raster, key.depthControl, key.colorMask, outputs, inputs,
+                key.blend[0], key.blend[1], key.blend[2], key.blend[3]);
+            write(".txt", state.data(), state.size());
+            auto mode = std::format("primitiveMode={}\nspirvTarget={}\n", key.primitiveMode, legacySpirv ? "1.3" : "1.5");
+            write(".mode.txt", mode.data(), mode.size());
+            fprintf(stderr, "[renderer] failed-pipeline diagnostics %s: %s\n", ok ? "saved" : "incomplete", stem.c_str());
+#endif
+        }
+
         // Compiles the pipeline for `key` (and the SPIR-V it needs). Runs on a
         // pipeline worker: touches only its arguments, the shaders' own
         // locked modules and the (internally synchronized) pipeline cache.
         VkPipeline BuildPipeline(const PipelineKey& key, VkPipelineLayout layout, Shader& vs, Shader& ps)
         {
-            VkShaderModule vsModule = VertexModule(vs);
+            const bool noFragment = (key.raster & 128u) != 0;
+            const bool positionOnly = s_depthStageReduction && noFragment;
+            VkShaderModule vsModule = VertexModule(vs, key.primitiveMode, false, positionOnly);
             if (!vsModule)
                 return VK_NULL_HANDLE;
             VkPipelineShaderStageCreateInfo stages[2]{};
@@ -2461,12 +2915,12 @@ namespace gpu::renderer
                 vsModule, "main", nullptr };
             uint32_t outputs = 0;
             for (int i = 0; i < 4; i++)
-                if (key.colorFormats[i] != 0)
+                if (key.colorFormats[i] != 0 && (!s_depthStageReduction || key.colorMask != 0))
                     outputs |= 1u << i;
             uint32_t psRegs = std::min(16u, ps.info.registerCount);
-            uint32_t inputs = vs.info.interpolatorMask & ((1u << psRegs) - 1);
-            VkShaderModule psModule = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1);
-            if (!psModule)
+            uint32_t inputs = positionOnly ? 0u : vs.info.interpolatorMask & ((1u << psRegs) - 1);
+            VkShaderModule psModule = noFragment ? VK_NULL_HANDLE : PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1, false, (key.raster >> 6) & 1);
+            if (!noFragment && !psModule)
                 return VK_NULL_HANDLE;
             stages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
                 psModule, "main", nullptr };
@@ -2557,7 +3011,7 @@ namespace gpu::renderer
 
             VkGraphicsPipelineCreateInfo gpci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
             gpci.pNext = &rci;
-            gpci.stageCount = 2;
+            gpci.stageCount = noFragment ? 1u : 2u;
             gpci.pStages = stages;
             gpci.pVertexInputState = &vi;
             gpci.pInputAssemblyState = &ia;
@@ -2570,10 +3024,45 @@ namespace gpu::renderer
             gpci.layout = layout;
             VkPipeline pipeline = VK_NULL_HANDLE;
             VkResult r = vkCreateGraphicsPipelines(s_dev, s_pipelineCache, 1, &gpci, nullptr, &pipeline);
+            if (r != VK_SUCCESS && noFragment) {
+                // Keep solid casters even if a driver rejects a vertex-only pipeline.
+                stages[1].module = PixelVariant(ps, outputs, inputs, false);
+                gpci.stageCount = 2;
+                if (pipeline) vkDestroyPipeline(s_dev, pipeline, nullptr);
+                pipeline = VK_NULL_HANDLE;
+                if (stages[1].module) r = vkCreateGraphicsPipelines(s_dev, s_pipelineCache, 1, &gpci, nullptr, &pipeline);
+                fprintf(stderr, "[renderer] depth-only fragment fallback result %d\n", int(r));
+            }
+            bool legacySpirv = false;
+#ifdef __ANDROID__
+            if (r == VK_ERROR_UNKNOWN)
+            {
+                // A second encoding of the same shaders for driver compiler
+                // compatibility. Cache keys/modules distinguish both targets;
+                // one failed PipelineKey is still memoized, never retried on
+                // every draw. Never retry allocation/device-lost failures.
+                fprintf(stderr, "[renderer] pipeline vs %016llx ps %016llx: retrying link with optimized SPIR-V 1.3\n",
+                    (unsigned long long)key.vs, (unsigned long long)key.ps);
+                if (pipeline) vkDestroyPipeline(s_dev, pipeline, nullptr);
+                pipeline = VK_NULL_HANDLE;
+                stages[0].module = VertexModule(vs, key.primitiveMode, true, positionOnly);
+                stages[1].module = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1, true, (key.raster >> 6) & 1);
+                if (stages[0].module && stages[1].module)
+                {
+                    legacySpirv = true;
+                    r = vkCreateGraphicsPipelines(s_dev, s_pipelineCache, 1, &gpci, nullptr, &pipeline);
+                    if (r == VK_SUCCESS)
+                        fprintf(stderr, "[renderer] pipeline vs %016llx ps %016llx recovered with SPIR-V 1.3\n",
+                            (unsigned long long)key.vs, (unsigned long long)key.ps);
+                }
+            }
+#endif
             if (r != VK_SUCCESS)
             {
                 fprintf(stderr, "[renderer] pipeline vs %016llx ps %016llx failed: %d\n",
                     (unsigned long long)key.vs, (unsigned long long)key.ps, int(r));
+                DumpPipelineFailure(key, vs, ps, outputs, inputs, r, legacySpirv);
+                if (pipeline) vkDestroyPipeline(s_dev, pipeline, nullptr);
                 pipeline = VK_NULL_HANDLE;
             }
             return pipeline;
@@ -2599,15 +3088,23 @@ namespace gpu::renderer
             bool done = false;
             VkPipeline pipeline = VK_NULL_HANDLE;
             std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now();
-            double createMs = 0;
+            double createMs = 0, queueMs = 0, waitMs = 0;
+            uint32_t skips = 0;
+            bool forcedWait = false;
             uint64_t queuedFrame = 0;
             bool outlasted = false;  // outlasted a frame's wait budget: a real compile, not worth waiting for again
         };
         std::unordered_map<PipelineKey, std::shared_ptr<PendingPipeline>, PipelineKeyHash> s_pendingPipelines;
         const uint32_t s_pipelineThreads = [] {
             if (const char* v = std::getenv("NFSMW_PIPELINE_THREADS"))
-                return uint32_t(std::atoi(v));
+                return uint32_t(std::clamp(std::atoi(v), 0, 16));
+#ifdef __ANDROID__
+            // Keep the peak of concurrent driver/compiler allocations down
+            // during world loading on a device with shared CPU/GPU RAM.
+            return 1u;
+#else
             return std::clamp(std::thread::hardware_concurrency() / 3, 1u, 4u);
+#endif
         }();
         const int64_t s_pipelineWaitUs = [] { const char* v = std::getenv("NFSMW_PIPELINE_WAIT_US"); return v ? int64_t(std::atoll(v)) : 3000; }();
         const bool s_logPipelines = std::getenv("NFSMW_PIPELINE_LOG") != nullptr;
@@ -2678,6 +3175,7 @@ namespace gpu::renderer
                     VkPipeline pipeline = BuildPipeline(key, layout, *vs, *ps);
                     {
                         std::lock_guard lock(job->mutex);
+                        job->queueMs = std::chrono::duration<double, std::milli>(start - job->queued).count();
                         job->pipeline = pipeline;
                         job->createMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
                         job->done = true;
@@ -2710,8 +3208,12 @@ namespace gpu::renderer
                 // Waits share one budget a frame (cache hits make it); once it
                 // is spent, draws just check. A per-draw wait made a pipeline
                 // used by 13 draws cost 47 ms a frame while it compiled.
+                auto waitStart = std::chrono::steady_clock::now();
                 if (!settings::GetBool(settings::Id::AsyncShaders) || s_frame < s_waitPipelinesUntil)
+                {
+                    job->forcedWait |= s_frame < s_waitPipelinesUntil;
                     job->cv.wait(lock, [&] { return job->done; });
+                }
                 else
                 {
                     // The budget catches compiles that finish within a few
@@ -2728,10 +3230,21 @@ namespace gpu::renderer
                     {
                         pending = true;
                         s_pipelineSkips++;
+                        ++job->skips;
+                        job->waitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
                         return VK_NULL_HANDLE;
                     }
                 }
+                job->waitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
             }
+#ifdef __ANDROID__
+            static uint32_t loggedPipelines = 0;
+            if (loggedPipelines++ < 512)
+                fprintf(stderr, "[shader-timing] frame %llu queued_frame %llu vs %016llx ps %016llx: async %d forced_loading_wait %d queue %.3f ms compile %.3f ms CP_wait %.3f ms skipped_draws %u ready_after_frames %llu\n",
+                    (unsigned long long)s_frame, (unsigned long long)job->queuedFrame, (unsigned long long)key.vs,
+                    (unsigned long long)key.ps, int(settings::GetBool(settings::Id::AsyncShaders)), int(job->forcedWait),
+                    job->queueMs, job->createMs, job->waitMs, job->skips, (unsigned long long)(s_frame - job->queuedFrame));
+#endif
             if (s_logPipelines)
                 fprintf(stderr, "[pipeline] vs %016llx ps %016llx: %.1f ms to compile, ready %.1f ms and %llu frames after the first draw\n",
                     (unsigned long long)key.vs, (unsigned long long)key.ps, job->createMs,
@@ -2917,8 +3430,15 @@ namespace gpu::renderer
             VkFormat vk;
             uint32_t bpbLog2;   // guest bytes per block
             uint32_t block;     // block width/height in texels
-            uint32_t convert;   // 0 copy; 1 565, 2 1555, 3 4444 -> RGBA8; 4 24_8 -> R32F
+            uint32_t convert;   // 0 copy; 1 565, 2 1555, 3 4444 -> RGBA8; 4 24_8 -> R32F; 5..8 BC1/2/3/5 -> RGBA8
         };
+
+        uint32_t s_bcDecodeMask = 0;  // BC1/2/3/5 bits, chosen once from actual format support.
+        TextureFormatInfo BcFormat(VkFormat native, uint32_t bytesLog, uint32_t bit, uint32_t conversion)
+        {
+            return s_bcDecodeMask & bit ? TextureFormatInfo{VK_FORMAT_R8G8B8A8_UNORM, bytesLog, 4, conversion}
+                                       : TextureFormatInfo{native, bytesLog, 4, 0};
+        }
 
         bool GetTextureFormat(uint32_t f, TextureFormatInfo& out)
         {
@@ -2931,9 +3451,9 @@ namespace gpu::renderer
             case 7: out = { VK_FORMAT_A2B10G10R10_UNORM_PACK32, 2, 1, 0 }; return true;
             case 10: out = { VK_FORMAT_R8G8_UNORM, 1, 1, 0 }; return true;
             case 15: out = { VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 3 }; return true;
-            case 18: out = { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 3, 4, 0 }; return true;
-            case 19: out = { VK_FORMAT_BC2_UNORM_BLOCK, 4, 4, 0 }; return true;
-            case 20: out = { VK_FORMAT_BC3_UNORM_BLOCK, 4, 4, 0 }; return true;
+            case 18: out = BcFormat(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 3, 1, 5); return true;
+            case 19: out = BcFormat(VK_FORMAT_BC2_UNORM_BLOCK, 4, 2, 6); return true;
+            case 20: out = BcFormat(VK_FORMAT_BC3_UNORM_BLOCK, 4, 4, 7); return true;
             case 22: case 23: out = { VK_FORMAT_R32_SFLOAT, 2, 1, 4 }; return true;
             case 24: out = { VK_FORMAT_R16_UNORM, 1, 1, 0 }; return true;
             case 25: out = { VK_FORMAT_R16G16_UNORM, 2, 1, 0 }; return true;
@@ -2944,7 +3464,7 @@ namespace gpu::renderer
             case 36: out = { VK_FORMAT_R32_SFLOAT, 2, 1, 0 }; return true;
             case 37: out = { VK_FORMAT_R32G32_SFLOAT, 3, 1, 0 }; return true;
             case 38: out = { VK_FORMAT_R32G32B32A32_SFLOAT, 4, 1, 0 }; return true;
-            case 49: out = { VK_FORMAT_BC5_UNORM_BLOCK, 4, 4, 0 }; return true;
+            case 49: out = BcFormat(VK_FORMAT_BC5_UNORM_BLOCK, 4, 8, 8); return true;
             default: return false;
             }
         }
@@ -3048,13 +3568,16 @@ namespace gpu::renderer
         // Scaled resolve memory (internal resolution above 1x)
         //
         // A resolve from a scaled render target writes each guest pixel's
-        // sx x sy host samples here, besides the 1x average into guest memory
+        // host samples here, besides the 1x average into guest memory
         // (which the CPU, 1x draws and the auto-exposure readback keep
         // using). Storage is per 4 KB guest page: a slot of 4096 x s bytes
-        // (s = sx x sy) in one pool buffer, found through a page table (a GPU
-        // buffer and its CPU copy), as MoltenVK has no sparse buffers. The
-        // samples of the 32-bit texel at guest byte address A are at
-        //   slot(A >> 12) x 4096 x s + (A & 4095) x s + (j x sx + i) x 4.
+        // (s = sx x sy host pixels per guest pixel: 9/4 at 1.5x) in one pool
+        // buffer, found through a page table (a GPU buffer and its CPU copy),
+        // as MoltenVK has no sparse buffers. At a whole scale the samples of
+        // the 32-bit texel at guest byte address A are at
+        //   slot(A >> 12) x 4096 x s + (A & 4095) x s + (j x sx + i) x 4;
+        // at 1.5x a 2x2 block of texels keeps its 3x3 samples together
+        // (gpu/render_scale.h, sbSampleWord, has the layout).
         // A page's scaled copy is current while the last write to the page
         // was a scaled resolve: its write sequence is still the one recorded
         // right after that resolve (a CPU write, a 1x resolve or any other
@@ -3072,7 +3595,8 @@ namespace gpu::renderer
         struct ScaledMemory
         {
             bool tried = false, enabled = false, direct = false, coalesce = false;
-            uint32_t sx = 1, sy = 1, s = 1, slotWords = 0, slots = 0;
+            gpu::RenderScale scale;  // the scale its samples are at
+            uint32_t slotWords = 0, slots = 0;
             VkBuffer pool = VK_NULL_HANDLE, table = VK_NULL_HANDLE, scratch = VK_NULL_HANDLE;
             VkDeviceMemory poolMemory = VK_NULL_HANDLE, tableMemory = VK_NULL_HANDLE, scratchMemory = VK_NULL_HANDLE;
             VkDeviceSize scratchSize = 0;  // also the largest scaled texture (no buffer when direct)
@@ -3251,11 +3775,30 @@ uint element(uint bx, uint by)
 
 uint expand(uint v, uint bits) { uint m = (1u << bits) - 1u; return (v * 255u + m / 2u) / m; }
 
+#ifdef BC_DECODE
+)" GLSL_BC_DECODE R"(
+#endif
+
 void main()
 {
     uint gx = gl_GlobalInvocationID.x, gy = gl_GlobalInvocationID.y;
     if (gy >= p.height) return;
     uint row = p.dstWord + gy * p.dstRowWords;
+#ifdef BC_DECODE
+    if (p.convert >= 5u)
+    {
+        if (gx >= p.width) return;
+        uint a = addr(gx, gy);
+        uint w0 = word(a), w1 = word(a + 4u), w2 = 0u, w3 = 0u;
+        if (p.bpbLog2 == 4u) { w2 = word(a + 8u); w3 = word(a + 12u); }
+        for (uint texel = 0u; texel < 16u; ++texel)
+        {
+            uint x = gx * 4u + (texel & 3u), y = gy * 4u + (texel >> 2u);
+            o_mem[p.dstWord + y * p.dstRowWords + x] = sbBcPixel(p.convert, w0, w1, w2, w3, texel);
+        }
+        return;
+    }
+#endif
     if (p.convert != 0u)
     {
         if (gx >= p.width) return;
@@ -3328,7 +3871,8 @@ void main()
             {
                 VkImageFormatProperties props;
                 it->second = vkGetPhysicalDeviceImageFormatProperties(s_vk->physical, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
-                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                    (s_visual.enabled() && format == VK_FORMAT_R32_SFLOAT && !cube ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0),
                     VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0),
                     &props) == VK_SUCCESS && (!cube || props.maxArrayLayers >= 6);
             }
@@ -3351,6 +3895,7 @@ void main()
             uint32_t guestStart, guestSize;
             uint64_t loadedSequence = 0;  // writewatch::Current() when last loaded
             uint64_t checkedEpoch = ~0ull;  // writewatch::WriteEpoch() at the last validity check
+            uint64_t usedFrame = 0;  // s_frame when last sampled or resolved into (TrimTextures)
             bool uploaded = false;
             bool cube = false;
             bool volume = false;
@@ -3657,6 +4202,8 @@ void main()
             return slot;
         }
 
+        std::unordered_map<VkImageView, VkExtent2D> s_textureViewExtents;
+
         VkImageView TextureView(Texture& t, uint32_t swizzle)
         {
             auto& view = t.views[swizzle];
@@ -3684,6 +4231,7 @@ void main()
             vci.components = { comp(swizzle), comp(swizzle >> 3), comp(swizzle >> 6), comp(swizzle >> 9) };
             vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, t.cube ? 6u : 1u };
             Check(vkCreateImageView(s_dev, &vci, nullptr, &view), "vkCreateImageView(texture)");
+            s_textureViewExtents[view] = { t.width, t.height };
             return view;
         }
 
@@ -3813,9 +4361,11 @@ void main()
             // (and nothing since) is sampled at host resolution, base level
             // only (resolved surfaces have no mips).
             // (Mipmapped textures keep their levels on the 1x path.)
+            // At 1.5x only a texture of whole 2x2 blocks (even width and
+            // height; gpu/render_scale.h).
             bool scaledCandidate = !cube && !volume && f.tiled && layers == 1 && !f.stacked &&
-                ScaledFormat(fi) && offX == 0 && offY == 0 && maxLevel == 0 &&
-                uint64_t(width) * height * s_scaled.s * 4 <= s_scaled.scratchSize;
+                ScaledFormat(fi) && offX == 0 && offY == 0 && maxLevel == 0 && s_scaled.scale.Exact(width, height) &&
+                s_scaled.scale.HostPixels(width, height) * 4 <= s_scaled.scratchSize;
             bool scaled = s_drawScaled && s_scaled.enabled && scaledCandidate && ScaledTextureValid(base, size);
             sampler = GetSampler(f, maxLevel);
             if (out)
@@ -3846,8 +4396,8 @@ void main()
                 t.scaled = scaled;
                 if (scaled)
                 {
-                    t.width = width * s_scaled.sx;
-                    t.height = height * s_scaled.sy;
+                    t.width = s_scaled.scale.x.Size(width);
+                    t.height = s_scaled.scale.y.Size(height);
                     s_scaled.textures++;
                 }
                 // A 1x texture the untile can store directly (see
@@ -3867,7 +4417,7 @@ void main()
                     // (MoltenVK: 2D R32_UINT views of a cube's layers): one
                     // turned down is staged instead, below.
                     t.image = CreateImage(VK_IMAGE_TYPE_2D, fi.vk, { t.width, t.height, 1 }, layers,
-                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | (direct1x ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0),
+                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | (s_visual.enabled() && fi.vk == VK_FORMAT_R32_SFLOAT && !cube ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0) | (direct1x ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0),
                         cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT,
                         VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0),
                         1, &list, &sampled, cube);
@@ -3926,11 +4476,12 @@ void main()
                 }
                 if (!t.image.image)
                     t.image = CreateImage(volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, fi.vk, { t.width, t.height, depth }, layers,
-                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (s_visual.enabled() && fi.vk == VK_FORMAT_R32_SFLOAT && !cube && !volume ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0),
                         cube ? VK_IMAGE_VIEW_TYPE_CUBE : volume ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT,
                         cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0, t.levels);
             }
             Texture& t = *slotRef;
+            t.usedFrame = s_frame;
             {
                 // No page written anywhere since the last check: still valid
                 // (a draw binds ~7,500 textures a frame; writes are rare).
@@ -3965,7 +4516,9 @@ void main()
                     EnsureShadow(base, size);
                     if (mipSize)
                         EnsureShadow(mipBase, mipSize);
-                    uint32_t outBpbLog2 = fi.convert == 0 ? fi.bpbLog2 : 2;
+                    const bool decodedBc = fi.convert >= 5;
+                    const uint32_t outRowsPerBlock = decodedBc ? 4 : 1;
+                    uint32_t outBpbLog2 = decodedBc ? 4 : fi.convert == 0 ? fi.bpbLog2 : 2;
                     uint32_t rowWords, rowTexels;
                     if (fi.convert != 0 || fi.bpbLog2 >= 2)
                     {
@@ -3998,51 +4551,69 @@ void main()
                             s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileStoreLayout, 0, AddSharedParts(w, 2), w);
                             vkCmdPushConstants(s_cmd, s_untileStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
                             if (!(s_exp & 4))
-                                vkCmdDispatch(s_cmd, (bw + 7) / 8, (bh + 7) / 8, 1);
+                                {
+                                    int timed = TimingBegin("texture_compute");
+                                    vkCmdDispatch(s_cmd, (bw + 7) / 8, (bh + 7) / 8, 1);
+                                    TimingEnd(timed);
+                                }
                             FullBarrier();
                             SubmitIfStarving();
                             continue;
                         }
-                        VkDeviceSize staging = RingAllocate(VkDeviceSize(rowWords) * 4 * bh);
-                        if (staging == ~VkDeviceSize(0))
+                        const uint32_t rowsPerChunk = decodedBc ? bc::BlockRowsPerChunk(bw, bh, kSlotSize) : bh;
+                        if (!rowsPerChunk) return dummy;
+                        for (uint32_t firstBlockRow = 0; firstBlockRow < bh; firstBlockRow += rowsPerChunk)
                         {
-                            LogOnce(0x2200, "texture %ux%u format %u is too large for a staging slot", width, height, format);
-                            return dummy;
+                            const uint32_t chunkRows = std::min(rowsPerChunk, bh - firstBlockRow);
+                            VkDeviceSize staging = RingAllocate(VkDeviceSize(rowWords) * 4 * chunkRows * outRowsPerBlock);
+                            if (staging == ~VkDeviceSize(0))
+                            {
+                                LogOnce(0x2200, "texture %ux%u format %u is too large for a staging slot", width, height, format);
+                                return dummy;
+                            }
+                            EndPass();
+                            Begin();
+                            uint32_t layer = volume ? 0 : slice, zSlice = volume ? slice : 0;
+                            uint32_t sliceBase = base + (volume ? (f.tiled ? 0 : zSlice * sliceStride) : layer * sliceStride);
+                            UntileConstants uc{ sliceBase, f.tiled ? 1u : 0u, f.tiled ? pitchAligned : rowBytes, fi.bpbLog2,
+                                offX, offY + firstBlockRow, bw, chunkRows, uint32_t(f.endianness), fi.convert, uint32_t(staging / 4), rowWords,
+                                zSlice, heightAligned3D };
+                            if (volume && f.tiled)
+                                uc.tiled = 2;
+                            VkDescriptorBufferInfo ring{ s_ring, 0, kRingSize };
+                            VkWriteDescriptorSet w[5] = {
+                                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr },
+                                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ring, nullptr },
+                            };
+                            s_stateEpoch++;
+                            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untilePipeline);
+                            s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileLayout, 0, AddSharedParts(w, 2), w);
+                            vkCmdPushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
+                            uint32_t groupsX = fi.convert != 0 || fi.bpbLog2 >= 2 ? bw : rowWords;
+                            if (!(s_exp & 4))
+                                {
+                                    int timed = TimingBegin("texture_compute");
+                                    vkCmdDispatch(s_cmd, (groupsX + 7) / 8, (chunkRows + 7) / 8, 1);
+                                    TimingEnd(timed);
+                                }
+                            FullBarrier();
+                            if (!t.uploaded && slice == 0 && firstBlockRow == 0)
+                                ToGeneral(t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, layers);
+                            VkBufferImageCopy region{};
+                            region.bufferOffset = staging;
+                            region.bufferRowLength = rowTexels;
+                            region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1 };
+                            region.imageOffset = { 0, int32_t(firstBlockRow * fi.block), int32_t(zSlice) };
+                            region.imageExtent = { width, std::min(height - firstBlockRow * fi.block, chunkRows * fi.block), 1 };
+                            if (!(s_exp & 16))  // NFSMW_GPU_EXP bit 16: no staging copy (upload cost experiment)
+                                {
+                                    int timed = TimingBegin("transfer");
+                                    vkCmdCopyBufferToImage(s_cmd, s_ring, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                                    TimingEnd(timed);
+                                }
+                            FullBarrier();
+                            SubmitIfStarving();
                         }
-                        EndPass();
-                        Begin();
-                        uint32_t layer = volume ? 0 : slice, zSlice = volume ? slice : 0;
-                        uint32_t sliceBase = base + (volume ? (f.tiled ? 0 : zSlice * sliceStride) : layer * sliceStride);
-                        UntileConstants uc{ sliceBase, f.tiled ? 1u : 0u, f.tiled ? pitchAligned : rowBytes, fi.bpbLog2,
-                            offX, offY, bw, bh, uint32_t(f.endianness), fi.convert, uint32_t(staging / 4), rowWords,
-                            zSlice, heightAligned3D };
-                        if (volume && f.tiled)
-                            uc.tiled = 2;
-                        VkDescriptorBufferInfo ring{ s_ring, 0, kRingSize };
-                        VkWriteDescriptorSet w[5] = {
-                            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr },
-                            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ring, nullptr },
-                        };
-                        s_stateEpoch++;
-                        vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untilePipeline);
-                        s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileLayout, 0, AddSharedParts(w, 2), w);
-                        vkCmdPushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
-                        uint32_t groupsX = fi.convert != 0 || fi.bpbLog2 >= 2 ? bw : rowWords;
-                        if (!(s_exp & 4))
-                            vkCmdDispatch(s_cmd, (groupsX + 7) / 8, (bh + 7) / 8, 1);
-                        FullBarrier();
-                        if (!t.uploaded && slice == 0)
-                            ToGeneral(t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, layers);
-                        VkBufferImageCopy region{};
-                        region.bufferOffset = staging;
-                        region.bufferRowLength = rowTexels;
-                        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1 };
-                        region.imageOffset = { 0, 0, int32_t(zSlice) };
-                        region.imageExtent = { width, height, 1 };
-                        if (!(s_exp & 16))  // NFSMW_GPU_EXP bit 16: no staging copy (upload cost experiment)
-                            vkCmdCopyBufferToImage(s_cmd, s_ring, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-                        FullBarrier();
-                        SubmitIfStarving();
                     }
                     // Mip levels 1..maxLevel, each face from its storage.
                     for (uint32_t level = 1; level <= maxLevel; level++)
@@ -4067,35 +4638,50 @@ void main()
                         }
                         for (uint32_t layer = 0; layer < layers; layer++)
                         {
-                            VkDeviceSize staging = RingAllocate(VkDeviceSize(levelRowWords) * 4 * lbh);
-                            if (staging == ~VkDeviceSize(0))
-                                break;
-                            EndPass();
-                            Begin();
-                            UntileConstants uc{ levelBase + layer * mips.SliceStride(storage), f.tiled ? 1u : 0u,
-                                f.tiled ? mips.PitchBlocks(storage) : mips.RowBytes(storage), fi.bpbLog2,
-                                levelOffX, levelOffY, lbw, lbh, uint32_t(f.endianness), fi.convert, uint32_t(staging / 4), levelRowWords,
-                                0, 0 };
-                            VkDescriptorBufferInfo ring{ s_ring, 0, kRingSize };
-                            VkWriteDescriptorSet w[5] = {
-                                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr },
-                                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ring, nullptr },
-                            };
-                            s_stateEpoch++;
-                            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untilePipeline);
-                            s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileLayout, 0, AddSharedParts(w, 2), w);
-                            vkCmdPushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
-                            uint32_t groupsX = fi.convert != 0 || fi.bpbLog2 >= 2 ? lbw : levelRowWords;
-                            vkCmdDispatch(s_cmd, (groupsX + 7) / 8, (lbh + 7) / 8, 1);
-                            FullBarrier();
-                            VkBufferImageCopy region{};
-                            region.bufferOffset = staging;
-                            region.bufferRowLength = levelRowTexels;
-                            region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 };
-                            region.imageExtent = { lw, lh, 1 };
-                            if (!(s_exp & 16))  // NFSMW_GPU_EXP bit 16: no staging copy (upload cost experiment)
-                                vkCmdCopyBufferToImage(s_cmd, s_ring, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-                            FullBarrier();
+                            const uint32_t rowsPerChunk = decodedBc ? bc::BlockRowsPerChunk(lbw, lbh, kSlotSize) : lbh;
+                            if (!rowsPerChunk) return dummy;
+                            for (uint32_t firstBlockRow = 0; firstBlockRow < lbh; firstBlockRow += rowsPerChunk)
+                            {
+                                const uint32_t chunkRows = std::min(rowsPerChunk, lbh - firstBlockRow);
+                                VkDeviceSize staging = RingAllocate(VkDeviceSize(levelRowWords) * 4 * chunkRows * outRowsPerBlock);
+                                if (staging == ~VkDeviceSize(0))
+                                    break;
+                                EndPass();
+                                Begin();
+                                UntileConstants uc{ levelBase + layer * mips.SliceStride(storage), f.tiled ? 1u : 0u,
+                                    f.tiled ? mips.PitchBlocks(storage) : mips.RowBytes(storage), fi.bpbLog2,
+                                    levelOffX, levelOffY + firstBlockRow, lbw, chunkRows, uint32_t(f.endianness), fi.convert, uint32_t(staging / 4), levelRowWords,
+                                    0, 0 };
+                                VkDescriptorBufferInfo ring{ s_ring, 0, kRingSize };
+                                VkWriteDescriptorSet w[5] = {
+                                    { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr },
+                                    { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ring, nullptr },
+                                };
+                                s_stateEpoch++;
+                                vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untilePipeline);
+                                s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileLayout, 0, AddSharedParts(w, 2), w);
+                                vkCmdPushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
+                                uint32_t groupsX = fi.convert != 0 || fi.bpbLog2 >= 2 ? lbw : levelRowWords;
+                                {
+                                    int timed = TimingBegin("texture_compute");
+                                    vkCmdDispatch(s_cmd, (groupsX + 7) / 8, (chunkRows + 7) / 8, 1);
+                                    TimingEnd(timed);
+                                }
+                                FullBarrier();
+                                VkBufferImageCopy region{};
+                                region.bufferOffset = staging;
+                                region.bufferRowLength = levelRowTexels;
+                                region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 };
+                                region.imageOffset = { 0, int32_t(firstBlockRow * fi.block), 0 };
+                                region.imageExtent = { lw, std::min(lh - firstBlockRow * fi.block, chunkRows * fi.block), 1 };
+                                if (!(s_exp & 16))  // NFSMW_GPU_EXP bit 16: no staging copy (upload cost experiment)
+                                    {
+                                        int timed = TimingBegin("transfer");
+                                        vkCmdCopyBufferToImage(s_cmd, s_ring, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                                        TimingEnd(timed);
+                                    }
+                                FullBarrier();
+                            }
                         }
                     }
                     t.uploaded = true;
@@ -4236,6 +4822,7 @@ void main()
             if (state == TextureEntryState::kValid)
             {
                 c.hits++;
+                e.texture->usedFrame = s_frame;
                 if (s_textureVerify)
                     VerifyTexture(*e.texture, epoch);
                 if (!c.verify)
@@ -4299,8 +4886,38 @@ void main()
         // ---------------------------------------------------------------
         // Resolves
 
+        VkPipeline s_resolveWordPipeline = VK_NULL_HANDLE;  // 1x, 32-bit, word-order lanes
         VkPipeline s_resolvePipeline = VK_NULL_HANDLE;
         VkPipeline s_resolveCoalescedPipeline = VK_NULL_HANDLE;  // scaled resolves (see COALESCED in the shader)
+        // The same for a source of another scale denominator ([coalesced][den x - 1][den y - 1]: 1.5x is 3/2), made
+        // at the first resolve that needs it (ResolvePipeline); [..][0][0] are the two above.
+        VkPipeline s_resolveDenPipelines[2][2][2] = {};
+        VkPipeline ResolvePipeline(bool coalesced, const gpu::RenderScale& scale);
+        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool wordOrder = false);
+
+        // Coalesced scaled resolves: 2.8 -> 1.1 ms of scaled resolves a frame
+        // on the Steam Machine (RADV), but 2.6-3.4 -> 4.1-4.4 ms on an M1 Pro
+        // (MoltenVK), so not on Apple GPUs unless NFSMW_SCALED_COALESCE=1.
+        bool ScaledCoalesce(const VkPhysicalDeviceProperties& props)
+        {
+            const char* coalesce = std::getenv("NFSMW_SCALED_COALESCE");
+            return coalesce ? coalesce[0] != '0' : props.vendorID != 0x106B;
+        }
+
+        // The resolve pipelines a scale will use, made now (at start or at a
+        // live change, with the menu open) rather than at its first resolve
+        // mid-frame: a new one costs ~0.4 s on MoltenVK (once; the pipeline
+        // cache keeps it), 23 ms on RADV.
+        void PrewarmResolvePipelines(const gpu::RenderScale& scale)
+        {
+            if (scale.x.den == 1 && scale.y.den == 1)
+                return;
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(s_vk->physical, &props);
+            ResolvePipeline(false, scale);
+            if (ScaledCoalesce(props))
+                ResolvePipeline(true, scale);
+        }
         VkPipelineLayout s_resolveLayout = VK_NULL_HANDLE;
         VkDescriptorSetLayout s_resolveSetLayout = VK_NULL_HANDLE;
 
@@ -4314,7 +4931,7 @@ void main()
             float expScale;
             uint32_t srcWidth, srcHeight;
             int32_t srcOriginX, srcOriginY;  // host pixels
-            uint32_t scaleX, scaleY;         // host pixels per guest pixel in the source
+            uint32_t scaleX, scaleY;         // host pixels per guest pixel in the source (/ the pipeline's SB_DEN_X, SB_DEN_Y)
             uint32_t scaledWrite, slotWords; // also write the samples to the scaled memory
             // Also store into a cached direct texture (binding 4), as its
             // untile would have from the words (see Resolve); texX, texY:
@@ -4344,13 +4961,25 @@ layout(push_constant) uniform P
     float expScale;
     uvec2 srcSize;
     ivec2 srcOrigin;    // where the rectangle is in the host target (see untiled rendering), host pixels
-    uvec2 scale;        // host pixels per guest pixel (internal resolution)
+    uvec2 scale;        // host pixels per guest pixel (internal resolution): scale / kDen
     uint scaledWrite, slotWords;
     uint texWrite, texEndian, texConvert, texWidth, texHeight;  // also into a cached texture (binding 4)
 #ifdef TEX_OFFSET
     uint texX, texY;    // the destination's texel 0,0 in it (whole tiles)
 #endif
 } p;
+)" GLSL_SCALE_CODE R"(
+// The scale's denominators are the pipeline's own (CreateResolvePipeline: a
+// pair of pipelines for each, made at the first resolve that needs it), not
+// push constants: at a whole scale (1, 1) every block and weight expression
+// folds back to the arithmetic from before 1.5x, with no integer division.
+#ifndef SB_DEN_X
+#define SB_DEN_X 1u
+#endif
+#ifndef SB_DEN_Y
+#define SB_DEN_Y 1u
+#endif
+const uvec2 kDen = uvec2(SB_DEN_X, SB_DEN_Y);
 
 uint tiled2D(uint x, uint y, uint pitch, uint bppLog2)
 {
@@ -4379,10 +5008,41 @@ uint bppLog2(uint f)
     return 2u;
 }
 
+// px() at 1.5x (a den of 2): the host pixels the guest pixel covers, each
+// weighted by how much of it lies inside (gpu/render_scale.h's box filter:
+// 2/3 and 1/3, in 1/den of a pixel, num of them a whole guest pixel), or
+// (depth) the one holding its centre. The rectangle's origin is whole blocks
+// (even), so its pixels' host coordinates count from srcOrigin.
+vec4 pxFraction(uint x, uint y)
+{
+    if ((p.flags & 2u) != 0u)
+        return texelFetch(src, clamp(p.srcOrigin + ivec2(sbCenterHost(x, p.scale.x, kDen.x), sbCenterHost(y, p.scale.y, kDen.y)),
+            ivec2(0), ivec2(p.srcSize) - 1), 0);
+    vec4 v = vec4(0.0);
+    uint x1 = sbHostSize(x + 1u, p.scale.x, kDen.x), y1 = sbHostSize(y + 1u, p.scale.y, kDen.y);
+    for (uint j = sbHostEdge(y, p.scale.y, kDen.y); j < y1; j++)
+        for (uint i = sbHostEdge(x, p.scale.x, kDen.x); i < x1; i++)
+            v += float(sbOverlap(x, i, p.scale.x, kDen.x) * sbOverlap(y, j, p.scale.y, kDen.y)) *
+                texelFetch(src, clamp(p.srcOrigin + ivec2(i, j), ivec2(0), ivec2(p.srcSize) - 1), 0);
+    v /= float(p.scale.x * p.scale.y);
+    v *= p.expScale;
+    if ((p.flags & 1u) != 0u) v = v.bgra;
+    return v;
+}
+
 vec4 px(uint x, uint y)
 {
     // Guest pixel (x, y) of the rectangle: its sx x sy block of host pixels,
     // averaged (colour) or its first sample (depth).
+#ifdef RESOLVE_1X
+    vec4 v = texelFetch(src, clamp(p.srcOrigin + ivec2(x, y), ivec2(0), ivec2(p.srcSize) - 1), 0);
+    if ((p.flags & 2u) == 0u) {
+        v *= p.expScale;
+        if ((p.flags & 1u) != 0u) v = v.bgra;
+    }
+    return v;
+#else
+    if (kDen.x * kDen.y > 1u) return pxFraction(x, y);
     ivec2 c = clamp(p.srcOrigin + ivec2(x * p.scale.x, y * p.scale.y), ivec2(0), ivec2(p.srcSize) - 1);
     vec4 v = texelFetch(src, c, 0);
     if ((p.flags & 2u) != 0u) return v;
@@ -4397,17 +5057,18 @@ vec4 px(uint x, uint y)
     v *= p.expScale;
     if ((p.flags & 1u) != 0u) v = v.bgra;
     return v;
+#endif
 }
 
 uint unorm(float v, float m) { return uint(clamp(v, 0.0, 1.0) * m + 0.5); }
-
+)" GLSL_DEPTH24_PACK R"(
 uint pack32(vec4 c)
 {
     switch (p.format)
     {
     case 6u: case 14u: return packUnorm4x8(c);
     case 7u: return unorm(c.r, 1023.0) | (unorm(c.g, 1023.0) << 10) | (unorm(c.b, 1023.0) << 20) | (unorm(c.a, 3.0) << 30);
-    case 22u: case 23u: return unorm(c.r, 16777215.0) << 8;
+    case 22u: case 23u: return packDepth24(c.r) << 8;  // (not unorm: 1.0 overflows 24 bits, see depth24_glsl.h)
     case 25u: return packSnorm2x16(c.rg);
     case 31u: return packHalf2x16(c.rg);
     case 33u: case 36u: return floatBitsToUint(c.r);
@@ -4436,15 +5097,17 @@ uint pack16(vec4 c)
 // thread storing its own pixel's samples writes words `s` apart across the
 // group, several times the memory transactions: most of a scaled resolve's
 // cost. (A pipeline of its own: the shared memory would slow the others.)
-shared uint g_samples[64 * 16];  // by pixel, then sample (scale up to 4x4)
-shared uint g_offsets[64];       // each pixel's samples in the pool; ~0u: none
+// By block (gpu/render_scale.h): a pixel at a whole scale, 2x2 pixels at
+// 1.5x (a group is 16 whole blocks: its rows start even, as its columns).
+shared uint g_samples[64 * 16];  // by block, then sample (up to 64 pixels' worth at 4x4)
+shared uint g_offsets[64];       // each block's samples in the pool; ~0u: none
 #endif
 
 void main()
 {
     uint bl = bppLog2(p.format);
     uint perWord = bl >= 2u ? 1u : (4u >> bl);
-#ifdef COALESCED
+#if defined(COALESCED) || defined(RESOLVE_1X)
     uint l = gl_LocalInvocationIndex;
     uvec2 id = gl_WorkGroupID.xy * uvec2(32u, 2u) + uvec2((l & 3u) | ((l >> 3u) << 2u), (l >> 2u) & 1u);
 #else
@@ -4458,18 +5121,30 @@ void main()
     uint x = uint(p.origin.x) + gx, y = uint(p.origin.y) + gy;
     uint word = ((p.destBase + tiled2D(x, y, p.destPitch, bl)) & 0x1FFFFFFFu) >> 2;
     uint w;
+    #ifndef RESOLVE_1X
     if (bl == 2u && p.scaledWrite != 0u)
     {
-        // Each host sample into the page's scaled slot (see ScaledMemory).
+        // Each host sample this guest pixel owns into its block's place in
+        // the page's scaled slot (see ScaledMemory, gpu/render_scale.h): at a
+        // whole scale all its sx x sy, at 1.5x one, two or four of its 2x2
+        // block's 3x3, from where its texel sits in the block (its word's
+        // bits 0 and 2; the rectangle's origin is even, so gx and gy agree).
         uint a = word << 2;
         uint slot = inside ? s_table[a >> 12] : 0u;
-        uint s = p.scale.x * p.scale.y;
-        uint o = (slot - 1u) * p.slotWords + ((a & 4095u) >> 2) * s;
+        uint s = p.scale.x * p.scale.y;  // samples a block
+        uint k = (a & 4095u) >> 2;
+        uint o = (slot - 1u) * p.slotWords + sbBlockIndex(k, kDen.x, kDen.y) * s;
+        uint subX = sbSubX(k, kDen.x), subY = sbSubY(k, kDen.y);
+        uint i0 = sbHostEdge(subX, p.scale.x, kDen.x), i1 = sbHostEdge(subX + 1u, p.scale.x, kDen.x);
+        uint j0 = sbHostEdge(subY, p.scale.y, kDen.y), j1 = sbHostEdge(subY + 1u, p.scale.y, kDen.y);
+#ifdef COALESCED
+        uint lb = sbBlockIndex(l, kDen.x, kDen.y);  // the block's in this group (l is the word order)
+#endif
         if (slot != 0u)
         {
-            ivec2 c0 = p.srcOrigin + ivec2(gx * p.scale.x, gy * p.scale.y);
-            for (uint j = 0u; j < p.scale.y; j++)
-                for (uint i = 0u; i < p.scale.x; i++)
+            ivec2 c0 = p.srcOrigin + ivec2(sbHostEdge(gx, p.scale.x, kDen.x), sbHostEdge(gy, p.scale.y, kDen.y)) - ivec2(i0, j0);
+            for (uint j = j0; j < j1; j++)
+                for (uint i = i0; i < i1; i++)
                 {
                     vec4 v = texelFetch(src, clamp(c0 + ivec2(i, j), ivec2(0), ivec2(p.srcSize) - 1), 0);
                     if ((p.flags & 2u) == 0u)
@@ -4478,16 +5153,18 @@ void main()
                         if ((p.flags & 1u) != 0u) v = v.bgra;
                     }
 #ifdef COALESCED
-                    g_samples[l * s + j * p.scale.x + i] = swapWord(pack32(v), p.endian);
+                    g_samples[lb * s + j * p.scale.x + i] = swapWord(pack32(v), p.endian);
 #else
                     s_pool[o + j * p.scale.x + i] = swapWord(pack32(v), p.endian);
 #endif
                 }
         }
 #ifdef COALESCED
-        g_offsets[l] = slot != 0u ? o : ~0u;
+        if (subX == 0u && subY == 0u)  // (every pixel at a whole scale)
+            g_offsets[lb] = slot != 0u ? o : ~0u;
         barrier();
-        for (uint q = l; q < 64u * s; q += 64u)
+        uint samples = 64u / (kDen.x * kDen.y) * s;
+        for (uint q = l; q < samples; q += 64u)
         {
             uint po = g_offsets[q / s];
             if (po != ~0u)
@@ -4495,6 +5172,7 @@ void main()
         }
 #endif
     }
+    #endif
     if (!inside) return;
     if (bl == 3u)
     {
@@ -4528,6 +5206,8 @@ void main()
 #endif
     {
         uint v = swapWord(m, p.texEndian);
+        // (D24: m is packDepth24's, clamped, so the far plane stores 1.0 here
+        // too, not 0.)
         uint o = p.texConvert == 4u ? floatBitsToUint(float(v >> 8) / 16777215.0) : v;
 #ifdef TEX_OFFSET
         imageStore(t_image, ivec2(int(x + p.texX), int(y + p.texY)), uvec4(o, 0u, 0u, 0u));
@@ -4657,10 +5337,10 @@ void main()
                 }
             }
             // `r` is in guest pixels; the clear covers its host pixels.
-            int32_t x0 = std::clamp(r.x0, 0, int32_t(rt->guestWidth)) * int32_t(rt->scaleX);
-            int32_t y0 = std::clamp(r.y0, 0, int32_t(rt->guestHeight)) * int32_t(rt->scaleY);
-            int32_t x1 = std::clamp(r.x1, 0, int32_t(rt->guestWidth)) * int32_t(rt->scaleX);
-            int32_t y1 = std::clamp(r.y1, 0, int32_t(rt->guestHeight)) * int32_t(rt->scaleY);
+            int32_t x0 = rt->scale.x.EdgeAt(std::clamp(r.x0, 0, int32_t(rt->guestWidth)));
+            int32_t y0 = rt->scale.y.EdgeAt(std::clamp(r.y0, 0, int32_t(rt->guestHeight)));
+            int32_t x1 = rt->scale.x.EdgeAt(std::clamp(r.x1, 0, int32_t(rt->guestWidth)));
+            int32_t y1 = rt->scale.y.EdgeAt(std::clamp(r.y1, 0, int32_t(rt->guestHeight)));
             x1 = std::max(x1, x0);
             y1 = std::max(y1, y0);
             if (x1 <= x0 || y1 <= y0)
@@ -4692,9 +5372,233 @@ void main()
             s_pendingClears.push_back({ rt, rect, ca.clearValue });
         }
 
+        // NFSMW_LOG_SHADOWMAP=1 (diagnostic): every 5 s, the first depth
+        // resolve from a surface of pitch 1600 (the sun's shadow map) is
+        // copied back after it, and a [shadowmap] line gives the share of its
+        // texels that are exactly 0 (nearest) and exactly 0xFFFFFF (far: the
+        // clear, no caster there). Before d24-fix every far texel read 0
+        // (depth24_glsl.h). A GPU copy into host memory: guest memory may be
+        // the GPU's copy in VRAM (shadow mode), uncached to the CPU. Once a
+        // swap finds the copy's submission done, a thread of its own counts
+        // the 2.56M texels. (Counted at the swap, on the command processor,
+        // they made the next frame late: after every sample on the Steam
+        // Machine, 3-5 ms more CP time and a ~20 ms frame.) The command
+        // processor still records the copy (10 MB) and its two barriers
+        // every 5 s, so time perf with the probe off. Off (the default): a
+        // constant tested per resolve and per swap, nothing allocated.
+        const bool s_logShadowMap = [] { const char* v = std::getenv("NFSMW_LOG_SHADOWMAP"); return v && v[0] && v[0] != '0'; }();
+        struct ShadowMapProbe
+        {
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            const uint8_t* host = nullptr;
+            bool coherent = true;
+            VkDeviceSize size = 0;
+            bool failed = false;
+            uint64_t submission = 0, frame = 0;  // the copy's submission, and the frame
+            double seconds = 0;
+            uint32_t rangeBase = 0, rangeBytes = 0, destBase = 0, destPitch = 0, endian = 0, format = 0, srcBase = 0;
+            Rect rect{};
+            std::chrono::steady_clock::time_point next{};
+        };
+        std::unique_ptr<ShadowMapProbe> s_shadowMapProbe;
+        std::chrono::steady_clock::time_point s_shadowMapClock{};  // the first swap
+        // Idle: a resolve may record a copy. Recorded: the copy waits for its
+        // submission. Counting: the counting thread reads the buffer, and the
+        // command processor neither refills nor reallocates it until the
+        // thread sets idle (release; the resolve's check acquires). Static
+        // storage: a count still running at exit outlives s_shadowMapProbe.
+        enum : uint8_t { kProbeIdle, kProbeRecorded, kProbeCounting };
+        std::atomic<uint8_t> s_shadowMapState{ kProbeIdle };
+
+        // What the counting thread needs, copied: it reads the buffer only.
+        struct ShadowMapSample
+        {
+            const uint8_t* host;
+            uint32_t rangeBase, rangeBytes, destBase, destPitch, endian, format, srcBase;
+            Rect rect;
+            uint64_t frame;
+            double seconds;
+        };
+
+        void ShadowMapCount(ShadowMapSample p)
+        {
+            SetHostThreadName("nfsmw-shadowmap");
+            hostcpu::LeaveReservedCore();  // started by the command processor
+#ifdef __APPLE__
+            pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);  // (not the CP's interactive class)
+#endif
+            // By 32x32 tiles: 32-bit texels make a tile 4 KB of consecutive
+            // bytes (Tiled2D), so a tile wholly inside the rectangle is read
+            // in order; the rest texel by texel.
+            // (farTexels, not "far": <windows.h> defines far and near as nothing.)
+            uint64_t texels = 0, zero = 0, farTexels = 0, outside = 0;
+            auto count = [&](uint32_t offset) {
+                if (uint64_t(offset) + 4 > p.rangeBytes)
+                {
+                    outside++;
+                    return;
+                }
+                uint32_t word;
+                memcpy(&word, p.host + offset, 4);
+                uint32_t d = GpuSwap(word, p.endian >= 4 ? 2 : p.endian) >> 8;
+                texels++;
+                zero += d == 0;
+                farTexels += d == 0xFFFFFF;
+            };
+            auto offsetOf = [&](uint32_t x, uint32_t y) { return ((p.destBase + Tiled2D(x, y, p.destPitch, 2)) & 0x1FFFFFFF) - p.rangeBase; };
+            const uint32_t x0 = uint32_t(p.rect.x0), y0 = uint32_t(p.rect.y0), x1 = uint32_t(p.rect.x1), y1 = uint32_t(p.rect.y1);
+            for (uint32_t ty = y0 >> 5; ty <= (y1 - 1) >> 5; ty++)
+                for (uint32_t tx = x0 >> 5; tx <= (x1 - 1) >> 5; tx++)
+                {
+                    uint32_t ax = std::max(x0, tx * 32), bx = std::min(x1, tx * 32 + 32);
+                    uint32_t ay = std::max(y0, ty * 32), by = std::min(y1, ty * 32 + 32);
+                    if (bx - ax == 32 && by - ay == 32)
+                        for (uint32_t i = 0, base = offsetOf(tx * 32, ty * 32); i < 1024; i++)
+                            count(base + i * 4);
+                    else
+                        for (uint32_t y = ay; y < by; y++)
+                            for (uint32_t x = ax; x < bx; x++)
+                                count(offsetOf(x, y));
+                }
+            auto pct = [&](uint64_t n) { return texels ? 100.0 * double(n) / double(texels) : 0.0; };
+            fprintf(stderr, "[shadowmap] frame %llu (%.1f s): depth resolve b%u p1600 fmt %u rect (%d,%d)-(%d,%d) -> %08X: %llu texels, "
+                "zero %.2f%%, far %.2f%%%s\n", (unsigned long long)p.frame, p.seconds, p.srcBase, p.format, p.rect.x0, p.rect.y0,
+                p.rect.x1, p.rect.y1, p.destBase, (unsigned long long)texels, pct(zero), pct(farTexels),
+                outside ? std::format(" ({} texels outside the copy)", outside).c_str() : "");
+            s_shadowMapState.store(kProbeIdle, std::memory_order_release);
+        }
+
+        void ShadowMapProbeRecord(uint32_t rangeBase, uint32_t rangeBytes, const ResolveConstants& rc, const Rect& r, uint32_t srcBase)
+        {
+            if (!s_shadowMapProbe)
+                s_shadowMapProbe = std::make_unique<ShadowMapProbe>();
+            ShadowMapProbe& p = *s_shadowMapProbe;
+            auto now = std::chrono::steady_clock::now();
+            if (p.failed || s_shadowMapState.load(std::memory_order_acquire) != kProbeIdle || now < p.next || rangeBytes == 0)
+                return;
+            if (p.size < rangeBytes)
+            {
+                if (p.buffer)
+                {
+                    vkDestroyBuffer(s_dev, p.buffer, nullptr);
+                    vkFreeMemory(s_dev, p.memory, nullptr);
+                    p.buffer = VK_NULL_HANDLE;
+                    p.memory = VK_NULL_HANDLE;
+                    p.host = nullptr;
+                    p.size = 0;
+                }
+                VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+                bci.size = rangeBytes;
+                bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                VkMemoryRequirements req{};
+                VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                void* mapped = nullptr;
+                const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+                bool ok = vkCreateBuffer(s_dev, &bci, nullptr, &p.buffer) == VK_SUCCESS;
+                if (ok)
+                {
+                    vkGetBufferMemoryRequirements(s_dev, p.buffer, &req);
+                    mai.allocationSize = req.size;
+                    // Cached host memory when there is some (the CPU reads the
+                    // copy), else any host-visible coherent type. (Inline: the
+                    // memory plan, gpu/memory_plan.h, replaced the renderer's
+                    // FindMemoryTypePreferring; the windows branch does the same.)
+                    const VkMemoryPropertyFlags cached = visible | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+                    mai.memoryTypeIndex = UINT32_MAX;
+                    for (uint32_t i = 0; i < s_memProps.memoryTypeCount && mai.memoryTypeIndex == UINT32_MAX; i++)
+                        if ((req.memoryTypeBits & (1u << i)) && (s_memProps.memoryTypes[i].propertyFlags & cached) == cached)
+                            mai.memoryTypeIndex = i;
+                    if (mai.memoryTypeIndex == UINT32_MAX)
+                        mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, visible | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                    ok = (s_memProps.memoryTypes[mai.memoryTypeIndex].propertyFlags & visible) == visible &&
+                        vkAllocateMemory(s_dev, &mai, nullptr, &p.memory) == VK_SUCCESS;
+                }
+                ok = ok && vkBindBufferMemory(s_dev, p.buffer, p.memory, 0) == VK_SUCCESS &&
+                    vkMapMemory(s_dev, p.memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS;
+                if (!ok)
+                {
+                    fprintf(stderr, "[shadowmap] no host-visible buffer for the copy (%u bytes): off\n", rangeBytes);
+                    if (p.buffer)
+                        vkDestroyBuffer(s_dev, p.buffer, nullptr);
+                    if (p.memory)
+                        vkFreeMemory(s_dev, p.memory, nullptr);
+                    p.buffer = VK_NULL_HANDLE;
+                    p.memory = VK_NULL_HANDLE;
+                    p.failed = true;
+                    return;
+                }
+                p.host = static_cast<const uint8_t*>(mapped);
+                p.size = rangeBytes;
+                p.coherent = (s_memProps.memoryTypes[mai.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+            }
+            // The resolve's writes -> the copy -> the host's reads (after
+            // the submission's fence).
+            VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            VkBufferCopy copy{ rangeBase, 0, rangeBytes };
+            {
+                int timed = TimingBegin("transfer");
+                vkCmdCopyBuffer(s_cmd, s_shared, p.buffer, 1, &copy);
+                TimingEnd(timed);
+            }
+            mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            s_shadowMapState.store(kProbeRecorded, std::memory_order_relaxed);
+            p.submission = s_submissionCounter;
+            p.frame = s_frame;
+            p.seconds = s_shadowMapClock.time_since_epoch().count()
+                ? std::chrono::duration<double>(now - s_shadowMapClock).count() : 0.0;
+            p.rangeBase = rangeBase;
+            p.rangeBytes = rangeBytes;
+            p.destBase = rc.destBase;
+            p.destPitch = rc.destPitch;
+            p.endian = rc.endian;
+            p.format = rc.format;
+            p.srcBase = srcBase;
+            p.rect = r;
+            p.next = now + std::chrono::seconds(5);
+        }
+
+        // At a swap: the recorded copy, once its submission is done, goes to
+        // a counting thread (ShadowMapCount).
+        void ShadowMapProbeOnSwap()
+        {
+            if (!s_shadowMapClock.time_since_epoch().count())
+                s_shadowMapClock = std::chrono::steady_clock::now();
+            if (!s_shadowMapProbe || s_shadowMapState.load(std::memory_order_relaxed) != kProbeRecorded)
+                return;
+            ShadowMapProbe& p = *s_shadowMapProbe;
+            {
+                std::lock_guard lock(s_submitMutex);
+                bool done = p.submission < s_submissionCounter &&
+                    (s_inFlight.empty() || s_submissions[s_inFlight.front()].number > p.submission);
+                if (!done)
+                    return;
+            }
+            if (!p.coherent)
+            {
+                VkMappedMemoryRange range{ VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, p.memory, 0, VK_WHOLE_SIZE };
+                vkInvalidateMappedMemoryRanges(s_dev, 1, &range);
+            }
+            s_shadowMapState.store(kProbeCounting, std::memory_order_relaxed);
+            std::thread(ShadowMapCount, ShadowMapSample{ p.host, p.rangeBase, p.rangeBytes, p.destBase, p.destPitch, p.endian, p.format,
+                p.srcBase, p.rect, p.frame, p.seconds }).detach();
+        }
+
         void Resolve()
         {
             s_stats.resolves++;
+            static const bool logReflectionResolves=[] {const char* v=std::getenv("NFSMW_REFLECTION_LOG");return v && v[0]=='1';}();
+            static std::set<std::array<uint32_t,3>> reflectionResolves;
+            const std::array<uint32_t,3> reflectionResolve={s_regs[XE_GPU_REG_RB_COLOR_INFO],
+                s_regs[XE_GPU_REG_RB_COPY_DEST_INFO],s_regs[XE_GPU_REG_RB_SURFACE_INFO]};
+            if(logReflectionResolves && reflectionResolves.size()<96 && reflectionResolves.insert(reflectionResolve).second)
+                fprintf(stderr,"[reflection-resolve] color=%08x copy_dest=%08x surface=%08x control=%08x\n",
+                    reflectionResolve[0],reflectionResolve[1],reflectionResolve[2],s_regs[XE_GPU_REG_RB_COPY_CONTROL]);
             auto copyControl = Reg<reg::RB_COPY_CONTROL>();
             auto surfaceInfo = Reg<reg::RB_SURFACE_INFO>();
             uint32_t pitch = surfaceInfo.surface_pitch;
@@ -4800,6 +5704,7 @@ void main()
                 : uint32_t(destInfo.copy_dest_format);
             bool copy = copyControl.copy_command == xenos::CopyCommand::kRaw ||
                 copyControl.copy_command == xenos::CopyCommand::kConvert;
+            if (depthSource && copy && destBase != 0) ++s_visualDepthResolves;
             if (copy && destBase != 0)
             {
                 auto [extentStart, extentEnd] = ResolveExtent(r, (destPitch.copy_dest_pitch + 31) & ~31u, ResolveBppLog2(format));
@@ -4832,10 +5737,10 @@ void main()
                     if (s_untiledArea && source->cut && !source->wholeArea)
                     {
                         auto [shiftX, shiftY] = TileShift();
-                        int32_t x0 = std::max((r.x0 + shiftX) * int32_t(source->scaleX), 0);
-                        int32_t y0 = std::max((r.y0 + shiftY) * int32_t(source->scaleY), 0);
-                        int32_t x1 = std::min({ (r.x1 + shiftX) * int32_t(source->scaleX), int32_t(source->width), int32_t(source->cutReach.width) });
-                        int32_t y1 = std::min({ (r.y1 + shiftY) * int32_t(source->scaleY), int32_t(source->height), int32_t(source->cutReach.height) });
+                        int32_t x0 = source->scale.x.EdgeAt(r.x0 + shiftX);
+                        int32_t y0 = source->scale.y.EdgeAt(r.y0 + shiftY);
+                        int32_t x1 = std::min({ source->scale.x.EdgeAt(r.x1 + shiftX), int32_t(source->width), int32_t(source->cutReach.width) });
+                        int32_t y1 = std::min({ source->scale.y.EdgeAt(r.y1 + shiftY), int32_t(source->height), int32_t(source->cutReach.height) });
                         VkRect2D read{ { x0, y0 }, { uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0)) } };
                         if (read.extent.width && read.extent.height && !Contains(source->cutDrawn, read))
                         {
@@ -4852,15 +5757,16 @@ void main()
                     if (s_clearFlushRect)
                     {
                         // What the shader reads (px() and the scaled path:
-                        // size x scale host pixels from rc.srcOrigin, each
-                        // axis clamped to the target), so the clears it
-                        // doesn't see stay pending.
+                        // the rectangle's host pixels from rc.srcOrigin, each
+                        // axis clamped to the target; at 1.5x its edges are
+                        // even, so whole), so the clears it doesn't see stay
+                        // pending.
                         auto [shiftX, shiftY] = TileShift();
                         auto texel = [](int32_t v, uint32_t size) { return std::clamp(v, 0, int32_t(size) - 1); };
-                        int32_t x0 = texel((r.x0 + shiftX) * int32_t(source->scaleX), source->width);
-                        int32_t y0 = texel((r.y0 + shiftY) * int32_t(source->scaleY), source->height);
-                        int32_t x1 = texel((r.x1 + shiftX) * int32_t(source->scaleX) - 1, source->width) + 1;
-                        int32_t y1 = texel((r.y1 + shiftY) * int32_t(source->scaleY) - 1, source->height) + 1;
+                        int32_t x0 = texel(source->scale.x.EdgeAt(r.x0 + shiftX), source->width);
+                        int32_t y0 = texel(source->scale.y.EdgeAt(r.y0 + shiftY), source->height);
+                        int32_t x1 = texel(source->scale.x.EdgeAt(r.x1 + shiftX) - 1, source->width) + 1;
+                        int32_t y1 = texel(source->scale.y.EdgeAt(r.y1 + shiftY) - 1, source->height) + 1;
                         VkRect2D read{ { x0, y0 }, { uint32_t(x1 - x0), uint32_t(y1 - y0) } };
                         FlushPendingClears(source, &read);
                     }
@@ -4884,16 +5790,26 @@ void main()
                     rc.srcWidth = source->width;
                     rc.srcHeight = source->height;
                     auto [shiftX, shiftY] = TileShift();
-                    rc.srcOriginX = (r.x0 + shiftX) * int32_t(source->scaleX);
-                    rc.srcOriginY = (r.y0 + shiftY) * int32_t(source->scaleY);
-                    rc.scaleX = source->scaleX;
-                    rc.scaleY = source->scaleY;
+                    rc.srcOriginX = source->scale.x.EdgeAt(r.x0 + shiftX);
+                    rc.srcOriginY = source->scale.y.EdgeAt(r.y0 + shiftY);
+                    rc.scaleX = source->scale.x.num;
+                    rc.scaleY = source->scale.y.num;
+                    // At 1.5x the shader counts host pixels from srcOrigin
+                    // and the destination's blocks from its origin: both
+                    // need even coordinates (resolves are 8-pixel aligned
+                    // and the tile offsets even, so they are).
+                    const bool wholeBlocks = (r.x0 + shiftX) >= 0 && (r.y0 + shiftY) >= 0 &&
+                        source->scale.x.Exact(uint32_t(r.x0 + shiftX)) && source->scale.y.Exact(uint32_t(r.y0 + shiftY)) &&
+                        source->scale.x.Exact(uint32_t(r.x0)) && source->scale.y.Exact(uint32_t(r.y0));
+                    if (!wholeBlocks)
+                        LogOnce(0x2500, "resolve at (%d,%d) (tile shift %d,%d) from a %s target isn't whole blocks: kept at 1x only, "
+                            "its 1x average up to half a host pixel off", r.x0, r.y0, shiftX, shiftY, gpu::ScaleName(source->scale).c_str());
                     uint32_t bl = ResolveBppLog2(format);
                     uint32_t firstPage = rangeBase >> 12;
                     uint32_t lastPage = std::min<uint32_t>((rangeBase + rangeBytes - 1) >> 12, kGuestPages - 1);
                     // A 32-bit resolve from a scaled target keeps its samples.
-                    bool scaledWrite = source->scaleX * source->scaleY > 1 && bl == 2 && !destInfo.copy_dest_array &&
-                        EnsureScaledMemory() && source->scaleX == s_scaled.sx && source->scaleY == s_scaled.sy;
+                    bool scaledWrite = !source->scale.IsOne() && wholeBlocks && bl == 2 && !destInfo.copy_dest_array &&
+                        EnsureScaledMemory() && source->scale == s_scaled.scale;
                     if (scaledWrite)
                     {
                         std::vector<std::pair<uint32_t, uint32_t>> fresh;
@@ -4912,7 +5828,7 @@ void main()
                         FillFreshSlots(fresh);
                         rc.scaledWrite = 1;
                         rc.slotWords = s_scaled.slotWords;
-                        s_scaled.resolvedBytes += uint64_t(rc.width) * rc.height * s_scaled.s * 4;
+                        s_scaled.resolvedBytes += s_scaled.scale.HostPixels(rc.width, rc.height) * 4;
                     }
 
                     // A cached direct 1x texture of exactly this surface (its
@@ -5038,6 +5954,7 @@ void main()
                     }
                     if (fused)
                     {
+                        fused->usedFrame = s_frame;
                         rc.texWrite = 1;
                         rc.texEndian = fused->endian;
                         rc.texConvert = fused->convert;
@@ -5069,17 +5986,26 @@ void main()
                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ti, nullptr, nullptr };
                     s_stateEpoch++;
                     bool coalesced = scaledWrite && s_scaled.coalesce;  // 32x2 pixels a group
-                    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, coalesced ? s_resolveCoalescedPipeline : s_resolvePipeline);
+                    static const bool wordOrderEnabled = [] { const char* v = std::getenv("NFSMW_RESOLVE_WORD_ORDER"); return !v || v[0] != '0'; }();
+                    const bool wordOrder = gpu::g_workReductionEnabled && wordOrderEnabled && source->scale.IsOne() && !scaledWrite && bl == 2;
+                    if (wordOrder && !s_resolveWordPipeline)
+                        if (gpu::g_workReductionEnabled) MakeResolvePipeline(false, 1, 1, &s_resolveWordPipeline, true);
+                    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, wordOrder ? s_resolveWordPipeline : ResolvePipeline(coalesced, source->scale));
                     s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
                     vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
                     uint32_t perWord = bl >= 2 ? 1 : (4 >> bl);
+                    int timedResolve = TimingBegin(depthSource ? "resolve_depth" : "resolve_color",
+                        rc.width, rc.height, rc.destBase, format, rangeBytes);
                     if (!(s_exp & 2))
-                        vkCmdDispatch(s_cmd, coalesced ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
-                            coalesced ? (rc.height + 1) / 2 : (rc.height + 7) / 8, 1);
+                        vkCmdDispatch(s_cmd, (coalesced || wordOrder) ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
+                            (coalesced || wordOrder) ? (rc.height + 1) / 2 : (rc.height + 7) / 8, 1);
                     if (scaledWrite)
                         FullBarrier();  // (above 1x: as before)
                     else
                         ResolveBarrier(rangeBase, rangeBytes, fused ? fused->guestStart : 0);
+                    TimingEnd(timedResolve);
+                    if (s_logShadowMap && depthSource && pitch == 1600 && bl == 2)
+                        ShadowMapProbeRecord(rangeBase, rangeBytes, rc, r, source->base);
                     SubmitIfStarving();
                     // Write sequences are per host page: guest pages of the
                     // edge host pages outside this resolve whose scaled copy
@@ -5141,6 +6067,41 @@ void main()
                 }
             }
 
+            if (s_visual.active && depthSource && copy && destBase != 0 && s_visual.resolveIndex++ == s_visual.selectedResolve)
+            {
+                s_visual.depthDestinations.insert(destBase & 0x1FFFFFFFu);
+                auto name = std::format("depth-targets/frame-{}-resolve-{}", s_visual.frame, s_visual.images);
+                s_visual.text("summary.txt", std::format("{}: EDRAM base {}, pitch {}, guest format {}, Vulkan format {}, dest {:08x}, dest format {}, rect {},{}..{},{}\n",
+                    name, source->base, source->pitch, source->format, int(source->vkFormat), destBase, format, r.x0, r.y0, r.x1, r.y1), true);
+                VisualImage(source->image.image, source->width, source->height, VK_IMAGE_ASPECT_DEPTH_BIT, name, true);
+                // Raw resolved guest words after the compute resolve, before guest ownership changes.
+                if (source->width * uint64_t(source->height) * 4 <= (12ull << 20))
+                {
+                    auto [offset, endOffset] = ResolveExtent(r, (destPitch.copy_dest_pitch + 31) & ~31u, ResolveBppLog2(format));
+                    uint32_t bytes = endOffset - offset;
+                    uint64_t base = (destBase & 0x1FFFFFFFu) + uint64_t(offset);
+                    if (bytes && bytes <= (12u << 20) && base + bytes <= kSharedSize && s_visual.bytes + bytes < visual::Capture::limit)
+                    {
+                        EndPass(); VkDeviceSize at = RingAllocate(bytes);
+                        if (at != ~VkDeviceSize(0))
+                        {
+                            FullBarrier(); VkBufferCopy copyRegion{ base, at, bytes };
+                            {
+                                int timed = TimingBegin("transfer");
+                                vkCmdCopyBuffer(s_cmd, s_shared, s_ring, 1, &copyRegion);
+                                TimingEnd(timed);
+                            }
+                            VkMemoryBarrier host{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+                            host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                            vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr, 0, nullptr);
+                            Flush();
+                            s_visual.write(name + ".guest-tiled.bin", s_ringHost + at, bytes);
+                            s_visual.text("summary.txt", std::format("{} guest bytes: base {:08x}, size {}, endian {}, tiled pitch {}\n", name, base, bytes, uint32_t(destInfo.copy_dest_endian), uint32_t(destPitch.copy_dest_pitch)), true);
+                        }
+                    }
+                }
+            }
+
             // Clears (in host target coordinates, see TileShift).
             {
                 auto [shiftX, shiftY] = TileShift();
@@ -5198,9 +6159,12 @@ layout(local_size_x = 64) in;
 layout(std430, set = 0, binding = 0) readonly buffer SharedMemory { uint g_mem[]; };)" GLSL_SHARED_MEMORY_READ R"(
 layout(std430, set = 0, binding = 1) buffer ScaledPool { uint s_pool[]; };
 layout(std430, set = 0, binding = 2) readonly buffer List { uint l_pairs[]; };
-layout(push_constant) uniform P { uint count, s, slotWords, listWord; } p;
-// A new slot starts as its page's 1x data, each word repeated s times: a
-// resolve covering the page only in part leaves no garbage around it.
+layout(push_constant) uniform P { uint count, slotWords, listWord, pad; uvec2 scale, den; } p;
+)" GLSL_SCALE_CODE R"(
+// A new slot starts as its page's 1x data, each word in the host samples its
+// texel owns (all s at a whole scale; at 1.5x one, two or four of its
+// block's): a resolve covering the page only in part leaves no garbage
+// around it.
 void main()
 {
     uint n = gl_GlobalInvocationID.x;
@@ -5208,9 +6172,12 @@ void main()
     if (pair >= p.count) return;
     uint page = l_pairs[p.listWord + pair * 2u], slot = l_pairs[p.listWord + pair * 2u + 1u];
     uint v = memLoad(page * 1024u + k);
-    uint o = slot * p.slotWords + k * p.s;
-    for (uint i = 0u; i < p.s; i++)
-        s_pool[o + i] = v;
+    uint o = slot * p.slotWords + sbBlockIndex(k, p.den.x, p.den.y) * (p.scale.x * p.scale.y);
+    uint subX = sbSubX(k, p.den.x), subY = sbSubY(k, p.den.y);
+    uint i1 = sbHostEdge(subX + 1u, p.scale.x, p.den.x), j1 = sbHostEdge(subY + 1u, p.scale.y, p.den.y);
+    for (uint j = sbHostEdge(subY, p.scale.y, p.den.y); j < j1; j++)
+        for (uint i = sbHostEdge(subX, p.scale.x, p.den.x); i < i1; i++)
+            s_pool[o + j * p.scale.x + i] = v;
 }
 )";
         VkPipeline s_scaledFillPipeline = VK_NULL_HANDLE;
@@ -5230,8 +6197,10 @@ layout(std430, set = 0, binding = 2) writeonly buffer Out { uint o_mem[]; };
 #else
 layout(set = 0, binding = 2, r32ui) writeonly uniform uimage2D o_image;
 #endif
-layout(push_constant) uniform P { uint base, pitch, width, height, sx, sy, endian, slotWords; } p;
-
+// width, height: the texture's host size (whole blocks); scale / den: host
+// pixels per guest pixel.
+layout(push_constant) uniform P { uint base, pitch, width, height, endian, slotWords; uvec2 scale, den; } p;
+)" GLSL_SCALE_CODE R"(
 uint tiled2D(uint x, uint y, uint pitch, uint bppLog2)
 {
     uint outer = (((y >> 5) * (pitch >> 5)) + (x >> 5)) << 6;
@@ -5254,14 +6223,17 @@ uint swapWord(uint v, uint e)
 void main()
 {
     uvec2 h = gl_GlobalInvocationID.xy;
-    uint w = p.width * p.sx;
-    if (h.x >= w || h.y >= p.height * p.sy) return;
-    uint gx = h.x / p.sx, gy = h.y / p.sy;
-    uint a = (p.base + tiled2D(gx, gy, p.pitch, 2u)) & 0x1FFFFFFFu;
+    uint w = p.width;
+    if (h.x >= w || h.y >= p.height) return;
+    // Host texel h: sample (h mod scale) of the block (h / scale), whose
+    // first texel is guest (block x den) (gpu/render_scale.h).
+    uvec2 b = h / p.scale;
+    uint a = (p.base + tiled2D(b.x * p.den.x, b.y * p.den.y, p.pitch, 2u)) & 0x1FFFFFFFu;
     uint slot = s_table[a >> 12];
     uint v = 0u;
     if (slot != 0u)
-        v = s_pool[(slot - 1u) * p.slotWords + ((a & 4095u) >> 2) * (p.sx * p.sy) + (h.y - gy * p.sy) * p.sx + (h.x - gx * p.sx)];
+        v = s_pool[(slot - 1u) * p.slotWords + sbSampleWord((a & 4095u) >> 2, h.x - b.x * p.scale.x, h.y - b.y * p.scale.y,
+            p.scale.x, p.scale.y, p.den.x, p.den.y)];
 #ifdef TO_BUFFER
     o_mem[h.y * w + h.x] = swapWord(v, p.endian);
 #else
@@ -5341,7 +6313,7 @@ void main()
             if (!keepBuffers)
                 FreeScaledBuffers();
             s_scaled.tried = s_scaled.enabled = false;
-            s_scaled.sx = s_scaled.sy = s_scaled.s = 1;
+            s_scaled.scale = {};
             s_scaled.slotWords = s_scaled.slots = 0;
             s_scaled.scratchSize = 0;
             std::vector<uint32_t>().swap(s_scaled.pageSlot);
@@ -5362,10 +6334,8 @@ void main()
             if (const char* v = std::getenv("NFSMW_SCALED_RESOLVE"); v && v[0] == '0')
                 return false;
             auto start = std::chrono::steady_clock::now();
-            s_scaled.sx = s_renderScaleX;
-            s_scaled.sy = s_renderScaleY;
-            s_scaled.s = s_scaled.sx * s_scaled.sy;
-            if (s_scaled.s <= 1)
+            s_scaled.scale = s_renderScale;
+            if (s_scaled.scale.IsOne())
                 return false;
             VkPhysicalDeviceProperties props;
             vkGetPhysicalDeviceProperties(s_vk->physical, &props);
@@ -5377,15 +6347,15 @@ void main()
             // within the device's storage buffer range (NFSMW_SCALED_MB=4096
             // is past a 4 GB - 1 limit).
             VkDeviceSize poolSize = std::min<VkDeviceSize>(VkDeviceSize(megabytes) << 20, props.limits.maxStorageBufferRange) & ~VkDeviceSize(0xFFFF);
-            s_scaled.slotWords = 1024 * s_scaled.s;
-            s_scaled.slots = uint32_t(std::min<uint64_t>(poolSize / (4096ull * s_scaled.s), kGuestPages));
+            s_scaled.slotWords = s_scaled.scale.SlotWords();
+            s_scaled.slots = uint32_t(std::min<uint64_t>(poolSize / (4ull * s_scaled.slotWords), kGuestPages));
             // Scaled textures up to 1280x1024 (at scale). The untile stores
             // into them through an R32_UINT view when the device can for every
             // scaled format (a mutable-format image with extended usage: the
             // format itself needn't be storable); otherwise they load through
             // a scratch buffer that size (the ring's slots are too small) and a
             // copy, one more full write and read of the texture.
-            s_scaled.scratchSize = VkDeviceSize(1280) * 1024 * 4 * s_scaled.s;
+            s_scaled.scratchSize = VkDeviceSize(s_scaled.scale.HostPixels(1280, 1024)) * 4;
             {
                 // (The image's format list is Vulkan 1.2.)
                 const char* v = std::getenv("NFSMW_SCALED_DIRECT");
@@ -5403,11 +6373,7 @@ void main()
                             VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT, &ifp) == VK_SUCCESS;
                 }
             }
-            // Coalesced resolves: 2.8 -> 1.1 ms of scaled resolves a frame on
-            // the Steam Machine (RADV), but 2.6-3.4 -> 4.1-4.4 ms on an M1 Pro
-            // (MoltenVK), so not on Apple GPUs unless NFSMW_SCALED_COALESCE=1.
-            const char* coalesce = std::getenv("NFSMW_SCALED_COALESCE");
-            s_scaled.coalesce = coalesce ? coalesce[0] != '0' : props.vendorID != 0x106B;
+            s_scaled.coalesce = ScaledCoalesce(props);
             // A scratch buffer kept from a smaller scale is too small.
             if (s_scaled.scratch && s_scaled.scratchBytes < s_scaled.scratchSize)
             {
@@ -5444,18 +6410,18 @@ void main()
             if (!s_scaledFillPipeline)
             {
                 auto bindings = WithSharedParts(b, 3);
-                CreateComputePipeline(kScaledFillGlsl, bindings.data(), uint32_t(bindings.size()), 4 * sizeof(uint32_t),
+                CreateComputePipeline(kScaledFillGlsl, bindings.data(), uint32_t(bindings.size()), 8 * sizeof(uint32_t),
                     s_scaledFillSetLayout, s_scaledFillLayout, s_scaledFillPipeline);
             }
             if (s_scaled.direct)
             {
                 b[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
                 if (!s_scaledStorePipeline)
-                    CreateComputePipeline(kScaledUntileGlsl, b, 3, 8 * sizeof(uint32_t), s_scaledStoreSetLayout, s_scaledStoreLayout,
+                    CreateComputePipeline(kScaledUntileGlsl, b, 3, 10 * sizeof(uint32_t), s_scaledStoreSetLayout, s_scaledStoreLayout,
                         s_scaledStorePipeline);
             }
             else if (!s_scaledUntilePipeline)
-                CreateComputePipeline(kScaledUntileGlsl, b, 3, 8 * sizeof(uint32_t), s_scaledUntileSetLayout, s_scaledUntileLayout,
+                CreateComputePipeline(kScaledUntileGlsl, b, 3, 10 * sizeof(uint32_t), s_scaledUntileSetLayout, s_scaledUntileLayout,
                     s_scaledUntilePipeline, "#define TO_BUFFER\n");
             EndPass();
             Begin();
@@ -5463,8 +6429,8 @@ void main()
             FullBarrier();
             s_scaled.enabled = true;
             s_textureCache->generation++;  // lookups decided without the scaled path
-            fprintf(stderr, "[renderer] scaled resolve memory: %u slots of %u KB (%llu MB), scale %ux%u, %s writes, textures %s (%.1f ms)\n",
-                s_scaled.slots, 4 * s_scaled.s, (unsigned long long)(poolSize >> 20), s_scaled.sx, s_scaled.sy,
+            fprintf(stderr, "[renderer] scaled resolve memory: %u slots of %u KB (%llu MB), scale %s, %s writes, textures %s (%.1f ms)\n",
+                s_scaled.slots, s_scaled.slotWords / 256, (unsigned long long)(poolSize >> 20), gpu::ScaleName(s_scaled.scale).c_str(),
                 s_scaled.coalesce ? "coalesced" : "per-thread", s_scaled.direct ? "stored directly" : "through a scratch buffer",
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
             return true;
@@ -5486,7 +6452,6 @@ void main()
 
         void LoadScaledTexture(Texture& t, uint32_t base, uint32_t pitchBlocks, uint32_t endian)
         {
-            uint32_t guestW = t.width / s_scaled.sx, guestH = t.height / s_scaled.sy;
             VkDeviceSize bytes = VkDeviceSize(t.width) * t.height * 4;
             if (bytes > s_scaled.scratchSize)
             {
@@ -5503,8 +6468,9 @@ void main()
             for (uint32_t k = 0; k < 3; k++)
                 w[k] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, k, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     nullptr, &bi[k], nullptr };
-            struct { uint32_t base, pitch, width, height, sx, sy, endian, slotWords; } pc = { base, pitchBlocks, guestW, guestH,
-                s_scaled.sx, s_scaled.sy, endian, s_scaled.slotWords };
+            const gpu::RenderScale& sc = s_scaled.scale;
+            struct { uint32_t base, pitch, width, height, endian, slotWords, scaleX, scaleY, denX, denY; } pc = { base, pitchBlocks,
+                t.width, t.height, endian, s_scaled.slotWords, sc.x.num, sc.y.num, sc.x.den, sc.y.den };
             s_stateEpoch++;
             if (t.storeView)
             {
@@ -5522,14 +6488,22 @@ void main()
                 vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledStorePipeline);
                 s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledStoreLayout, 0, 3, w);
                 vkCmdPushConstants(s_cmd, s_scaledStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-                vkCmdDispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
+                {
+                    int timed = TimingBegin("texture_compute");
+                    vkCmdDispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
+                    TimingEnd(timed);
+                }
                 ComputeBarrier();
                 return;
             }
             vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledUntilePipeline);
             s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledUntileLayout, 0, 3, w);
             vkCmdPushConstants(s_cmd, s_scaledUntileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            vkCmdDispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
+            {
+                int timed = TimingBegin("scaled_texture_compute", t.width, t.height);
+                vkCmdDispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
+                TimingEnd(timed);
+            }
             FullBarrier();
             if (!t.uploaded)
                 ToGeneral(t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, 1);
@@ -5537,7 +6511,11 @@ void main()
             region.bufferRowLength = t.width;
             region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             region.imageExtent = { t.width, t.height, 1 };
-            vkCmdCopyBufferToImage(s_cmd, s_scaled.scratch, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            {
+                int timed = TimingBegin("transfer");
+                vkCmdCopyBufferToImage(s_cmd, s_scaled.scratch, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                TimingEnd(timed);
+            }
             FullBarrier();
         }
 
@@ -5563,12 +6541,18 @@ void main()
                 for (uint32_t k = 0; k < 3; k++)
                     w[k] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, k, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                         nullptr, &bi[k], nullptr };
-                struct { uint32_t count, s, slotWords, listWord; } pc = { count, s_scaled.s, s_scaled.slotWords, uint32_t(list / 4) };
+                const gpu::RenderScale& sc = s_scaled.scale;
+                struct { uint32_t count, slotWords, listWord, pad, scaleX, scaleY, denX, denY; } pc = { count, s_scaled.slotWords,
+                    uint32_t(list / 4), 0, sc.x.num, sc.y.num, sc.x.den, sc.y.den };
                 s_stateEpoch++;
                 vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledFillPipeline);
                 s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledFillLayout, 0, AddSharedParts(w, 3), w);
                 vkCmdPushConstants(s_cmd, s_scaledFillLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-                vkCmdDispatch(s_cmd, (count * 1024 + 63) / 64, 1, 1);
+                {
+                    int timed = TimingBegin("scaled_memory_fill");
+                    vkCmdDispatch(s_cmd, (count * 1024 + 63) / 64, 1, 1);
+                    TimingEnd(timed);
+                }
                 FullBarrier();
             }
         }
@@ -5581,9 +6565,10 @@ layout(std430, set = 0, binding = 0) readonly buffer SharedMemory { uint g_mem[]
 layout(set = 0, binding = 1, rgba8) writeonly uniform image2D outImage;
 layout(std430, set = 0, binding = 2) readonly buffer ScaledPool { uint s_pool[]; };
 layout(std430, set = 0, binding = 3) readonly buffer ScaledTable { uint s_table[]; };
-// width, height: the output (host pixels when scaled: from the scaled memory).
-layout(push_constant) uniform P { uint base, pitch, tiled, endian, format, swizzle, width, height, sx, sy, slotWords, scaled; } p;
-
+// width, height: the output (host pixels when scaled: from the scaled memory,
+// at sx / denX x sy / denY host pixels per guest pixel).
+layout(push_constant) uniform P { uint base, pitch, tiled, endian, format, swizzle, width, height, sx, sy, slotWords, scaled, denX, denY; } p;
+)" GLSL_SCALE_CODE R"(
 uint tiled2D(uint x, uint y, uint pitch, uint bppLog2)
 {
     uint outer = (((y >> 5) * (pitch >> 5)) + (x >> 5)) << 6;
@@ -5602,10 +6587,13 @@ void main()
     uint v;
     if (p.scaled != 0u)
     {
-        uint gx = g.x / p.sx, gy = g.y / p.sy;
-        uint a = (p.base + tiled2D(gx, gy, p.pitch, 2u)) & 0x1FFFFFFFu;
+        // Host pixel g: sample (g mod scale) of the block (g / scale), whose
+        // first texel is guest (block x den) (gpu/render_scale.h).
+        uint bx = g.x / p.sx, by = g.y / p.sy;
+        uint a = (p.base + tiled2D(bx * p.denX, by * p.denY, p.pitch, 2u)) & 0x1FFFFFFFu;
         uint slot = s_table[a >> 12];
-        v = slot != 0u ? s_pool[(slot - 1u) * p.slotWords + ((a & 4095u) >> 2) * (p.sx * p.sy) + (g.y - gy * p.sy) * p.sx + (g.x - gx * p.sx)] : 0u;
+        v = slot != 0u ? s_pool[(slot - 1u) * p.slotWords + sbSampleWord((a & 4095u) >> 2, g.x - bx * p.sx, g.y - by * p.sy, p.sx, p.sy,
+            p.denX, p.denY)] : 0u;
     }
     else
     {
@@ -5660,11 +6648,52 @@ void main()
             };
             auto bindings = WithSharedParts(b, 2);
             CreateComputePipeline(kUntileGlsl, bindings.data(), uint32_t(bindings.size()), sizeof(UntileConstants), s_untileSetLayout,
-                s_untileLayout, s_untilePipeline);
+                s_untileLayout, s_untilePipeline, s_bcDecodeMask ? "#define BC_DECODE\n" : "");
             b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             bindings = WithSharedParts(b, 2);
             CreateComputePipeline(kUntileGlsl, bindings.data(), uint32_t(bindings.size()), sizeof(UntileConstants), s_untileStoreSetLayout,
                 s_untileStoreLayout, s_untileStorePipeline, "#define TO_IMAGE\n");
+        }
+
+        // The resolve shader for sources whose scale has these denominators
+        // (1 or 2 each; the shader's SB_DEN_X, SB_DEN_Y), into `out`.
+        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool wordOrder)
+        {
+            std::string log;
+            std::string preamble = wordOrder ? "#define RESOLVE_1X\n" : coalesced ? "#define COALESCED\n" : "";
+            if (s_resolvePush != offsetof(ResolveConstants, texX))
+                preamble += "#define TEX_OFFSET\n";
+            if (denX != 1)
+                preamble += std::format("#define SB_DEN_X {}u\n", denX);
+            if (denY != 1)
+                preamble += std::format("#define SB_DEN_Y {}u\n", denY);
+            auto spirv = CompileGlsl(kResolveGlsl, GLSLANG_STAGE_COMPUTE, log, preamble);
+            if (spirv.empty())
+            {
+                fprintf(stderr, "[renderer] resolve shader failed:\n%s\n", log.c_str());
+                abort();
+            }
+            VkShaderModule module = CreateModule(spirv);
+            VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+            cpci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
+                module, "main", nullptr };
+            cpci.layout = s_resolveLayout;
+            Check(vkCreateComputePipelines(s_dev, s_pipelineCache, 1, &cpci, nullptr, out), "resolve pipeline");
+        }
+
+        // The resolve pipeline for a source at `scale` (see s_resolveDenPipelines).
+        VkPipeline ResolvePipeline(bool coalesced, const gpu::RenderScale& scale)
+        {
+            const uint32_t dx = std::clamp(scale.x.den, 1u, 2u), dy = std::clamp(scale.y.den, 1u, 2u);
+            VkPipeline& slot = s_resolveDenPipelines[coalesced][dx - 1][dy - 1];
+            if (!slot)
+            {
+                auto start = std::chrono::steady_clock::now();
+                MakeResolvePipeline(coalesced, dx, dy, &slot);
+                fprintf(stderr, "[renderer] resolve pipeline for scale denominators %ux%u%s made (%.1f ms)\n", dx, dy,
+                    coalesced ? ", coalesced" : "", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+            }
+            return slot;
         }
 
         void CreateResolvePipeline()
@@ -5690,34 +6719,161 @@ void main()
             plci.pPushConstantRanges = &range;
             Check(vkCreatePipelineLayout(s_dev, &plci, nullptr, &s_resolveLayout), "resolve pipeline layout");
             for (bool coalesced : { false, true })
-            {
-                std::string log;
-                std::string preamble = coalesced ? "#define COALESCED\n" : "";
-                if (s_resolvePush != offsetof(ResolveConstants, texX))
-                    preamble += "#define TEX_OFFSET\n";
-                auto spirv = CompileGlsl(kResolveGlsl, GLSLANG_STAGE_COMPUTE, log, preamble);
-                if (spirv.empty())
-                {
-                    fprintf(stderr, "[renderer] resolve shader failed:\n%s\n", log.c_str());
-                    abort();
-                }
-                VkShaderModule module = CreateModule(spirv);
-                VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-                cpci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
-                    module, "main", nullptr };
-                cpci.layout = s_resolveLayout;
-                Check(vkCreateComputePipelines(s_dev, s_pipelineCache, 1, &cpci, nullptr,
-                    coalesced ? &s_resolveCoalescedPipeline : &s_resolvePipeline), "resolve pipeline");
-            }
+                MakeResolvePipeline(coalesced, 1, 1, coalesced ? &s_resolveCoalescedPipeline : &s_resolvePipeline);
+            if (gpu::g_workReductionEnabled) MakeResolvePipeline(false, 1, 1, &s_resolveWordPipeline, true);
+            s_resolveDenPipelines[0][0][0] = s_resolvePipeline;
+            s_resolveDenPipelines[1][0][0] = s_resolveCoalescedPipeline;
+            PrewarmResolvePipelines(s_renderScale);
         }
 
         // ---------------------------------------------------------------
 
-        // Guest physical memory imported without a copy (unified memory).
+        // Where guest memory and the upload ring go: gpu/memory_plan.h, which
+        // lists the places to try in order. A place the driver refuses (out of
+        // memory, say) is logged and the next one tried; only when none is
+        // left does the renderer give up.
+        memplan::Memory s_planMemory;  // the plan's view of the device's memory
+        uint32_t s_guestType = memplan::kNoType;  // the copy's memory type (kNoType: imported)
+        std::string s_guestChoice;  // for the [renderer] memory line
+
+        // Test hooks for the plan's fallbacks, which the machines we test on
+        // never need:
+        //   NFSMW_TEST_BAR_HEAP_MB=<MB>: the heaps holding CPU-mapped VRAM read
+        //     as that size to the plan, and the copy's and the ring's
+        //     allocations from those types fail (out of device memory) once
+        //     they would pass it, as on a GPU without resizable BAR;
+        //   NFSMW_TEST_ALLOC_FAIL=<places>: those places fail as out of device
+        //     memory (comma-separated: import, copy-vram, copy-system,
+        //     copy-cached, ring-vram, ring-cached, ring-system);
+        //   NFSMW_TEST_GPU_KIND=integrated|discrete|other: the plan takes the
+        //     GPU for that kind (the Deck's choice on the Steam Machine, say).
+        struct MemoryTest
+        {
+            uint64_t barBytes = 0, barUsed = 0;
+            std::string fail;  // ",a,b,"
+            const char* kind = nullptr;
+        };
+        MemoryTest s_memoryTest = [] {
+            MemoryTest t;
+            if (const char* v = std::getenv("NFSMW_TEST_BAR_HEAP_MB"); v && std::atoi(v) > 0)
+                t.barBytes = uint64_t(std::atoi(v)) << 20;
+            if (const char* v = std::getenv("NFSMW_TEST_ALLOC_FAIL"); v && v[0])
+                t.fail = std::string(",") + v + ",";
+            t.kind = std::getenv("NFSMW_TEST_GPU_KIND");
+            return t;
+        }();
+
+        // NFSMW_TEST_ALLOC_FAIL names this place.
+        bool MemoryTestRefuses(memplan::Place place, bool ring)
+        {
+            const char* name = memplan::Name(place, ring);
+            if (s_memoryTest.fail.find(std::string(",") + name + ",") == std::string::npos)
+                return false;
+            fprintf(stderr, "[renderer] NFSMW_TEST_ALLOC_FAIL: %s refused (out of device memory)\n", name);
+            return true;
+        }
+
+        // vkAllocateMemory for a planned place, through the test hooks.
+        VkResult AllocatePlanned(const memplan::Candidate& c, bool ring, VkDeviceSize size, VkDeviceMemory& memory)
+        {
+            if (MemoryTestRefuses(c.place, ring))
+                return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            const VkMemoryPropertyFlags bar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+            bool mappedVram = (s_memProps.memoryTypes[c.type].propertyFlags & bar) == bar;
+            if (mappedVram && s_memoryTest.barBytes && s_memoryTest.barUsed + size > s_memoryTest.barBytes)
+            {
+                fprintf(stderr, "[renderer] NFSMW_TEST_BAR_HEAP_MB: %llu MB of CPU-mapped VRAM refused (%llu of %llu MB taken)\n",
+                    (unsigned long long)(size >> 20), (unsigned long long)(s_memoryTest.barUsed >> 20),
+                    (unsigned long long)(s_memoryTest.barBytes >> 20));
+                return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            }
+            VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+            mai.allocationSize = size;
+            mai.memoryTypeIndex = c.type;
+            VkResult r = vkAllocateMemory(s_dev, &mai, nullptr, &memory);
+            if (r == VK_SUCCESS && mappedVram)
+                s_memoryTest.barUsed += size;
+            return r;
+        }
+
+        // The device's memory as the plan sees it (NFSMW_TEST_BAR_HEAP_MB
+        // applied), logged once: bug reports then show what a GPU offers.
+        memplan::Memory PlanMemory()
+        {
+            memplan::Memory m;
+            std::string line;
+            for (uint32_t h = 0; h < s_memProps.memoryHeapCount; h++)
+            {
+                m.heaps.push_back(s_memProps.memoryHeaps[h].size);
+                line += std::format("{}{} {}{}", h ? ", " : "", h, memplan::Size(m.heaps.back()),
+                    (s_memProps.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? " device-local" : "");
+            }
+            line += "; types (type:heap/flags):";
+            for (uint32_t i = 0; i < s_memProps.memoryTypeCount; i++)
+            {
+                m.types.push_back({ s_memProps.memoryTypes[i].propertyFlags, s_memProps.memoryTypes[i].heapIndex });
+                line += std::format(" {}:{}/{:X}", i, m.types.back().heap, m.types.back().flags);
+            }
+            if (s_memoryTest.barBytes)
+            {
+                memplan::ShrinkMappedVram(m, s_memoryTest.barBytes);
+                line += std::format(" (NFSMW_TEST_BAR_HEAP_MB: CPU-mapped VRAM's heaps read as {} MB)", s_memoryTest.barBytes >> 20);
+            }
+            fprintf(stderr, "[renderer] memory heaps: %s\n", line.c_str());
+            return m;
+        }
+
+        // Arm's Mali-G1 family (Mali-G1-Ultra/-Premium/-Pro, any core count),
+        // where both workarounds keyed on this were measured: the Vivo X300 Pro's
+        // Mali-G1-Ultra MC12, driver r54p1 (226496512). Matched by family, not by
+        // that exact driver build: a system update ships a new driver, and
+        // silently dropping both workarounds would bring back the video stripes
+        // and the minutes-long shader compile on loading a save. A driver other
+        // than the measured one is logged so a regression can be traced to it.
+        bool ObservedMaliG1Driver(const VkPhysicalDeviceProperties& props)
+        {
+#ifdef __ANDROID__
+            const std::string_view name(props.deviceName);
+            const bool g1 = props.vendorID == 0x13b5 && name.starts_with("Mali-G1") &&
+                (name.size() == 7 || name[7] < '0' || name[7] > '9');
+            if (g1 && props.driverVersion != 226496512)
+            {
+                static const bool once = [&] {
+                    fprintf(stderr, "[renderer] Mali-G1 driver %u differs from the measured r54p1 (226496512): "
+                        "workarounds kept on; NFSMW_FORWARD_CF=0 / NFSMW_SHARED_MEMORY=import compare without them\n",
+                        props.driverVersion);
+                    return true;
+                }();
+                (void)once;
+            }
+            return g1;
+#else
+            return false;
+#endif
+        }
+
+        uint32_t DriverId(const VkPhysicalDeviceProperties& props)
+        {
+            if (props.apiVersion < VK_API_VERSION_1_2)
+                return 0;
+            VkPhysicalDeviceDriverProperties driver{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+            VkPhysicalDeviceProperties2 props2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+            props2.pNext = &driver;
+            vkGetPhysicalDeviceProperties2(s_vk->physical, &props2);
+            return uint32_t(driver.driverID);
+        }
+
+        // Guest physical memory imported without a copy (unified memory, or
+        // a discrete GPU reading system memory over PCIe).
         bool ImportSharedMemory()
         {
             if (!s_vk->getMemoryHostPointerProperties)  // (no host-memory import)
                 return false;
+            if (MemoryTestRefuses(memplan::Place::kImport, false))
+            {
+                fprintf(stderr, "[renderer] importing guest memory failed (%d)\n", int(VK_ERROR_OUT_OF_DEVICE_MEMORY));
+                return false;
+            }
             VkMemoryHostPointerPropertiesEXT hpp{ VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
             if (s_vk->getMemoryHostPointerProperties(s_dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                     s_sharedHost, &hpp) != VK_SUCCESS)
@@ -5741,59 +6897,66 @@ void main()
             mai.allocationSize = kSharedSize;
             mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits & hpp.memoryTypeBits,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            if (VkResult r = vkAllocateMemory(s_dev, &mai, nullptr, &s_sharedMemory); r != VK_SUCCESS)
+            VkResult r = vkAllocateMemory(s_dev, &mai, nullptr, &s_sharedMemory);
+            if (r == VK_SUCCESS && (r = vkBindBufferMemory(s_dev, s_shared, s_sharedMemory, 0)) != VK_SUCCESS)
+            {
+                vkFreeMemory(s_dev, s_sharedMemory, nullptr);
+                s_sharedMemory = VK_NULL_HANDLE;
+            }
+            if (r != VK_SUCCESS)
             {
                 fprintf(stderr, "[renderer] importing guest memory failed (%d)\n", int(r));
                 vkDestroyBuffer(s_dev, s_shared, nullptr);
                 s_shared = VK_NULL_HANDLE;
                 return false;
             }
-            Check(vkBindBufferMemory(s_dev, s_shared, s_sharedMemory, 0), "vkBindBufferMemory(shared)");
             return true;
         }
 
-        void CreateShadowSharedMemory()
+        // The buffer of guest memory's copy (an unbound one: a place that
+        // fails before binding leaves it for the next).
+        VkBuffer NewCopyBuffer(VkMemoryRequirements& req)
         {
             VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
             bci.size = kSharedSize;
             bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            Check(vkCreateBuffer(s_dev, &bci, nullptr, &s_shared), "vkCreateBuffer(shadow)");
-            VkMemoryRequirements req;
-            vkGetBufferMemoryRequirements(s_dev, s_shared, &req);
-            VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-            mai.allocationSize = req.size;
-            // An integrated GPU's (the Deck's) copy goes in system memory:
-            // host-visible and not device-local (write-combined GTT on amdgpu,
-            // uncached first). Its "VRAM" is a carve-out of the same RAM, 1 GB
-            // on a Deck, and the copy there with the textures and targets
-            // didn't fit: at every world load the kernel moved ~500 MB of it
-            // out to GTT, and the GPU reads GTT as fast. A discrete GPU keeps
-            // it in VRAM the CPU writes through resizable BAR when there is
-            // some. NFSMW_SHADOW_MEMORY=vram|gtt overrides.
-            VkPhysicalDeviceProperties props;
-            vkGetPhysicalDeviceProperties(s_vk->physical, &props);
-            const char* where = std::getenv("NFSMW_SHADOW_MEMORY");
-            bool system = where ? strcmp(where, "gtt") == 0 : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-            const VkMemoryPropertyFlags mapped = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-            mai.memoryTypeIndex = UINT32_MAX;
-            for (int pass = 0; system && pass < 2 && mai.memoryTypeIndex == UINT32_MAX; pass++)
-                for (uint32_t i = 0; i < s_memProps.memoryTypeCount; i++)
-                {
-                    VkMemoryPropertyFlags f = s_memProps.memoryTypes[i].propertyFlags;
-                    if ((req.memoryTypeBits & (1u << i)) && (f & mapped) == mapped && !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
-                        (pass == 1 || !(f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)))
-                    {
-                        mai.memoryTypeIndex = i;
-                        break;
-                    }
-                }
-            if (mai.memoryTypeIndex == UINT32_MAX)  // (all device-local: unified memory)
-                mai.memoryTypeIndex = FindMemoryTypePreferring(req.memoryTypeBits,
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mapped);
-            Check(vkAllocateMemory(s_dev, &mai, nullptr, &s_sharedMemory), "vkAllocateMemory(shadow)");
-            Check(vkBindBufferMemory(s_dev, s_shared, s_sharedMemory, 0), "vkBindBufferMemory(shadow)");
-            void* p;
-            Check(vkMapMemory(s_dev, s_sharedMemory, 0, VK_WHOLE_SIZE, 0, &p), "vkMapMemory(shadow)");
+            VkBuffer buffer = VK_NULL_HANDLE;
+            Check(vkCreateBuffer(s_dev, &bci, nullptr, &buffer), "vkCreateBuffer(shadow)");
+            vkGetBufferMemoryRequirements(s_dev, buffer, &req);
+            return buffer;
+        }
+
+        // Guest memory's copy for the GPU in `c`'s memory type, kept current
+        // page by page from the write watch (writewatch::SyncShadow): on a
+        // discrete GPU in VRAM the CPU writes through resizable BAR when it
+        // holds the copy, else in system memory; on an integrated one in
+        // system memory (memory_plan.h). False, with nothing kept, when the
+        // driver refuses it; `buffer` is then still unbound, or replaced.
+        bool CreateShadowSharedMemory(VkBuffer& buffer, const VkMemoryRequirements& req, const memplan::Candidate& c)
+        {
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            void* p = nullptr;
+            const char* what = "vkAllocateMemory(shadow)";
+            VkResult r = AllocatePlanned(c, false, req.size, memory);
+            if (r == VK_SUCCESS && (r = vkMapMemory(s_dev, memory, 0, VK_WHOLE_SIZE, 0, &p)) != VK_SUCCESS)
+                what = "vkMapMemory(shadow)";
+            else if (r == VK_SUCCESS && (r = vkBindBufferMemory(s_dev, buffer, memory, 0)) != VK_SUCCESS)
+            {
+                what = "vkBindBufferMemory(shadow)";
+                vkDestroyBuffer(s_dev, buffer, nullptr);  // (a buffer binds once)
+                VkMemoryRequirements again;
+                buffer = NewCopyBuffer(again);
+            }
+            if (r != VK_SUCCESS)
+            {
+                fprintf(stderr, "[renderer] %s failed: %d (%s, memory type %u): trying the next place\n", what, int(r),
+                    memplan::Name(c.place, false), c.type);
+                if (memory)
+                    vkFreeMemory(s_dev, memory, nullptr);
+                return false;
+            }
+            s_shared = buffer;
+            s_sharedMemory = memory;
             // Write every page of the mapping once, before anything uses it.
             // The first CPU write to a page of mapped VRAM faults it into the
             // page tables; left to the first sync, a burst of new textures
@@ -5803,7 +6966,18 @@ void main()
             // ~100 ms here. The zeros are never read: SyncShadow copies a page
             // before its first use. NFSMW_SHADOW_PREFAULT=0 leaves the faults
             // to the first sync.
-            static const bool prefault = [] { const char* v = std::getenv("NFSMW_SHADOW_PREFAULT"); return !v || v[0] != '0'; }();
+            static const bool prefault = [] {
+                if (const char* v = std::getenv("NFSMW_SHADOW_PREFAULT"))
+                    return v[0] != '0';
+#ifdef __ANDROID__
+                // SyncShadow initializes each range before the GPU uses it.
+                // Eagerly touching all 512 MiB consumes shared system RAM,
+                // including pages the current scene never needs.
+                return false;
+#else
+                return true;
+#endif
+            }();
             auto prefaultStart = std::chrono::steady_clock::now();
             if (prefault)
                 for (VkDeviceSize offset = 0; offset < kSharedSize; offset += 4096)
@@ -5811,10 +6985,17 @@ void main()
             double prefaultMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prefaultStart).count();
             writewatch::EnableShadow(static_cast<uint8_t*>(p));
             s_shadowMode = true;
-            s_shadowInVram = (s_memProps.memoryTypes[mai.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+            s_shadowInVram = (s_memProps.memoryTypes[c.type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
             fprintf(stderr, "[renderer] guest memory: GPU copy in %s (memory type %u, flags %X), updated from the write watch%s\n",
-                s_shadowInVram ? "VRAM (CPU-mapped)" : "host memory", mai.memoryTypeIndex, s_memProps.memoryTypes[mai.memoryTypeIndex].propertyFlags,
+                s_shadowInVram ? "VRAM (CPU-mapped)" : "host memory", c.type, s_memProps.memoryTypes[c.type].propertyFlags,
                 prefault ? std::format(" (pages touched in {:.0f} ms)", prefaultMs).c_str() : "");
+            return true;
+        }
+
+        // `failed`, a list of place names, as the log's ", after ... failed".
+        std::string AfterFailed(const std::string& failed)
+        {
+            return failed.empty() ? std::string() : " after " + failed + " failed";
         }
 
         void CreateSharedMemory()
@@ -5824,6 +7005,28 @@ void main()
             vkGetPhysicalDeviceProperties(s_vk->physical, &props);
             VkPhysicalDeviceFeatures features;
             vkGetPhysicalDeviceFeatures(s_vk->physical, &features);  // the presenter enables anisotropy when supported
+            s_bcDecodeMask = 0;
+            const char* bcOverride = std::getenv("NFSMW_BC_DECODE");
+            const bool forceBc = bcOverride && bcOverride[0] == '1';
+#ifdef __ANDROID__
+            const bool autoBc = !bcOverride;
+#else
+            const bool autoBc = false;
+#endif
+            uint32_t bcBit = 1;
+            for (VkFormat format : {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC2_UNORM_BLOCK,
+                    VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC5_UNORM_BLOCK})
+            {
+                VkFormatProperties fp{};
+                vkGetPhysicalDeviceFormatProperties(s_vk->physical, format, &fp);
+                const auto required = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                    VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+                const bool native = features.textureCompressionBC && (fp.optimalTilingFeatures & required) == required;
+                if (forceBc || (autoBc && !native)) s_bcDecodeMask |= bcBit;
+                bcBit <<= 1;
+            }
+            fprintf(stderr, "[texture-bc] compute decode mask=0x%x (BC1/2/3/5), override=%s; guest block layout retained\n",
+                s_bcDecodeMask, bcOverride ? bcOverride : "auto");
             s_maxAnisotropy = features.samplerAnisotropy ? props.limits.maxSamplerAnisotropy : 1.0f;
             s_autoAnisotropy = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 16 : 4;
 #if defined(__APPLE__) && TARGET_OS_IOS
@@ -5842,42 +7045,123 @@ void main()
                     anisotropy < 0 ? "the game's" : std::format("{}x", std::min(float(anisotropy), s_maxAnisotropy)).c_str());
             }
 
-            const char* mode = std::getenv("NFSMW_SHARED_MEMORY");
-            bool shadow = mode ? strcmp(mode, "shadow") == 0 : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
-            if (!shadow && ImportSharedMemory())
+            s_planMemory = PlanMemory();
+            memplan::GuestInput in;
+            in.gpu = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? memplan::Gpu::kDiscrete
+                : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? memplan::Gpu::kIntegrated : memplan::Gpu::kOther;
+            if (const char* kind = s_memoryTest.kind)
             {
-                fprintf(stderr, "[renderer] guest memory: imported (zero-copy)\n");
-                return;
+                std::string_view k(kind);
+                in.gpu = k == "integrated" ? memplan::Gpu::kIntegrated : k == "discrete" ? memplan::Gpu::kDiscrete
+                    : k == "other" ? memplan::Gpu::kOther : in.gpu;
+                fprintf(stderr, "[renderer] NFSMW_TEST_GPU_KIND=%s: memory planned as for %s GPU\n", kind,
+                    in.gpu == memplan::Gpu::kDiscrete ? "a discrete" : in.gpu == memplan::Gpu::kIntegrated ? "an integrated" : "another");
             }
-            CreateShadowSharedMemory();
+            in.importable = s_vk->getMemoryHostPointerProperties != nullptr;
+            in.importRefusal = memplan::ImportRefusal(DriverId(props));
+            in.overrides = memplan::ParseOverrides(std::getenv("NFSMW_SHARED_MEMORY"), std::getenv("NFSMW_SHADOW_MEMORY"),
+                std::getenv("NFSMW_RING_MEMORY"));
+            // The imported-memory comparison had video stripes and stretched
+            // menu geometry. The existing synchronized copy path passes those
+            // scenes on this observed driver. Preserve explicit import/shadow
+            // overrides for comparison, and other devices' existing policies.
+            if (ObservedMaliG1Driver(props) && in.overrides.shared == memplan::Overrides::Shared::kAuto)
+            {
+                in.overrides.shared = memplan::Overrides::Shared::kShadow;
+                fprintf(stderr, "[renderer] observed Mali-G1 driver: defaulting guest memory to synchronized copy\n");
+            }
+            VkMemoryRequirements req;
+            VkBuffer copy = NewCopyBuffer(req);
+            in.bits = req.memoryTypeBits;
+            memplan::Plan plan = memplan::PlanGuestMemory(s_planMemory, in);
+            std::string failed;
+            const memplan::Candidate* placed = nullptr;
+            for (const memplan::Candidate& c : plan.order)
+            {
+                if (c.place == memplan::Place::kImport ? ImportSharedMemory() : CreateShadowSharedMemory(copy, req, c))
+                {
+                    placed = &c;
+                    break;
+                }
+                failed += std::string(failed.empty() ? "" : ", ") + memplan::Name(c.place, false);
+            }
+            if (!placed)
+            {
+                fprintf(stderr, "[renderer] guest memory: no place could hold it (%s failed; %s)\n", failed.c_str(), plan.why.c_str());
+                abort();
+            }
+            if (placed->place == memplan::Place::kImport)
+            {
+                vkDestroyBuffer(s_dev, copy, nullptr);
+                fprintf(stderr, "[renderer] guest memory: imported (zero-copy)\n");
+                s_guestChoice = "imported (zero-copy)";
+            }
+            else
+            {
+                s_guestType = placed->type;
+                s_guestChoice = std::format("as a GPU copy in {}, memory type {}", placed->place == memplan::Place::kVram ? "CPU-mapped VRAM"
+                    : placed->place == memplan::Place::kCached ? "cached host memory" : "host memory", placed->type);
+            }
+            s_guestChoice += " (" + plan.why + ")" + AfterFailed(failed);
         }
 
         void CreateRing()
         {
             VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-            bci.size = kRingSize;
+            bci.size = kRingSize + kConstantsSize;  // (the constants' descriptor reads past a short last upload)
             bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
             Check(vkCreateBuffer(s_dev, &bci, nullptr, &s_ring), "vkCreateBuffer(ring)");
             VkMemoryRequirements req;
             vkGetBufferMemoryRequirements(s_dev, s_ring, &req);
-            VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-            mai.allocationSize = req.size;
-            // Device-local when the host can map it (resizable BAR), so the
-            // GPU reads constants and indices from VRAM. NFSMW_RING_MEMORY=cached
-            // prefers cached system memory instead: the CPU's ~40 MB of writes
-            // a frame then aren't write-combined PCIe stores (A/B experiment).
-            static const bool cached = [] { const char* v = std::getenv("NFSMW_RING_MEMORY"); return v && std::string_view(v) == "cached"; }();
-            mai.memoryTypeIndex = FindMemoryTypePreferring(req.memoryTypeBits,
-                cached ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT
-                       : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            fprintf(stderr, "[renderer] upload ring: memory type %u (flags %X)\n", mai.memoryTypeIndex,
-                s_memProps.memoryTypes[mai.memoryTypeIndex].propertyFlags);
-            Check(vkAllocateMemory(s_dev, &mai, nullptr, &s_ringMemory), "vkAllocateMemory(ring)");
-            vkBindBufferMemory(s_dev, s_ring, s_ringMemory, 0);
-            void* p;
-            Check(vkMapMemory(s_dev, s_ringMemory, 0, VK_WHOLE_SIZE, 0, &p), "vkMapMemory(ring)");
-            s_ringHost = static_cast<uint8_t*>(p);
+            // Device-local when the host can map it (resizable BAR) and it
+            // fits, so the GPU reads constants and indices from VRAM; else
+            // cached system memory (memory_plan.h). NFSMW_RING_MEMORY=cached
+            // prefers cached system memory anyway: the CPU's ~40 MB of
+            // writes a frame then aren't write-combined PCIe stores (an A/B
+            // experiment: on the Steam Machine 2% less CPU, twice the GPU
+            // time); =vram|system name the other places.
+            memplan::Overrides o = memplan::ParseOverrides(nullptr, nullptr, std::getenv("NFSMW_RING_MEMORY"));
+            memplan::Plan plan = memplan::PlanRing(s_planMemory, req.memoryTypeBits, s_guestType, o.ring);
+            std::string failed;
+            const memplan::Candidate* placed = nullptr;
+            for (const memplan::Candidate& c : plan.order)
+            {
+                VkDeviceMemory memory = VK_NULL_HANDLE;
+                void* p = nullptr;
+                const char* what = "vkAllocateMemory(ring)";
+                VkResult r = AllocatePlanned(c, true, req.size, memory);
+                if (r == VK_SUCCESS && (r = vkMapMemory(s_dev, memory, 0, VK_WHOLE_SIZE, 0, &p)) != VK_SUCCESS)
+                    what = "vkMapMemory(ring)";
+                else if (r == VK_SUCCESS && (r = vkBindBufferMemory(s_dev, s_ring, memory, 0)) != VK_SUCCESS)
+                {
+                    what = "vkBindBufferMemory(ring)";
+                    vkDestroyBuffer(s_dev, s_ring, nullptr);  // (a buffer binds once)
+                    Check(vkCreateBuffer(s_dev, &bci, nullptr, &s_ring), "vkCreateBuffer(ring)");
+                }
+                if (r != VK_SUCCESS)
+                {
+                    fprintf(stderr, "[renderer] %s failed: %d (%s, memory type %u): trying the next place\n", what, int(r),
+                        memplan::Name(c.place, true), c.type);
+                    if (memory)
+                        vkFreeMemory(s_dev, memory, nullptr);
+                    failed += std::string(failed.empty() ? "" : ", ") + memplan::Name(c.place, true);
+                    continue;
+                }
+                fprintf(stderr, "[renderer] upload ring: memory type %u (flags %X)\n", c.type, s_memProps.memoryTypes[c.type].propertyFlags);
+                s_ringMemory = memory;
+                s_ringHost = static_cast<uint8_t*>(p);
+                placed = &c;
+                break;
+            }
+            if (!placed)
+            {
+                fprintf(stderr, "[renderer] upload ring: no place could hold it (%s failed; %s)\n", failed.c_str(), plan.why.c_str());
+                abort();
+            }
+            // The choice and why, in one line.
+            fprintf(stderr, "[renderer] memory: guest memory %s; upload ring in %s, memory type %u (%s)%s\n", s_guestChoice.c_str(),
+                placed->place == memplan::Place::kVram ? "CPU-mapped VRAM" : placed->place == memplan::Place::kCached ? "cached host memory"
+                    : "host memory", placed->type, plan.why.c_str(), AfterFailed(failed).c_str());
         }
 
         void CreateSet0()
@@ -5972,7 +7256,8 @@ void main()
         uint64_t s_liveGeneration = ~0ull;
         int32_t s_resolutionSetting = 0;  // Internal Resolution as applied
         constexpr uint32_t kAutoSettleFrames = 30;
-        uint32_t s_autoWantX = 0, s_autoWantY = 0, s_autoSeen = 0;
+        gpu::RenderScale s_autoWant;
+        uint32_t s_autoSeen = 0;
 
         void DestroyTexture(Texture& t)
         {
@@ -5980,8 +7265,10 @@ void main()
                 s_directByBase.erase(it);
             if (auto it = s_directByStart.find(t.guestStart); it != s_directByStart.end() && it->second == &t)
                 s_directByStart.erase(it);
-            for (auto& [swizzle, view] : t.views)
+            for (auto& [swizzle, view] : t.views) {
+                s_textureViewExtents.erase(view);
                 vkDestroyImageView(s_dev, view, nullptr);
+            }
             t.views.clear();
             for (uint32_t layer = 1; layer < 6; layer++)  // ([0] is storeView)
                 if (t.storeViews[layer])
@@ -6013,39 +7300,41 @@ void main()
             return dropped;
         }
 
-        void ApplyRenderScale(uint32_t sx, uint32_t sy, const std::string& how)
+        void ApplyRenderScale(const gpu::RenderScale& scale, const std::string& how)
         {
             auto start = std::chrono::steady_clock::now();
-            uint32_t oldX = s_renderScaleX, oldY = s_renderScaleY;
+            const gpu::RenderScale old = s_renderScale;
             Flush();
-            s_renderScaleX = sx;
-            s_renderScaleY = sy;
+            s_renderScale = scale;
+            PrewarmResolvePipelines(scale);
             size_t targets = 0;
             for (auto& [key, slot] : s_targets)
             {
-                RenderTarget& old = *slot;  // (keyed as before: the key has no scale)
-                if (!ScaledPitch(old.pitch) || (old.scaleX == sx && old.scaleY == sy))
+                RenderTarget& was = *slot;  // (keyed as before: the key has no scale)
+                if (!ScaledPitch(was.pitch) || was.scale == scale)
                     continue;
-                // Clears still waiting for their target's next pass, in guest pixels.
+                // Clears still waiting for their target's next pass, in guest
+                // pixels (their host edges came from guest ones: GuestEdge
+                // gives those back).
                 std::vector<PendingClear> moved;
                 std::erase_if(s_pendingClears, [&](const PendingClear& pc) {
-                    if (pc.rt != &old)
+                    if (pc.rt != &was)
                         return false;
-                    moved.push_back({ nullptr,
-                        { { pc.rect.offset.x / int32_t(old.scaleX), pc.rect.offset.y / int32_t(old.scaleY) },
-                          { pc.rect.extent.width / old.scaleX, pc.rect.extent.height / old.scaleY } },
-                        pc.value });
+                    const uint32_t x0 = was.scale.x.GuestEdge(uint32_t(pc.rect.offset.x)), y0 = was.scale.y.GuestEdge(uint32_t(pc.rect.offset.y));
+                    const uint32_t x1 = was.scale.x.GuestEdge(uint32_t(pc.rect.offset.x) + pc.rect.extent.width);
+                    const uint32_t y1 = was.scale.y.GuestEdge(uint32_t(pc.rect.offset.y) + pc.rect.extent.height);
+                    moved.push_back({ nullptr, { { int32_t(x0), int32_t(y0) }, { x1 - x0, y1 - y0 } }, pc.value });
                     return true;
                 });
-                uint32_t base = old.base, format = old.format, pitch = old.pitch;
-                bool depth = old.depth, wide = old.wide;
-                DestroyTarget(old);
+                uint32_t base = was.base, format = was.format, pitch = was.pitch;
+                bool depth = was.depth, wide = was.wide;
+                DestroyTarget(was);
                 slot = CreateTarget(base, format, depth, pitch, wide);
                 for (PendingClear& pc : moved)
                 {
                     pc.rt = slot.get();
-                    pc.rect = { { pc.rect.offset.x * int32_t(sx), pc.rect.offset.y * int32_t(sy) },
-                        { pc.rect.extent.width * sx, pc.rect.extent.height * sy } };
+                    pc.rect = HostRect(scale, pc.rect.offset.x, pc.rect.offset.y, pc.rect.offset.x + int32_t(pc.rect.extent.width),
+                        pc.rect.offset.y + int32_t(pc.rect.extent.height));
                     s_pendingClears.push_back(pc);
                 }
                 targets++;
@@ -6053,9 +7342,9 @@ void main()
             for (RecentTarget& recent : s_recentTargets)
                 recent = {};
             size_t textures = DropTextures([](const Texture& t) { return t.scaled; });
-            ResetScaledMemory(sx * sy > 1);
-            fprintf(stderr, "[renderer] internal resolution %ux%u -> %ux%u (%ux%u, %s): %zu targets and %zu scaled textures replaced in %.1f ms\n",
-                oldX, oldY, sx, sy, 1280 * sx, 720 * sy, how.c_str(), targets, textures,
+            ResetScaledMemory(!scale.IsOne());
+            fprintf(stderr, "[renderer] internal resolution %s -> %s (%ux%u, %s): %zu targets and %zu scaled textures replaced in %.1f ms\n",
+                gpu::ScaleName(old).c_str(), gpu::ScaleName(scale).c_str(), scale.x.Size(1280), scale.y.Size(720), how.c_str(), targets, textures,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
         }
 
@@ -6067,6 +7356,58 @@ void main()
             size_t textures = DropTextures([](const Texture&) { return true; });
             fprintf(stderr, "[renderer] mipmaps %s: %zu textures dropped in %.1f ms (loaded again as they are drawn)\n",
                 mips ? "on" : "off", textures, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        }
+
+        // The texture cache keeps every texture it made (dead ones too) until
+        // something drops it. Driving around Rockport streams new ones in for
+        // as long as the game runs: a 44-minute session on the vivo X300 Pro
+        // reached 6,950 textures in 3.8 GB, the app 6.5 GB. Every 10 s, when
+        // the cache is over NFSMW_TEXTURE_BUDGET_MB (Android 1536, elsewhere
+        // 0: off), the textures nothing sampled for 30 s go, the oldest
+        // first, down to 3/4 of it; a texture drawn again loads again from
+        // guest memory, as after a mipmaps change. Waits for the GPU only
+        // when it drops something.
+        const uint64_t s_textureBudget = [] {
+            const char* v = std::getenv("NFSMW_TEXTURE_BUDGET_MB");
+#ifdef __ANDROID__
+            constexpr long defaultMb = 1536;
+#else
+            constexpr long defaultMb = 0;
+#endif
+            return uint64_t(v ? std::max(0L, std::atol(v)) : defaultMb) << 20;
+        }();
+
+        void TrimTextures(uint64_t frame)
+        {
+            constexpr uint64_t kEvery = 600, kUnused = 1800;  // frames: 10 s, 30 s at 60 fps
+            if (!s_textureBudget || frame % kEvery != 0 || frame < kUnused)
+                return;
+            uint64_t total = 0;
+            std::vector<std::pair<uint64_t, Texture*>> idle;  // (last used, texture)
+            for (const auto& [key, t] : s_textures)
+            {
+                total += t->image.bytes;
+                if (!t->scaled && t->usedFrame + kUnused < frame)
+                    idle.push_back({ t->usedFrame, t.get() });
+            }
+            if (total <= s_textureBudget || idle.empty())
+                return;
+            auto start = std::chrono::steady_clock::now();
+            std::sort(idle.begin(), idle.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            std::unordered_set<const Texture*> drop;
+            uint64_t freed = 0;
+            for (const auto& [used, t] : idle)
+            {
+                if (total - freed <= s_textureBudget / 4 * 3)
+                    break;
+                drop.insert(t);
+                freed += t->image.bytes;
+            }
+            Flush();
+            size_t dropped = DropTextures([&drop](const Texture& t) { return drop.contains(&t); });
+            fprintf(stderr, "[texture-cache] %zu textures unused for 30 s dropped (%llu MB), %zu left in %llu MB (budget %llu MB), %.1f ms\n",
+                dropped, (unsigned long long)(freed >> 20), s_textures.size(), (unsigned long long)((total - freed) >> 20),
+                (unsigned long long)(s_textureBudget >> 20), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
         }
 
         void ApplyLiveSettings()
@@ -6089,9 +7430,8 @@ void main()
                 if (regionW == 0 || regionH == 0)
                     return;  // no picture to size it for: keep the scale
             }
-            uint32_t sx, sy;
-            WantedRenderScale(setting, regionW, regionH, sx, sy);
-            if (sx == s_renderScaleX && sy == s_renderScaleY)
+            const gpu::RenderScale want = WantedRenderScale(setting, regionW, regionH);
+            if (want == s_renderScale)
             {
                 s_resolutionSetting = setting;
                 s_autoSeen = 0;
@@ -6100,10 +7440,9 @@ void main()
             // Only the picture's size moved (Auto): once it has settled.
             if (setting == s_resolutionSetting)
             {
-                if (sx != s_autoWantX || sy != s_autoWantY)
+                if (!(want == s_autoWant))
                 {
-                    s_autoWantX = sx;
-                    s_autoWantY = sy;
+                    s_autoWant = want;
                     s_autoSeen = 0;
                 }
                 if (++s_autoSeen < kAutoSettleFrames)
@@ -6111,7 +7450,7 @@ void main()
             }
             s_resolutionSetting = setting;
             s_autoSeen = 0;
-            ApplyRenderScale(sx, sy, ScaleReason(setting, regionW, regionH));
+            ApplyRenderScale(want, ScaleReason(setting, regionW, regionH));
         }
 
         // ---------------------------------------------------------------
@@ -6185,6 +7524,13 @@ void main()
 
     bool Initialize(const uint32_t* regs)
     {
+        gpu::g_workReductionEnabled = settings::GetBool(settings::Id::GpuWorkReduction);
+        gpu::g_predicateCoalescingEnabled = settings::GetBool(settings::Id::PredicateCoalescing);
+        s_depthStageReduction = settings::GetBool(settings::Id::DepthStageReduction);
+        fprintf(stderr, "[renderer] predicate coalescing=%d depth stage reduction=%d\n",
+            gpu::g_predicateCoalescingEnabled, s_depthStageReduction);
+        fprintf(stderr, "[renderer] GPU work reduction %s (early depth, texture reciprocals, 1x resolve lanes)\n",
+            gpu::g_workReductionEnabled ? "on" : "off");
         s_vk = video::GetVulkan();
         if (!s_vk)
             return false;
@@ -6193,6 +7539,22 @@ void main()
         {
             VkPhysicalDeviceProperties props;
             vkGetPhysicalDeviceProperties(s_vk->physical, &props);
+            // Controlled compiler probe: this shader's forward-only CF graph
+            // links in milliseconds on the observed driver; the equivalent
+            // loop/switch dispatcher exceeds the external timeout.
+            gpu::g_forwardControlFlowEnabled = ObservedMaliG1Driver(props);
+            if (const char* cf = std::getenv("NFSMW_FORWARD_CF"))
+                gpu::g_forwardControlFlowEnabled = cf[0] == '1';
+            fprintf(stderr, "[renderer] forward-only shader control flow=%d\n", gpu::g_forwardControlFlowEnabled);
+            if (kRingSize > props.limits.maxStorageBufferRange)
+            {
+                fprintf(stderr, "[renderer] upload ring exceeds storage-buffer limit (%llu > %u bytes)\n",
+                    (unsigned long long)kRingSize, props.limits.maxStorageBufferRange);
+                return false;
+            }
+            fprintf(stderr, "[renderer] shader limits: vertex outputs %u, fragment inputs %u, storage buffers/stage %u, samplers/stage %u; pipeline workers %u\n",
+                props.limits.maxVertexOutputComponents, props.limits.maxFragmentInputComponents,
+                props.limits.maxPerStageDescriptorStorageBuffers, props.limits.maxPerStageDescriptorSamplers, s_pipelineThreads);
             ReadRenderScale(props);
             const char* split = std::getenv("NFSMW_SPLIT_MEMORY");
             s_splitMemory = split ? split[0] == '1' : props.limits.maxStorageBufferRange < kSharedSize;
@@ -6239,16 +7601,57 @@ void main()
             VkPhysicalDeviceProperties props;
             vkGetPhysicalDeviceProperties(s_vk->physical, &props);
             s_timestampPeriod = props.limits.timestampPeriod;
+            uint32_t familyCount = 0;
+            vkGetPhysicalDeviceQueueFamilyProperties(s_vk->physical, &familyCount, nullptr);
+            std::vector<VkQueueFamilyProperties> timestampFamilies(familyCount);
+            vkGetPhysicalDeviceQueueFamilyProperties(s_vk->physical, &familyCount, timestampFamilies.data());
+            s_timestampBits = s_vk->queueFamily < familyCount ? timestampFamilies[s_vk->queueFamily].timestampValidBits : 0;
+#ifdef __ANDROID__
+            ApplyAndroidScheduling(1);
+#endif
             VkQueryPoolCreateInfo qpci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
             qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
             qpci.queryCount = kSlots * 2;
             if (const char* v = std::getenv("NFSMW_GPU_TIMING"); v && v[0] == '1')
-                if (vkCreateQueryPool(s_dev, &qpci, nullptr, &s_timestamps) != VK_SUCCESS)
-                    s_timestamps = VK_NULL_HANDLE;
-            if (s_profileFrame >= 0)
             {
+                uint32_t count = 0;
+                vkGetPhysicalDeviceQueueFamilyProperties(s_vk->physical, &count, nullptr);
+                std::vector<VkQueueFamilyProperties> families(count);
+                vkGetPhysicalDeviceQueueFamilyProperties(s_vk->physical, &count, families.data());
+                if (s_vk->queueFamily < count && families[s_vk->queueFamily].timestampValidBits &&
+                    vkCreateQueryPool(s_dev, &qpci, nullptr, &s_timestamps) == VK_SUCCESS)
+                    fprintf(stderr, "[renderer] submission GPU timestamps enabled\n");
+                else
+                {
+                    s_timestamps = VK_NULL_HANDLE;
+                    fprintf(stderr, "[renderer] submission GPU timestamps unavailable\n");
+                }
+            }
+            const char* passTiming = std::getenv("SB_GPU_PASS_TIMING");
+#ifdef __ANDROID__
+            s_passTimingEnabled = !passTiming || passTiming[0] != '0';
+#else
+            s_passTimingEnabled = passTiming && passTiming[0] == '1';
+#endif
+            if (s_passTimingEnabled && s_timestampBits)
+            {
+                qpci.queryCount = gpu::timing::MaxRegions * 2;
+                for (auto& slot : s_timedSlots)
+                    if (vkCreateQueryPool(s_dev, &qpci, nullptr, &slot.pool) != VK_SUCCESS)
+                        slot.pool = VK_NULL_HANDLE;
+            }
+            fprintf(stderr, "[gpu-pass] sampling %s; %u timestamp bits, %u/%u slot pools; one frame per 120 complex frames, up to 120 samples\n",
+                s_passTimingEnabled ? "ON" : "OFF", s_timestampBits,
+                unsigned(std::count_if(std::begin(s_timedSlots), std::end(s_timedSlots), [](const auto& slot) { return slot.pool != VK_NULL_HANDLE; })), kSlots);
+            if (s_profileFrame >= 0 || s_visual.enabled())
+            {
+                uint32_t count = 0; vkGetPhysicalDeviceQueueFamilyProperties(s_vk->physical, &count, nullptr);
+                std::vector<VkQueueFamilyProperties> families(count);
+                vkGetPhysicalDeviceQueueFamilyProperties(s_vk->physical, &count, families.data());
                 qpci.queryCount = 512;
-                Check(vkCreateQueryPool(s_dev, &qpci, nullptr, &s_passQueries), "pass query pool");
+                if (s_vk->queueFamily >= count || !families[s_vk->queueFamily].timestampValidBits ||
+                    vkCreateQueryPool(s_dev, &qpci, nullptr, &s_passQueries) != VK_SUCCESS)
+                { s_passQueries = VK_NULL_HANDLE; fprintf(stderr, "[visual] per-pass timestamps unavailable\n"); }
             }
         }
         // NFSMW_OCCLUSION=1: a pool of occlusion queries per slot, so a reset
@@ -6311,7 +7714,7 @@ void main()
                 { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
             };
             auto bindings = WithSharedParts(b, 4);
-            CreateComputePipeline(kFrontGlsl, bindings.data(), uint32_t(bindings.size()), 12 * sizeof(uint32_t), s_frontSetLayout,
+            CreateComputePipeline(kFrontGlsl, bindings.data(), uint32_t(bindings.size()), 14 * sizeof(uint32_t), s_frontSetLayout,
                 s_frontLayout, s_frontPipeline);
         }
         Flush();
@@ -6385,11 +7788,182 @@ void main()
             if (!slot->info.ok)
                 fprintf(stderr, "[renderer] %s_%016llx: translation failed: %s\n", type == 0 ? "vs" : "ps",
                     (unsigned long long)h, slot->info.error.c_str());
+#ifdef __ANDROID__
+            static uint32_t metadataRows = 0;
+            if (slot->info.ok && metadataRows++ < 512) {
+                const auto& info = slot->info;
+                fprintf(stderr, "[shader-meta] %s_%016llx regs=%u interpolators=%04x colors=%x kill=%d depth_export=%d memexport=%d vfetch=%08x textures=%08x/%08x/%08x predicated_instructions=%u instruction_predicate_blocks=%u\n",
+                    type == 0 ? "vs" : "ps", (unsigned long long)h, info.registerCount,
+                    info.interpolatorMask, info.colorTargetMask, info.usesKill, info.writesDepth, info.usesMemExport,
+                    info.vertexFetchMask, info.texture2DMask, info.texture3DMask, info.textureCubeMask,
+                    info.predicatedInstructions, info.predicateBlocks);
+            }
+#endif
             // Compiled to SPIR-V with its first pipeline, on a pipeline worker.
         }
         if (e)
             e->shader = slot.get();
         (type == 0 ? s_vs : s_ps) = slot.get();
+    }
+
+    // A snapshot of [base, base + size) already in this submission's ring slot
+    // and unchanged since (NFSMW_SNAPSHOT_REUSE=1): its ring offset.
+    static bool SnapshotReusable(uint32_t base, uint32_t size, VkDeviceSize* offset)
+    {
+        if (s_snapshotMode != 1)
+            return false;
+        uint64_t key = uint64_t(base) << 32 | size;
+        const SnapshotEntry& e = SnapshotSlot(key);
+        if (e.key != key || e.submission != s_submissionCounter || e.stage != 2)
+            return false;
+        if (writewatch::WriteSequence(base, size) > e.sequence)
+            return false;
+        *offset = e.offset;
+        return true;
+    }
+
+    // Copies a vertex range into the ring (`host` is `offset` into it) and
+    // keeps what a later draw in the same submission needs to reuse the copy.
+    static void CopySnapshot(uint32_t base, uint32_t size, uint8_t* host, VkDeviceSize offset)
+    {
+        s_stats.snapRanges++;
+        if (s_snapshotMode == 0)
+        {
+            memcpy(host, s_sharedHost + base, size);
+            return;
+        }
+        const uint64_t key = uint64_t(base) << 32 | size;
+        SnapshotEntry& e = SnapshotSlot(key);
+        const bool repeat = e.key == key && e.submission == s_submissionCounter;
+        if (repeat)
+            s_stats.snapRepeats++;
+        if (s_snapshotMode == 2)
+        {
+            if (repeat)
+            {
+                bool same = memcmp(s_ringHost + e.offset, s_sharedHost + base, size) == 0;
+                (same ? s_stats.snapSame : s_stats.snapDiff)++;
+                (same ? s_stats.snapSameBytes : s_stats.snapDiffBytes) += size;
+            }
+            memcpy(host, s_sharedHost + base, size);
+            e = { key, s_submissionCounter, offset, 0, 1 };
+            return;
+        }
+        if (repeat)
+        {
+            if (e.stage == 2)
+                s_stats.snapChanged++;  // a copy we reused before, written since
+            writewatch::Watch(base, size);
+            uint64_t sequence = writewatch::Current();
+            memcpy(host, s_sharedHost + base, size);
+            e.offset = offset;
+            e.sequence = sequence;
+            e.stage = 2;
+            s_stats.snapWatched++;
+            return;
+        }
+        memcpy(host, s_sharedHost + base, size);
+        e = { key, s_submissionCounter, offset, 0, 1 };
+    }
+
+    // NFSMW_COLOUR_PASS_LOG=1 (it found the yellow filter, below). With it on, a few
+    // frames of full-screen-looking draws (a rectangle list, or six vertices or
+    // fewer) log their pixel shader's float constants, so the game's colour
+    // filter shows up with its real numbers on the 360: ps hash, texture count,
+    // and the constants (register, x y z w) that are not all zero. A shader
+    // with the same constants as one already logged in the window is skipped.
+    // Armed by switching the option on (not by it being saved on at launch) and,
+    // while it stays on, every 30 s of play for a frame in a heavy scene (1500
+    // draws the frame before: a race, not a menu), four times. At most 400
+    // lines a window. Costs nothing with the option off.
+    static void DumpColourPassConstants(bool rect, uint32_t vertexCount)
+    {
+        static int wasOn = -1;
+        static uint64_t armedFrame = 0, nextAuto = 0, countedFrame = 0;
+        static uint32_t lines = 0, autoWindows = 0, drawsNow = 0, drawsBefore = 0;
+        static std::vector<uint64_t> seen;
+        static const bool logOn = [] { const char* v = std::getenv("NFSMW_COLOUR_PASS_LOG"); return v && v[0] == '1'; }();
+        const bool on = logOn;
+        if (wasOn < 0)
+            wasOn = on;  // saved on at launch: not a switch-on
+        if (s_frame != countedFrame)
+        {
+            countedFrame = s_frame;
+            drawsBefore = drawsNow;
+            drawsNow = 0;
+        }
+        drawsNow++;
+        bool arm = false;
+        const char* why = "switched on";
+        if (on && !wasOn)
+        {
+            arm = true;
+            autoWindows = 0;
+            nextAuto = s_frame + 1800;
+        }
+        else if (on && autoWindows < 4 && s_frame >= nextAuto && drawsBefore >= 1500 && s_frame > armedFrame + 3)
+        {
+            arm = true;
+            autoWindows++;
+            nextAuto = s_frame + 1800;
+            why = "in play";
+        }
+        wasOn = on;
+        if (arm)
+        {
+            armedFrame = s_frame;
+            lines = 0;
+            seen.clear();
+            fprintf(stderr, "[colour-pass] logging a frame (%s, frame %llu, %u draws the frame before)\n", why, (unsigned long long)s_frame, drawsBefore);
+        }
+        if (!on || s_frame > armedFrame + 1 || lines >= 400 || !(rect || vertexCount <= 6))
+            return;
+        uint64_t hash = s_ps->hash;
+        for (uint32_t reg = 0; reg < 256; reg++)
+        {
+            if (s_ps->info.constPacked && !((s_ps->info.constUsed[reg / 64] >> (reg % 64)) & 1))
+                continue;
+            const uint32_t* v = &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (256 + reg) * 4];
+            hash = (hash ^ (uint64_t(v[0]) * 31 + v[1] * 131 + v[2] * 1031 + v[3] * 8191 + reg)) * 0x100000001B3ull;
+        }
+        if (std::find(seen.begin(), seen.end(), hash) != seen.end())
+            return;
+        seen.push_back(hash);
+        fprintf(stderr, "[colour-pass] frame %llu: ps %016llx vs %016llx, %s, %u vertices, %d textures, constants %s\n", (unsigned long long)s_frame,
+            (unsigned long long)s_ps->hash, (unsigned long long)s_vs->hash, rect ? "rect list" : "other", vertexCount,
+            __builtin_popcount(s_ps->info.texture2DMask), s_ps->info.constPacked ? "packed" : "all");
+        lines++;
+        for (uint32_t reg = 0; reg < 256 && lines < 400; reg++)
+        {
+            if (s_ps->info.constPacked && !((s_ps->info.constUsed[reg / 64] >> (reg % 64)) & 1))
+                continue;
+            const uint32_t* v = &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (256 + reg) * 4];
+            float f[4];
+            memcpy(f, v, 16);
+            if (f[0] == 0.0f && f[1] == 0.0f && f[2] == 0.0f && f[3] == 0.0f)
+                continue;
+            fprintf(stderr, "[colour-pass]   c%u = %.4f %.4f %.4f %.4f\n", reg, f[0], f[1], f[2], f[3]);
+            lines++;
+        }
+    }
+
+    // Settings > Display > Remove Game Yellow Filter. The game's final HDR
+    // composite (pixel shader d52a5eb6c17f9598: five textures, the luminance
+    // weights 0.2125 0.7154 0.0721 in c0) takes a colour curve in c6-c9 whose
+    // y, z, w are one tint scaled per row: red 0.85, green 0.75, blue 0.25 (the
+    // owner's race log, 2026-11-01, four captures, the same every time). The
+    // low blue is Most Wanted's yellow. Here the blue of each of those rows is
+    // set to the mean of its red and green, in the ring copy only: the curve
+    // stays, the yellow goes. A row that doesn't look like that tint (blue not
+    // well under red and green, or signs that differ) is left alone.
+    constexpr uint64_t kColourCurvePs = 0xD52A5EB6C17F9598ull;
+    static void NeutralColourCurveRow(float* v)
+    {
+        const float r = v[1], g = v[2], b = v[3];
+        const bool sameSign = (r > 0 && g > 0 && b > 0) || (r < 0 && g < 0 && b < 0);
+        if (!sameSign || std::fabs(b) > 0.6f * std::min(std::fabs(r), std::fabs(g)))
+            return;
+        v[3] = 0.5f * (r + g);
     }
 
     void Draw(uint32_t initiatorValue, uint32_t dmaBase, uint32_t dmaSizeValue)
@@ -6406,6 +7980,15 @@ void main()
         }
         if (edramMode != xenos::EdramMode::kColorDepth && edramMode != xenos::EdramMode::kDepthOnly)
             return;
+        // Depth-only: no pixel shader runs (depth_only.h); the guest's stays
+        // bound for the draws after this one.
+        struct RestorePs
+        {
+            Shader* ps;
+            ~RestorePs() { s_ps = ps; }
+        } restorePs{ s_ps };
+        if (!gpu::RunsGuestPixelShader(edramMode, s_depthOnlyGuestPs))
+            s_ps = DepthOnlyPixelShader();
         s_stats.draws++;
         auto skip = [&](uint64_t key, const char* why) {
             s_stats.skipped++;
@@ -6559,7 +8142,7 @@ void main()
         // samples scaled textures (every attachment shares the pitch, so the scale).
         s_drawScaled = false;
         for (RenderTarget* rt : { color[0], color[1], color[2], color[3], depth })
-            if (rt && rt->scaleX * rt->scaleY > 1)
+            if (rt && !rt->scale.IsOne())
                 s_drawScaled = true;
 
         // NFSMW_LOG_TILES=1: register state of the first draws under MSAA (predicated tiling).
@@ -6740,6 +8323,7 @@ void main()
         key.ps = s_ps->hash;
         key.topology = topology;
         key.restart = restart;
+        key.primitiveMode = (pc.indexInfo >> 3) & 3u;
         static const uint32_t blendRegs[4] = { XE_GPU_REG_RB_BLENDCONTROL0, XE_GPU_REG_RB_BLENDCONTROL1,
             XE_GPU_REG_RB_BLENDCONTROL2, XE_GPU_REG_RB_BLENDCONTROL3 };
         for (int i = 0; i < 4; i++)
@@ -6765,9 +8349,22 @@ void main()
         if (polygonal && initiator.prim_type != xenos::PrimitiveType::kRectangleList)
             cull = (modeCntl.cull_front ? VK_CULL_MODE_FRONT_BIT : 0) | (modeCntl.cull_back ? VK_CULL_MODE_BACK_BIT : 0);
         auto colorControlKey = Reg<reg::RB_COLORCONTROL>();
-        bool alphaTest = colorControlKey.alpha_test_enable && colorControlKey.alpha_func != xenos::CompareFunction::kAlways;
+        // (The alpha test tests the pixel shader's alpha: none depth-only.)
+        bool alphaTest = colorControlKey.alpha_test_enable && colorControlKey.alpha_func != xenos::CompareFunction::kAlways &&
+            gpu::RunsGuestPixelShader(edramMode, s_depthOnlyGuestPs);
         key.raster = cull | (modeCntl.face ? 4u : 0u) | (clipCntl.clip_disable ? 8u : 0u) | (depthBias ? 16u : 0u) |
             (alphaTest ? 32u : 0u);
+
+        static const bool earlyDepth = [] { const char* v = std::getenv("NFSMW_EARLY_DEPTH"); return !v || v[0] != '0'; }();
+        if (gpu::g_workReductionEnabled && earlyDepth && gpu::SafeEarlyDepth(key.depthControl, key.depthFormat != 0,
+                s_ps->info.writesDepth, s_ps->info.usesMemExport, !s_zpdOpen.Empty()))
+            key.raster |= 64u;
+
+        if (gpu::CanOmitFragmentStage(key.colorMask, alphaTest, s_ps->info.usesKill,
+                s_ps->info.writesDepth, s_ps->info.usesMemExport, s_vs->info.usesMemExport) &&
+            (s_depthStageReduction ||
+             (gpu::g_workReductionEnabled && key.ps == kDepthOnlyPsHash)))
+            key.raster |= 128u;  // Native depth/stencil, with no fragment shader stage.
 
         bool pipelinePending;
         VkPipeline pipeline = GetPipeline(key, layout.pipeline, pipelinePending);
@@ -6784,6 +8381,36 @@ void main()
             s_textureCache->generation++;
         }
         VkDescriptorImageInfo textureInfos[96];
+        float textureReciprocal[32][4] = {};
+        // Temporary bring-up probe: metadata only, no image readbacks or
+        // shading changes. Run on the CP thread before cached texture lookup.
+        // Deduplicate material state rather than changing guest base addresses,
+        // so rotating cube targets cannot exhaust the quota in one frame.
+        static const bool logReflectionFetch = [] {
+            const char* v = std::getenv("NFSMW_REFLECTION_LOG");
+            return v && v[0] == '1';
+        }();
+        static std::set<std::array<uint64_t, 6>> reflectionFetches;
+        if (logReflectionFetch && s_ps->info.textureCubeMask && reflectionFetches.size() < 192)
+            for (uint32_t d = 0; d < 3; ++d)
+                for (uint32_t n = 0; n < 32; ++n)
+                {
+                    if (!((layout.psMasks[d] >> n) & 1)) continue;
+                    const uint32_t* words = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6];
+                    const std::array<uint64_t, 6> key = { s_ps->hash, n | (d << 8) | ((words[1] & 0xFFu) << 16),
+                        (words[0] & 0x3FFu) | (uint64_t(words[3]) << 32), words[2],
+                        s_regs[XE_GPU_REG_RB_COLOR_INFO] | (uint64_t(s_regs[XE_GPU_REG_RB_COLOR1_INFO]) << 32),
+                        s_regs[XE_GPU_REG_RB_COLOR2_INFO] | (uint64_t(s_regs[XE_GPU_REG_RB_COLOR3_INFO]) << 32) };
+                    if (reflectionFetches.size() >= 192 || !reflectionFetches.insert(key).second) continue;
+                    xenos::xe_gpu_texture_fetch_t f;
+                    memcpy(&f, words, sizeof(f));
+                    fprintf(stderr, "[reflection-fetch] vs=%016llx ps=%016llx slot=%u dim=%u format=%u signs=%u,%u,%u,%u exp=%d swizzle=%03x raw=%08x,%08x,%08x,%08x,%08x,%08x color=%08x,%08x,%08x,%08x\n",
+                        (unsigned long long)s_vs->hash, (unsigned long long)s_ps->hash, n, d, uint32_t(f.format),
+                        uint32_t(f.sign_x), uint32_t(f.sign_y), uint32_t(f.sign_z), uint32_t(f.sign_w), int(f.exp_adjust),
+                        uint32_t(f.swizzle), words[0], words[1], words[2], words[3], words[4], words[5],
+                        s_regs[XE_GPU_REG_RB_COLOR_INFO], s_regs[XE_GPU_REG_RB_COLOR1_INFO],
+                        s_regs[XE_GPU_REG_RB_COLOR2_INFO], s_regs[XE_GPU_REG_RB_COLOR3_INFO]);
+                }
         for (uint32_t d = 0; d < 3; d++)
             for (uint32_t n = 0; n < 32; n++)
             {
@@ -6793,7 +8420,17 @@ void main()
                 ii = { s_sampler, s_dummy[d].view, VK_IMAGE_LAYOUT_GENERAL };
                 if (!(s_exp & 8))  // NFSMW_GPU_EXP bit 8: placeholders only (texture cost experiment)
                     ii.imageView = GetTexture(n, d == 0 ? TexDim::k2D : d == 1 ? TexDim::k3D : TexDim::kCube, ii.sampler);
+                if (d == 0) {
+                    auto found = s_textureViewExtents.find(ii.imageView);
+                    const VkExtent2D extent = found == s_textureViewExtents.end() ? VkExtent2D{1, 1} : found->second;
+                    textureReciprocal[n][0] = 1.0f / float(std::max(extent.width, 1u));
+                    textureReciprocal[n][1] = 1.0f / float(std::max(extent.height, 1u));
+                }
             }
+
+        static float lastTextureReciprocal[32][4] = {};
+        if (memcmp(lastTextureReciprocal, textureReciprocal, sizeof(textureReciprocal)) != 0)
+            g_constantsDirty.store(true, std::memory_order_relaxed);
 
         // Vertex data the guest may reuse before the GPU runs this draw (its
         // fences are published early, see g_eagerWrites): small ranges are
@@ -6888,51 +8525,108 @@ void main()
         // were 9 KB an upload, ~2,500 uploads a frame into the BAR ring.
         const Shader* constLayoutVs = s_vs->info.constPacked ? s_vs : nullptr;
         const Shader* constLayoutPs = s_ps->info.constPacked ? s_ps : nullptr;
+        // The float constants an upload holds: the vertex shader's slots, then
+        // the pixel shader's (pc.psConstBase), after the fixed part.
+        auto stageSlots = [](const Shader* packed) -> uint32_t {
+            if (!packed)
+                return 256;
+            uint32_t n = 0;
+            for (uint32_t q = 0; q < 4; q++)
+                n += uint32_t(__builtin_popcountll(packed->info.constUsed[q]));
+            return n;
+        };
+        const uint32_t vsSlots = stageSlots(constLayoutVs), psSlots = stageSlots(constLayoutPs);
+        const bool neutralCurve = s_ps->hash == kColourCurvePs && settings::GetBool(settings::Id::GameYellowFilter);
+        DumpColourPassConstants(initiator.prim_type == xenos::PrimitiveType::kRectangleList, vertexCount);
+        const VkDeviceSize constantsBytes = kFloatConstOffset + VkDeviceSize(vsSlots + psSlots) * 16;
+        // Snapshots served from an earlier copy in this submission (decided
+        // again after every submit, which retires them).
+        VkDeviceSize reusedOffset[4] = {};
+        bool reused[4] = {};
+        auto setRedirect = [&](uint32_t i, VkDeviceSize ringOffset) {
+            pc.vfRedirect[i][0] = copies[i].base;
+            pc.vfRedirect[i][1] = copies[i].size;
+            pc.vfRedirect[i][2] = uint32_t(ringOffset);
+        };
         while (true)
         {
             bool uploadConstants = g_constantsDirty.load(std::memory_order_relaxed) ||
                 s_lastConstantsSubmission != s_submissionCounter || !s_recording ||
-                constLayoutVs != s_lastConstLayoutVs || constLayoutPs != s_lastConstLayoutPs;
-            VkDeviceSize need = (uploadConstants ? kConstantsSize : 0) + (useIndices ? 256 + indexBytes : 0) +
-                (copyCount ? 256 + copyBytes : 0);
+                constLayoutVs != s_lastConstLayoutVs || constLayoutPs != s_lastConstLayoutPs || neutralCurve != s_lastNeutralCurve;
+            bool anyReused = false;
+            VkDeviceSize snapshotBytes = 0;
+            for (uint32_t i = 0; i < copyCount; i++)
+            {
+                reused[i] = SnapshotReusable(copies[i].base, copies[i].size, &reusedOffset[i]);
+                anyReused |= reused[i];
+                if (!reused[i])
+                    snapshotBytes += (copies[i].size + 255) & ~255u;
+            }
+            copyBytes = snapshotBytes;  // (what goes into the ring: the capture's upload bytes)
+            VkDeviceSize need = (uploadConstants ? constantsBytes : 0) + (useIndices ? 256 + indexBytes : 0) +
+                (snapshotBytes ? 256 + snapshotBytes : 0);
             if (need == 0)
+            {
+                for (uint32_t i = 0; i < copyCount; i++)  // (all reused)
+                {
+                    setRedirect(i, reusedOffset[i]);
+                    s_stats.snapReused++;
+                    s_stats.snapReusedBytes += copies[i].size;
+                }
                 break;
+            }
             uint64_t before = s_submissionCounter;
             VkDeviceSize at = RingAllocate(need);
-            if (!uploadConstants && s_submissionCounter != before)
-                continue;  // submitted meanwhile: the cached constants are gone
+            if ((!uploadConstants || anyReused) && s_submissionCounter != before)
+                continue;  // submitted meanwhile: the cached constants and reused snapshots are gone
             if (uploadConstants)
             {
                 g_constantsDirty.store(false, std::memory_order_relaxed);
                 constantsOffset = at;
                 uint8_t* c = s_ringHost + at;
-                auto copyStage = [&](const Shader* packed, uint32_t base) {
-                    const uint32_t* src = &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + base * 4];
+                // `regBase`: the stage's first float constant register (VS 0, PS
+                // 256); `slotBase`: where its constants start among c[].
+                auto copyStage = [&](const Shader* packed, uint32_t regBase, uint32_t slotBase) {
+                    const uint32_t* src = &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + regBase * 4];
+                    uint8_t* dst = c + kFloatConstOffset + slotBase * 16;
+                    const bool curve = neutralCurve && regBase == 256;  // (the pixel shader's c6-c9)
                     if (!packed)
                     {
-                        memcpy(c + base * 16, src, 256 * 16);
+                        memcpy(dst, src, 256 * 16);
+                        if (curve)
+                            for (uint32_t r = 6; r <= 9; r++)
+                                NeutralColourCurveRow(reinterpret_cast<float*>(dst + r * 16));
                         return;
                     }
                     uint32_t slot = 0;
                     for (uint32_t q = 0; q < 4; q++)
                         for (uint64_t bits = packed->info.constUsed[q]; bits; bits &= bits - 1, slot++)
-                            memcpy(c + (base + slot) * 16, src + (q * 64 + uint32_t(__builtin_ctzll(bits))) * 4, 16);
+                        {
+                            const uint32_t reg = q * 64 + uint32_t(__builtin_ctzll(bits));
+                            memcpy(dst + slot * 16, src + reg * 4, 16);
+                            if (curve && reg >= 6 && reg <= 9)
+                                NeutralColourCurveRow(reinterpret_cast<float*>(dst + slot * 16));
+                        }
                 };
-                copyStage(constLayoutVs, 0);    // pc.vsConstBase
-                copyStage(constLayoutPs, 256);  // pc.psConstBase
+                copyStage(constLayoutVs, 0, 0);          // pc.vsConstBase
+                copyStage(constLayoutPs, 256, vsSlots);  // pc.psConstBase
                 s_lastConstLayoutVs = constLayoutVs;
                 s_lastConstLayoutPs = constLayoutPs;
-                memcpy(c + 512 * 16, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 48 * 16);
-                memcpy(c + 560 * 16, &s_regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 2 * 16);
-                memcpy(c + 562 * 16, &s_regs[XE_GPU_REG_SHADER_CONSTANT_LOOP_00], 8 * 16);
-                memset(c + 570 * 16, 0, 4 * 16);
+                s_lastNeutralCurve = neutralCurve;
+                memcpy(c + kFetchOffset, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 48 * 16);
+                memcpy(c + kBoolsOffset, &s_regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 2 * 16);
+                memcpy(c + kLoopsOffset, &s_regs[XE_GPU_REG_SHADER_CONSTANT_LOOP_00], 8 * 16);
+                memset(c + kDrawInfoOffset, 0, 4 * 16);
+                memcpy(c + kTextureReciprocalOffset, textureReciprocal, sizeof(textureReciprocal));
+                s_stats.constantBytes += constantsBytes;
+                memcpy(lastTextureReciprocal, textureReciprocal, sizeof(textureReciprocal));
                 s_lastConstantsOffset = at;
                 s_lastConstantsSubmission = s_submissionCounter;
                 s_stats.constantUploads++;
             }
             if (useIndices)
             {
-                indexOffset = (at + (uploadConstants ? kConstantsSize : 0) + 255) & ~VkDeviceSize(255);
+                indexOffset = (at + (uploadConstants ? constantsBytes : 0) + 255) & ~VkDeviceSize(255);
                 if (directIndices)
                 {
                     ConvertIndices(s_ringHost + indexOffset, src, count, indices16, restart, resetIndex);
@@ -6966,14 +8660,19 @@ void main()
             }
             if (copyCount)
             {
-                VkDeviceSize snapshot = (at + (uploadConstants ? kConstantsSize : 0) + (useIndices ? 256 + indexBytes : 0) + 255) & ~VkDeviceSize(255);
-                s_stats.snapshotBytes += copyBytes;
+                VkDeviceSize snapshot = (at + (uploadConstants ? constantsBytes : 0) + (useIndices ? 256 + indexBytes : 0) + 255) & ~VkDeviceSize(255);
+                s_stats.snapshotBytes += snapshotBytes;
                 for (uint32_t i = 0; i < copyCount; i++)
                 {
-                    memcpy(s_ringHost + snapshot, s_sharedHost + copies[i].base, copies[i].size);
-                    pc.vfRedirect[i][0] = copies[i].base;
-                    pc.vfRedirect[i][1] = copies[i].size;
-                    pc.vfRedirect[i][2] = uint32_t(snapshot);
+                    if (reused[i])
+                    {
+                        setRedirect(i, reusedOffset[i]);
+                        s_stats.snapReused++;
+                        s_stats.snapReusedBytes += copies[i].size;
+                        continue;
+                    }
+                    CopySnapshot(copies[i].base, copies[i].size, s_ringHost + snapshot, snapshot);
+                    setRedirect(i, snapshot);
                     snapshot += (copies[i].size + 255) & ~255u;
                 }
             }
@@ -6986,17 +8685,19 @@ void main()
         // Untiled, tile 0 draws the whole frame: the whole target, or with
         // NFSMW_UNTILED_AREA its viewport (UntiledScissor).
         // In guest pixels; the host viewport and scissor are x (scaleX, scaleY)
-        // (every attachment of a pass shares the surface pitch, so its scale).
-        uint32_t targetW = UINT32_MAX, targetH = UINT32_MAX, scaleX = 1, scaleY = 1;
+        // (every attachment of a pass shares the surface pitch, so its scale),
+        // the scissor's edges as gpu/render_scale.h maps them (HostRect).
+        uint32_t targetW = UINT32_MAX, targetH = UINT32_MAX;
+        gpu::RenderScale scale;
         for (RenderTarget* rt : { color[0], color[1], color[2], color[3], depth })
             if (rt)
             {
                 targetW = std::min(targetW, rt->guestWidth);
                 targetH = std::min(targetH, rt->guestHeight);
-                scaleX = rt->scaleX;
-                scaleY = rt->scaleY;
+                scale = rt->scale;
             }
         float w = float(targetW), h = float(targetH);
+        const float scaleX = scale.x.Value(), scaleY = scale.y.Value();
         RenderTarget* const attached[5] = { color[0], color[1], color[2], color[3], depth };
         Rect sc = GuestScissor();
         int untiledWhy = 4;
@@ -7013,7 +8714,7 @@ void main()
         // barrier may end the pass: then it gives way a draw early.)
         if (untiledPass && untiledWhy != 4 && x1 > x0 && y1 > y0 && s_passActive && depth == s_passDepth &&
             std::equal(color, color + 4, s_passColor) &&
-            !Contains(s_passArea, { { x0 * int32_t(scaleX), y0 * int32_t(scaleY) }, { uint32_t(x1 - x0) * scaleX, uint32_t(y1 - y0) * scaleY } }))
+            !Contains(s_passArea, HostRect(scale, x0, y0, x1, y1)))
         {
             uint64_t key = 0;
             for (RenderTarget* rt : attached)
@@ -7022,11 +8723,11 @@ void main()
                     rt->wholeArea = true;
                     key = key * 0x9E3779B1ull + ((uint64_t(rt->base) << 20) ^ (uint64_t(rt->pitch) << 1) ^ uint64_t(rt->depth));
                 }
+            const VkRect2D want = HostRect(scale, x0, y0, x1, y1);
             LogOnce((0x33ull << 56) | (key & 0xFFFFFFFFFFFFFFull), "untiled area: frame %llu vs_%016llx ps_%016llx would restart its targets' "
-                "pass (area %ux%u@%d,%d) for %dx%d@%d,%d: they keep the whole target from now on", (unsigned long long)s_frame,
+                "pass (area %ux%u@%d,%d) for %ux%u@%d,%d: they keep the whole target from now on", (unsigned long long)s_frame,
                 (unsigned long long)s_vs->hash, (unsigned long long)s_ps->hash, s_passArea.extent.width, s_passArea.extent.height,
-                s_passArea.offset.x, s_passArea.offset.y, (x1 - x0) * int32_t(scaleX), (y1 - y0) * int32_t(scaleY), x0 * int32_t(scaleX),
-                y0 * int32_t(scaleY));
+                s_passArea.offset.x, s_passArea.offset.y, want.extent.width, want.extent.height, want.offset.x, want.offset.y);
             if (untiledWhy == 0)
             {
                 x0 = y0 = 0;
@@ -7079,7 +8780,7 @@ void main()
         if (untiledPass && s_untiledArea)
         {
             const bool cut = untiledWhy == 0 && (x0 > 0 || y0 > 0 || x1 < int32_t(w) || y1 < int32_t(h));
-            const VkRect2D drew{ { x0 * int32_t(scaleX), y0 * int32_t(scaleY) }, { uint32_t(x1 - x0) * scaleX, uint32_t(y1 - y0) * scaleY } };
+            const VkRect2D drew = HostRect(scale, x0, y0, x1, y1);
             for (int i = 0; i < 5; i++)
                 if (RenderTarget* rt = attached[i]; rt && !(i < 4 ? (adoptedColor >> i) & 1 : adoptedDepth))
                 {
@@ -7096,7 +8797,7 @@ void main()
                         rt->cutReach = {};
                     }
                     rt->cut = true;
-                    rt->cutReach = { std::max(rt->cutReach.width, uint32_t(w) * scaleX), std::max(rt->cutReach.height, uint32_t(h) * scaleY) };
+                    rt->cutReach = { std::max(rt->cutReach.width, scale.x.Size(uint32_t(w))), std::max(rt->cutReach.height, scale.y.Size(uint32_t(h))) };
                     if (x1 <= x0 || y1 <= y0)
                         continue;
                     const VkRect2D& was = rt->cutDrawn;
@@ -7113,7 +8814,7 @@ void main()
         }
         if (x1 <= x0 || y1 <= y0)
             return;
-        VkRect2D scissor{ { x0 * int32_t(scaleX), y0 * int32_t(scaleY) }, { uint32_t(x1 - x0) * scaleX, uint32_t(y1 - y0) * scaleY } };
+        VkRect2D scissor = HostRect(scale, x0, y0, x1, y1);
 
         // Viewport: the guest transform is folded into the vertex shader
         // (pc.posScale) and the host viewport covers the whole target.
@@ -7205,6 +8906,10 @@ void main()
         // reaches the screen's top and bottom, its sides cropped ("cover"):
         // stretched in y alone it would be distorted by up to 1/sv. The rest
         // of the front end is clipped to the band (below).
+        // Edge bars (gpu/edge_bars.h): the copies of a police vid-cam side
+        // bar or the intro's black frame that fill the screen past the 16:9
+        // band, drawn right after it.
+        gpu::bars::Plan barPlan;
         if (const float s = game::AspectScaleX(), sv = game::AspectScaleY(); s < 1.0f || sv < 1.0f)
         {
             if (const float feX = game::FrontEndScaleX(); feX > 0.0f)
@@ -7278,6 +8983,29 @@ void main()
                     bool outside = false;  // a primitive wholly above or below the band
                     uint32_t prims = 0;
                     std::string primList;
+                    // NFSMW_LOG_FRONTEND=1: up to four primitives that cross
+                    // an edge of the 16:9 band (past it by more than half a
+                    // percent of the band) and stop short of the screen's
+                    // edge, the shape that leaves a strip of the world (the
+                    // vid cam's mask did): logged below as "edge candidate"
+                    // with what the rules here did to them. And ("inset
+                    // candidate") one centred in the band, covering most of
+                    // it in x and y and stopping short of its edges in one
+                    // or both, the shape of the intro's black frame between
+                    // two shots, which the world showed all round.
+                    struct EdgeHit
+                    {
+                        uint32_t prim;
+                        const char* edge;  // "+y", "-y", "+x" or "-x" (clip space), or "in" (inset)
+                        float lo, hi, past, end;  // band units along that axis; the outer end in clip units
+                                                  // (inset: band x, then its reach in clip x and y)
+                        float acrossLo, acrossHi;  // band units along the other axis (inset: band y)
+                        uint32_t colours[4];
+                        uint32_t colourCount;
+                    };
+                    EdgeHit edgeHits[4];
+                    uint32_t edgeHitCount = 0;
+                    const float bandMidX = c[3] * (1.0f - s), bandLoX = bandMidX - s, bandHiX = bandMidX + s;
                     if (scan)
                     {
                         const uint32_t base = vf[0] & 0x1FFFFFFC, endian = vf[1] & 3;
@@ -7330,6 +9058,56 @@ void main()
                             outside = outside || (measureY && (hiY < bandLo || loY > bandHi));
                             if (logFrontEnd && prims < 8)
                                 primList += std::format(" [{:.3f}..{:.3f} {:.3f}..{:.3f}]", lo, hi, loY, hiY);
+                            // (The front-end shader's draws only: one that
+                            // inherits the constants reads no ePolys.)
+                            if (logFrontEnd && feShader && edgeHitCount < 4)
+                            {
+                                auto hit = [&](const char* edge, float a, float b, float mid, float scale, float past, float end) {
+                                    if (edgeHitCount >= 4)
+                                        return;
+                                    EdgeHit& e = edgeHits[edgeHitCount++];
+                                    const bool y = edge[1] == 'y';
+                                    const float c0 = y ? lo : loY, c1 = y ? hi : hiY, cMid = y ? bandMidX : bandMid, cScale = y ? s : sv;
+                                    e = { prims, edge, (a - mid) / scale, (b - mid) / scale, past / scale, end, (c0 - cMid) / cScale,
+                                        (c1 - cMid) / cScale, {}, 0 };
+                                    for (uint32_t k = 0; k < per && k < 4; k++)
+                                    {
+                                        const uint32_t v = src.Get(v0 + k) + first;  // (in range: read above)
+                                        e.colours[e.colourCount++] = GpuSwap(LoadPhysical(base + (v * 8 + 3) * 4), endian);
+                                    }
+                                };
+                                const float my = 0.005f * sv, mx = 0.005f * s;
+                                if (sv < 1.0f)
+                                {
+                                    if (hiY > bandHi + my && hiY < 1.0f && loY < bandHi)
+                                        hit("+y", loY, hiY, bandMid, sv, hiY - bandHi, hiY);
+                                    if (loY < bandLo - my && loY > -1.0f && hiY > bandLo)
+                                        hit("-y", loY, hiY, bandMid, sv, bandLo - loY, loY);
+                                }
+                                if (s < 1.0f)
+                                {
+                                    if (hi > bandHiX + mx && hi < 1.0f && lo < bandHiX)
+                                        hit("+x", lo, hi, bandMidX, s, hi - bandHiX, hi);
+                                    if (lo < bandLoX - mx && lo > -1.0f && hi > bandLoX)
+                                        hit("-x", lo, hi, bandMidX, s, bandLoX - lo, lo);
+                                }
+                                // Inset: centred within 2% of the band,
+                                // reaching 80% of it or more each way, short
+                                // of its edge (99%) in x or y.
+                                const float xl = (lo - bandMidX) / s, xh = (hi - bandMidX) / s, yl = (loY - bandMid) / sv, yh = (hiY - bandMid) / sv;
+                                const float bandReachX = std::min(-xl, xh), bandReachY = std::min(-yl, yh);
+                                if (edgeHitCount < 4 && std::fabs(xl + xh) <= 0.04f && std::fabs(yl + yh) <= 0.04f && bandReachX >= 0.8f &&
+                                    bandReachY >= 0.8f && std::min(bandReachX, bandReachY) < 0.99f)
+                                {
+                                    EdgeHit& e = edgeHits[edgeHitCount++];
+                                    e = { prims, "in", xl, xh, std::min(-lo, hi), std::min(-loY, hiY), yl, yh, {}, 0 };
+                                    for (uint32_t k = 0; k < per && k < 4; k++)
+                                    {
+                                        const uint32_t v = src.Get(v0 + k) + first;  // (in range: read above)
+                                        e.colours[e.colourCount++] = GpuSwap(LoadPhysical(base + (v * 8 + 3) * 4), endian);
+                                    }
+                                }
+                            }
                             prims++;
                         }
                         fullWidth = fullWidth && valid;
@@ -7408,15 +9186,197 @@ void main()
                     bool clipped = false;
                     if (tall && !extended && !cover && !meetsBand && vte.vport_y_scale_ena && vte.vport_y_offset_ena)
                     {
-                        const float hostH = h * float(scaleY);
-                        const float n0 = bandLo * ps1 + ps3, n1 = bandHi * ps1 + ps3;  // NDC y of the band's edges
-                        const float a = std::round((std::min(n0, n1) + 1.0f) * 0.5f * hostH * 256.0f) / 256.0f;
-                        const float b = std::round((std::max(n0, n1) + 1.0f) * 0.5f * hostH * 256.0f) / 256.0f;
-                        const int32_t top = std::max(scissor.offset.y, int32_t(std::ceil(a - 0.5f)));
-                        const int32_t bottom = std::min(scissor.offset.y + int32_t(scissor.extent.height), int32_t(std::ceil(b - 0.5f)));
+                        // (The rows the edge-bar fills leave, by the same rule.)
+                        const gpu::bars::Rows band = gpu::bars::BandRows(bandLo, bandHi, ps1, ps3, h * float(scaleY));
+                        const int32_t top = std::max(scissor.offset.y, band.top);
+                        const int32_t bottom = std::min(scissor.offset.y + int32_t(scissor.extent.height), band.bottom);
                         scissor.offset.y = top;
                         scissor.extent.height = uint32_t(std::max(bottom - top, 0));
                         clipped = true;
+                    }
+                    // The police vid-cam's mask (career intro) ends with two
+                    // solid black side bars that reach ~3% past the 16:9
+                    // frame's top and bottom: under Vert+ the world shows in
+                    // the rows above and below them (and the CRT bezel's
+                    // quadrants, which stop at the same place), under Hor+
+                    // past a 2.50:1 screen beside them. The intro's cut
+                    // between two shots (~95 s) is a few frames of one black
+                    // quad 0.970 x 0.939 of the 16:9 frame: the world shows
+                    // all round it. Such a quad (gpu::bars::PlanFill: one
+                    // black rectangle of the front-end shader the rules
+                    // above left alone; a bar a little past both band edges
+                    // in y, from inside the band to well past one side; a
+                    // black frame centred, short of the band's edges) is
+                    // drawn again after itself, stretched over the frame and
+                    // scissored to (its half of) what lies outside the band:
+                    // nothing inside the band changes.
+                    // NFSMW_BAR_FILL=0 turns it off (an A/B switch).
+                    static const bool barFill = [] { const char* v = std::getenv("NFSMW_BAR_FILL"); return !(v && v[0] == '0'); }();
+                    const uint32_t blend0 = s_regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF1FFF;
+                    if (barFill)
+                    {
+                        xenos::xe_gpu_texture_fetch_t t0;
+                        memcpy(&t0, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(t0));
+                        const gpu::bars::Draw draw{ .prim = prim,
+                            .count = count,
+                            .c = c,
+                            .frontEndY = feY,
+                            .scaleX = s,
+                            .scaleY = sv,
+                            .frontEndShader = feShader,
+                            .leftAlone = kX == 1.0f && kY == 1.0f && kCover == 1.0f && !clipped,
+                            .occlusion = zpdCount,
+                            .vte = vte.value,
+                            .blend0 = blend0,
+                            .t0Sampled = (s_ps->info.texture2DMask & 1) != 0,
+                            .t0Width = uint32_t(t0.size_2d.width) + 1,
+                            .t0Height = uint32_t(t0.size_2d.height) + 1,
+                            .posScale = { pc.posScale[0], pc.posScale[1], pc.posScale[2], pc.posScale[3] },
+                            .hostW = w * float(scaleX),
+                            .hostH = h * float(scaleY),
+                            .scissor = { scissor.offset.x, scissor.offset.y, scissor.offset.x + int32_t(scissor.extent.width),
+                                scissor.offset.y + int32_t(scissor.extent.height) } };
+                        const uint32_t base = vf[0] & 0x1FFFFFFC, endian = vf[1] & 3;
+                        const uint32_t words = (vf[1] >> 2) & 0xFFFFFF, first = s_regs[XE_GPU_REG_VGT_INDX_OFFSET];
+                        auto read = [&](uint32_t k, uint32_t j, uint32_t& word) {
+                            const uint32_t v = src.Get(k) + first;  // an ePoly: 8 words
+                            if ((v + 1) * 8 > words)
+                                return false;
+                            word = GpuSwap(LoadPhysical(base + (v * 8 + j) * 4), endian);
+                            return true;
+                        };
+                        barPlan = gpu::bars::PlanFill(draw, read);
+                        // The results screen's backdrop (and any opaque
+                        // picture of that shape: the title's key art): what
+                        // lies past the band and outside the picture is
+                        // cleared to black after it, where the world drawn
+                        // behind it showed (gpu/edge_bars.h).
+                        if (barPlan.fill == gpu::bars::Fill::None)
+                            barPlan = gpu::bars::PlanBackdrop(draw, read);
+                    }
+                    if (barPlan.fill != gpu::bars::Fill::None)
+                    {
+                        // Once per kind, screen shape and outcome, in every
+                        // log (a tester's too); a match each frame skips
+                        // building the line once its key is logged.
+                        const uint32_t kind = uint32_t(barPlan.fill);
+                        const bool blackout = barPlan.fill == gpu::bars::Fill::Blackout;
+                        const bool backdrop = barPlan.fill == gpu::bars::Fill::Backdrop;
+                        const gpu::bars::Box& box = barPlan.box;
+                        const uint64_t key = (0x36ull << 56) | (uint64_t(kind) << 40) | (uint64_t(barPlan.rectCount) << 36) |
+                            (uint64_t(std::lround(s * 4096.0f)) << 18) | uint64_t(std::lround(sv * 4096.0f));
+                        static uint64_t loggedKey[5] = { ~0ull, ~0ull, ~0ull, ~0ull, ~0ull };
+                        if (loggedKey[kind] != key)
+                        {
+                            loggedKey[kind] = key;
+                            char fills[96];
+                            if (barPlan.rectCount)
+                                snprintf(fills, sizeof(fills), "fills %u rectangle(s) past the 16:9 band, first [%d,%d)x[%d,%d) (host px)",
+                                    barPlan.rectCount, barPlan.rects[0].x0, barPlan.rects[0].x1, barPlan.rects[0].y0, barPlan.rects[0].y1);
+                            else
+                                snprintf(fills, sizeof(fills), "%s", blackout || backdrop ? "fills nothing" : "reaches the screen edge: nothing to fill");
+                            LogOnce(key,
+                                "edge bars: frame %llu vs_%016llx ps_%016llx: %s (clip x %.3f..%.3f y %.3f..%.3f, colour %08X; view scale x %.4f y %.4f) %s",
+                                (unsigned long long)s_frame, (unsigned long long)s_vs->hash, (unsigned long long)s_ps->hash,
+                                backdrop ? "a full-band backdrop (black past the band)" : blackout ? "a black frame"
+                                    : kind == uint32_t(gpu::bars::Fill::RightBar) ? "the right vid-cam bar" : "the left vid-cam bar",
+                                box.x0, box.x1, box.y0, box.y1, barPlan.argb, s, sv, fills);
+                        }
+                        // NFSMW_LOG_FRONTEND=1: the first frame of each
+                        // run of frames with a match, bars and black frames
+                        // apart (one run per vid-cam scene and per cut; any
+                        // other is a draw this should not take).
+                        static uint64_t lastBarFrame[3] = { ~0ull - 1, ~0ull - 1, ~0ull - 1 };
+                        uint64_t& last = lastBarFrame[backdrop ? 2 : blackout ? 1 : 0];
+                        if (logFrontEnd && s_frame != last && s_frame != last + 1)
+                        {
+                            xenos::xe_gpu_texture_fetch_t t0;
+                            memcpy(&t0, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(t0));
+                            fprintf(stderr, "[frontend] edge bars: matching from frame %llu: %s x %.3f..%.3f y %.3f..%.3f colour %08X blend %08X t0 %08X %ux%u, %u rect(s)\n",
+                                (unsigned long long)s_frame, backdrop ? "backdrop" : blackout ? "black frame" : kind == uint32_t(gpu::bars::Fill::RightBar) ? "right bar" : "left bar",
+                                box.x0, box.x1, box.y0, box.y1, barPlan.argb, blend0, (uint32_t(t0.base_address) << 12) & 0x1FFFFFFFu,
+                                uint32_t(t0.size_2d.width) + 1, uint32_t(t0.size_2d.height) + 1, barPlan.rectCount);
+                        }
+                        last = s_frame;
+                    }
+                    // The edge candidates (above) that still stop short of
+                    // the screen's edge after the rules, each distinct line
+                    // once, at most 4 per (t0, edge, kind) and 256 per run:
+                    // a sliding or fading element makes a new line each
+                    // frame, so the frame number is not part of the line.
+                    // Their own cap, not the per-shader-pair one (every
+                    // front-end draw shares one shader pair, and the title
+                    // screen and menus use it up).
+                    for (uint32_t i = 0; i < edgeHitCount; i++)
+                    {
+                        static std::unordered_set<std::string> logged;
+                        static std::unordered_map<uint64_t, uint32_t> perKey;
+                        static uint32_t lines = 0;
+                        if (lines > 256)
+                            break;
+                        const EdgeHit& e = edgeHits[i];
+                        const bool inset = e.edge[0] == 'i';
+                        // One the rules above take past the screen's edge
+                        // (widened, stretched or zoomed about the centre: the
+                        // fades, dims and loading band) leaves no strip; an
+                        // inset one, none when they take it past both.
+                        if (inset ? e.past * kX * kCover >= 1.0f && e.end * kY * kCover >= 1.0f
+                                  : std::fabs(e.end * (e.edge[1] == 'x' ? kX : kY) * kCover) >= 1.0f)
+                            continue;
+                        auto fetch = [](uint32_t n) {
+                            xenos::xe_gpu_texture_fetch_t f;
+                            memcpy(&f, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6], sizeof(f));
+                            return f;
+                        };
+                        const xenos::xe_gpu_texture_fetch_t f0 = fetch(0), f1 = fetch(1);
+                        const uint32_t t0 = (s_ps->info.texture2DMask & 1) ? (uint32_t(f0.base_address) << 12) & 0x1FFFFFFFu : 0;
+                        const uint32_t t1 = (s_ps->info.texture2DMask & 2) ? (uint32_t(f1.base_address) << 12) & 0x1FFFFFFFu : 0;
+                        bool same = true;
+                        uint32_t minAlpha = 0xFF;
+                        for (uint32_t k = 0; k < e.colourCount; k++)
+                        {
+                            same = same && e.colours[k] == e.colours[0];
+                            minAlpha = std::min(minAlpha, e.colours[k] >> 24);
+                        }
+                        // At most 4 lines per (t0, edge, kind: opaque black,
+                        // opaque, translucent): checked before the line is
+                        // made, so a capped element costs nothing more. (By
+                        // kind too: the game's white texture is under every
+                        // flat panel, and a fading glow would use them up.)
+                        const uint64_t kind = (minAlpha >= 0xF0 ? 1u : 0u) | (same && (e.colours[0] & 0xFFFFFFu) == 0 ? 2u : 0u);
+                        const uint64_t edgeCode = inset ? 4u : (uint64_t(e.edge[0] == '+') << 1) | uint64_t(e.edge[1] == 'x');
+                        uint32_t& perT0Edge = perKey[(uint64_t(t0) << 32) | (kind << 3) | edgeCode];
+                        if (perT0Edge >= 4)
+                            continue;
+                        const std::string action = barPlan.rectCount
+                            ? std::string(barPlan.fill == gpu::bars::Fill::Backdrop ? "backdrop fill"
+                                    : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame fill" : "bar fill")
+                            : clipped ? std::format("clipped to rows {}..{}", scissor.offset.y, scissor.offset.y + int32_t(scissor.extent.height))
+                            : kCover != 1.0f ? std::format("cover x{:.3f}", kCover)
+                            : (kX != 1.0f || kY != 1.0f) ? std::format("widened x{:.3f} y{:.3f}", kX, kY)
+                            : std::string("left alone");
+                        const std::string textures = std::format("t0 {} t1 {}",
+                            t0 ? std::format("{:08X} {}x{} f{}", t0, uint32_t(f0.size_2d.width) + 1, uint32_t(f0.size_2d.height) + 1, uint32_t(f0.format)) : std::string("-"),
+                            t1 ? std::format("{:08X}", t1) : std::string("-"));
+                        const std::string colour = same ? std::format("{:08X}", e.colours[0]) : std::string("varies");
+                        const std::string line = inset
+                            ? std::format("vs_{:016x} ps_{:016x} n{} prim {}/{} {}: band x {:.3f}..{:.3f} y {:.3f}..{:.3f}, short of the band's edges by "
+                                "{:.3f} in x and {:.3f} in y, reaches clip x {:.3f} y {:.3f}; colour {} alpha {:02X} blend {:08X}: {}",
+                                s_vs->hash, s_ps->hash, count, e.prim, prims, textures, e.lo, e.hi, e.acrossLo, e.acrossHi,
+                                1.0f - std::min(-e.lo, e.hi), 1.0f - std::min(-e.acrossLo, e.acrossHi), e.past, e.end, colour, minAlpha, blend0, action)
+                            : std::format("vs_{:016x} ps_{:016x} n{} prim {}/{} {} {}: band {:.3f}..{:.3f} ({} {:.3f}..{:.3f}), "
+                                "{:.3f} past its edge, ends at clip {:.3f} (short of the screen edge); colour {} alpha {:02X} blend {:08X}: {}",
+                                s_vs->hash, s_ps->hash, count, e.prim, prims, textures, e.edge, e.lo, e.hi, e.edge[1] == 'y' ? "x" : "y", e.acrossLo,
+                                e.acrossHi, e.past, e.end, colour, minAlpha, blend0, action);
+                        if (!logged.insert(line).second)
+                            continue;
+                        perT0Edge++;
+                        if (++lines > 256)
+                        {
+                            fprintf(stderr, "[frontend] edge candidate: cap reached (256 lines), no more\n");
+                            break;
+                        }
+                        fprintf(stderr, "[frontend] %s candidate: frame %llu %s\n", inset ? "inset" : "edge", (unsigned long long)s_frame, line.c_str());
                     }
                     if (logFrontEnd && fullWidth)
                     {
@@ -7476,6 +9436,41 @@ void main()
                 }
             }
         }
+        if (s_visual.active && s_visual.draws++ < 6000)
+        {
+            auto finiteValue = [](float value) { return std::isfinite(value) ? value : 0.0f; };
+            std::string line = std::format("{{\"frame\":{},\"draw\":{},\"vs\":\"{:016x}\",\"ps\":\"{:016x}\",\"target\":[{},{}],\"viewport_transform\":[{},{},{},{},{},{}],\"scissor\":[{},{},{},{}],\"depth_control\":{},\"blend\":[{},{},{},{}],\"color_mask\":{},\"clip\":{},\"fetch\":[",
+                s_visual.frame, s_visual.draws, s_vs->hash, s_ps->hash, targetW, targetH,
+                finiteValue(sx), finiteValue(sy), finiteValue(sz), finiteValue(ox), finiteValue(oy), finiteValue(oz), x0, y0, x1, y1, s_regs[XE_GPU_REG_RB_DEPTHCONTROL],
+                s_regs[XE_GPU_REG_RB_BLENDCONTROL0], s_regs[XE_GPU_REG_RB_BLENDCONTROL1], s_regs[XE_GPU_REG_RB_BLENDCONTROL2], s_regs[XE_GPU_REG_RB_BLENDCONTROL3],
+                s_regs[XE_GPU_REG_RB_COLOR_MASK], s_regs[XE_GPU_REG_PA_CL_CLIP_CNTL]);
+            bool comma = false;
+            for (uint32_t n = 0; n < 32; ++n)
+                if ((s_ps->info.texture2DMask | s_ps->info.texture3DMask | s_ps->info.textureCubeMask) & (1u << n))
+                {
+                    const uint32_t* f = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6];
+                    if (comma) line += ","; comma = true;
+                    line += std::format("{{\"slot\":{},\"words\":[{},{},{},{},{},{}]}}", n, f[0], f[1], f[2], f[3], f[4], f[5]);
+                    s_visual.sampled.insert(f[1] & 0x1FFFF000u);
+                }
+            line += std::format("],\"pixel_writes_depth\":{},\"constants\":[", s_ps->info.writesDepth ? "true" : "false");
+            comma = false;
+            for (unsigned stage = 0; stage < 2; ++stage)
+            {
+                const auto& info = stage ? s_ps->info : s_vs->info;
+                unsigned recorded = 0;
+                for (unsigned index = 0; index < 256 && recorded < 32; ++index)
+                    if (info.constRelative || (info.constUsed[index / 64] & (1ull << (index % 64))))
+                    {
+                        const uint32_t* c = &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (stage * 256 + index) * 4];
+                        if (comma) line += ","; comma = true;
+                        line += std::format("{{\"stage\":{},\"index\":{},\"bits\":[{},{},{},{}]}}", stage, index, c[0], c[1], c[2], c[3]);
+                        ++recorded;
+                    }
+            }
+            line += "],\"constant_limit_per_stage\":32}\n";
+            s_visual.text("draw-state.jsonl", line, true);
+        }
         // NFSMW_LOG_DRAWS=<seconds>: every draw of one frame (target, viewport,
         // scissor, textures, shaders), consecutive duplicates folded.
         if (s_logDrawsNow)
@@ -7485,6 +9480,9 @@ void main()
             for (uint32_t n = 0; n < 32; n++)
                 if ((s_ps->info.texture2DMask | s_ps->info.texture3DMask | s_ps->info.textureCubeMask) & (1u << n))
                     line += std::format(" {}:{:08X}", n, (s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6 + 1] & 0x1FFFF000u));
+            if (barPlan.rectCount)
+                line += std::format(" +edge {} fill x{}", barPlan.fill == gpu::bars::Fill::Backdrop ? "backdrop"
+                    : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame" : "bar", barPlan.rectCount);
             static std::string last;
             static uint32_t repeats = 0;
             if (line == last)
@@ -7499,7 +9497,7 @@ void main()
             }
         }
         pc.vsConstBase = 0;
-        pc.psConstBase = 256;
+        pc.psConstBase = vsSlots;  // (the upload's layout: the pixel shader's constants follow the vertex shader's)
         pc.indexOffset = s_regs[XE_GPU_REG_VGT_INDX_OFFSET];
         auto colorControl = Reg<reg::RB_COLORCONTROL>();
         pc.alphaTest = colorControl.alpha_test_enable ? uint32_t(colorControl.alpha_func) : 7u;
@@ -7547,11 +9545,20 @@ void main()
             vkCmdSetViewport(s_cmd, 0, 1, &viewport);
             bound.viewport = viewport;
         }
+        // The scissor and the push constants are recorded through these, so
+        // the bound state always follows what was recorded: the edge-bar
+        // copies (below) change both, and a stale cache would skip the next
+        // draw's own scissor and clip it to a fill rectangle.
+        auto setScissor = [&](const VkRect2D& r) {
+            vkCmdSetScissor(s_cmd, 0, 1, &r);
+            bound.scissor = r;
+        };
+        auto pushConstants = [&](const DrawConstants& c) {
+            vkCmdPushConstants(s_cmd, layout.pipeline, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(c), &c);
+            bound.pc = c;
+        };
         if (fresh || memcmp(&bound.scissor, &scissor, sizeof(scissor)) != 0)
-        {
-            vkCmdSetScissor(s_cmd, 0, 1, &scissor);
-            bound.scissor = scissor;
-        }
+            setScissor(scissor);
         auto front = Reg<reg::RB_STENCILREFMASK>();
         auto back = depthControl.backface_enable ? RegAt<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF) : front;
         uint32_t stencil[6] = { front.stencilmask, back.stencilmask, front.stencilwritemask, back.stencilwritemask,
@@ -7578,7 +9585,7 @@ void main()
         {
             bias[0] = RegF(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET) * float(1 << 24);
             // The slope factor is per host pixel: scaled with the resolution (Xenia).
-            bias[2] = RegF(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE) / 16.0f * float(std::max(scaleX, scaleY));
+            bias[2] = RegF(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE) / 16.0f * std::max(scaleX, scaleY);
         }
         if (fresh || memcmp(bound.bias, bias, sizeof(bias)) != 0)
         {
@@ -7624,10 +9631,7 @@ void main()
             }
         }
         if (fresh || memcmp(&bound.pc, &pc, sizeof(pc)) != 0)
-        {
-            vkCmdPushConstants(s_cmd, layout.pipeline, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-            bound.pc = pc;
-        }
+            pushConstants(pc);
 
         // Guest memory this draw reads when the GPU runs it: vertex data, and
         // indices when the shader fetches them itself.
@@ -7661,7 +9665,8 @@ void main()
             // Weighted by the guest's samples per pixel (its MSAA; the host
             // renders 1) over host pixels per guest pixel (the render scale).
             const uint64_t segments = s_zpdSegNext;
-            ZpdBeginSegment(1u << uint32_t(surface.msaa_samples), scaleX * scaleY);
+            // (At 1.5x a host pixel is 4/9 of a guest one: msaa x 4 / 9.)
+            ZpdBeginSegment((1u << uint32_t(surface.msaa_samples)) * scale.PixelsDen(), scale.PixelsNum());
             s_zpdCounts.draws++;
             if (ZpdLogging())
             {
@@ -7673,9 +9678,24 @@ void main()
                     (unsigned long long)s_frame, (unsigned long long)s_vs->hash, (unsigned long long)s_ps->hash, vertexCount,
                     s_zpdQuery < 0 ? "not counted (this command buffer's queries are used up)"
                         : std::format("{} {}", s_zpdSegNext != segments ? "new segment" : "segment", s_zpdSegNext - 1).c_str(),
-                    1u << uint32_t(surface.msaa_samples), scaleX * scaleY, targets.c_str(), scissor.extent.width,
+                    (1u << uint32_t(surface.msaa_samples)) * scale.PixelsDen(), scale.PixelsNum(), targets.c_str(), scissor.extent.width,
                     scissor.extent.height, scissor.offset.x, scissor.offset.y);
             }
+        }
+        if (s_timedPass >= 0)
+        {
+            auto& timed = s_timedSlots[s_slot].regions[s_timedPass];
+            if (!timed.draws) { timed.firstVs = s_vs->hash; timed.firstPs = s_ps->hash; }
+            ++timed.draws;
+            timed.noFragmentDraws += (key.raster & 128u) != 0;
+            timed.eligibleDepthDraws += gpu::CanOmitFragmentStage(key.colorMask, alphaTest,
+                s_ps->info.usesKill, s_ps->info.writesDepth, s_ps->info.usesMemExport, s_vs->info.usesMemExport);
+            if (useIndices) timed.indices += vertexCount; else timed.vertices += vertexCount;
+            timed.snapshotDraws += copyCount != 0;
+            timed.snapshotRanges += copyCount; timed.snapshotBytes += copyBytes;
+            timed.vs = s_vs->hash; timed.ps = s_ps->hash;
+            timed.depthOnlyDraws += s_ps->hash == kDepthOnlyPsHash;
+            timed.alphaDraws += pc.alphaTest != 7u;
         }
         if (useIndices)
         {
@@ -7685,6 +9705,60 @@ void main()
         else
         {
             vkCmdDraw(s_cmd, vertexCount, 1, 0, 0);
+        }
+        // Edge bars (above): the same draw again per rectangle, with the
+        // stretched posScale and the rectangle as its scissor (inside this
+        // draw's own, so inside the pass); through setScissor and
+        // pushConstants, so the bound state follows.
+        if (barPlan.rectCount && barPlan.fill == gpu::bars::Fill::Backdrop)
+        {
+            // A backdrop: its rectangles (inside this draw's scissor, so
+            // inside the pass) cleared to opaque black in the colour targets
+            // it writes; nothing else changes.
+            VkClearAttachment ca[4]{};
+            uint32_t attachments = 0;
+            for (uint32_t i = 0; i < 4; i++)
+                if (color[i] && ((writeMask >> (4 * i)) & 0xF))
+                {
+                    ca[attachments].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    ca[attachments].colorAttachment = i;
+                    ca[attachments].clearValue.color = { { 0.0f, 0.0f, 0.0f, 1.0f } };
+                    attachments++;
+                }
+            VkClearRect cr[6]{};
+            for (uint32_t i = 0; i < barPlan.rectCount; i++)
+            {
+                const gpu::bars::Rect& r = barPlan.rects[i];
+                cr[i] = { { { r.x0, r.y0 }, { uint32_t(r.x1 - r.x0), uint32_t(r.y1 - r.y0) } }, 0, 1 };
+            }
+            if (attachments)
+                vkCmdClearAttachments(s_cmd, attachments, ca, barPlan.rectCount, cr);
+        }
+        else if (barPlan.rectCount)
+        {
+            DrawConstants fill = pc;
+            memcpy(fill.posScale, barPlan.posScale, sizeof(barPlan.posScale));
+            pushConstants(fill);
+            for (uint32_t i = 0; i < barPlan.rectCount; i++)
+            {
+                const gpu::bars::Rect& r = barPlan.rects[i];
+                setScissor(VkRect2D{ { r.x0, r.y0 }, { uint32_t(r.x1 - r.x0), uint32_t(r.y1 - r.y0) } });
+                if (s_timedPass >= 0) {
+                    auto& timed = s_timedSlots[s_slot].regions[s_timedPass];
+                    ++timed.draws;
+                    timed.snapshotDraws += copyCount != 0;
+                    timed.noFragmentDraws += (key.raster & 128u) != 0;
+                    timed.eligibleDepthDraws += gpu::CanOmitFragmentStage(key.colorMask, alphaTest,
+                        s_ps->info.usesKill, s_ps->info.writesDepth, s_ps->info.usesMemExport, s_vs->info.usesMemExport);
+                    if (useIndices) timed.indices += vertexCount; else timed.vertices += vertexCount;
+                    timed.depthOnlyDraws += s_ps->hash == kDepthOnlyPsHash;
+                    timed.alphaDraws += pc.alphaTest != 7u;
+                }
+                if (useIndices)
+                    vkCmdDrawIndexed(s_cmd, vertexCount, 1, 0, 0, 0);
+                else
+                    vkCmdDraw(s_cmd, vertexCount, 1, 0, 0);
+            }
         }
         if (s_submitAfterDraw)
         {
@@ -7903,14 +9977,16 @@ void main()
             height = showTexture[2];
         }
         uint32_t pitch = ((fetch[0] >> 22) & 0x1FF) << 5;
-        struct { uint32_t base, pitch, tiled, endian, format, swizzle, width, height, sx, sy, slotWords, scaled; } pc = {
+        struct { uint32_t base, pitch, tiled, endian, format, swizzle, width, height, sx, sy, slotWords, scaled, denX, denY; } pc = {
             fetch[1] & 0x1FFFF000u, pitch ? pitch : (width + 31) & ~31u, (fetch[0] >> 31) & 1, (fetch[1] >> 6) & 3,
-            fetch[1] & 0x3F, (fetch[3] >> 1) & 0xFFF, width, height, 1, 1, 0, 0 };
+            fetch[1] & 0x3F, (fetch[3] >> 1) & 0xFFF, width, height, 1, 1, 0, 0, 1, 1 };
         uint32_t frontBytes = pc.pitch * ((height + 31) & ~31u) * 4;
         // At host resolution when a scaled resolve wrote it (the game's frames;
-        // movies and loading screens drawn at 1x use the 1x image).
-        bool scaled = pc.tiled && !showTexture[0] && s_scaled.enabled && ScaledRangeValid(pc.base, frontBytes);
-        uint32_t outW = scaled ? width * s_scaled.sx : width, outH = scaled ? height * s_scaled.sy : height;
+        // movies and loading screens drawn at 1x use the 1x image). At 1.5x
+        // only a front buffer of whole blocks (even; 1280x720 is).
+        bool scaled = pc.tiled && !showTexture[0] && s_scaled.enabled && s_scaled.scale.Exact(width, height) &&
+            ScaledRangeValid(pc.base, frontBytes);
+        uint32_t outW = scaled ? s_scaled.scale.x.Size(width) : width, outH = scaled ? s_scaled.scale.y.Size(height) : height;
         Image& front = scaled ? s_frontScaled : s_front;
         uint32_t& frontW = scaled ? s_frontScaledWidth : s_frontWidth;
         uint32_t& frontH = scaled ? s_frontScaledHeight : s_frontHeight;
@@ -7931,8 +10007,10 @@ void main()
         {
             pc.width = outW;
             pc.height = outH;
-            pc.sx = s_scaled.sx;
-            pc.sy = s_scaled.sy;
+            pc.sx = s_scaled.scale.x.num;
+            pc.sy = s_scaled.scale.y.num;
+            pc.denX = s_scaled.scale.x.den;
+            pc.denY = s_scaled.scale.y.den;
             pc.slotWords = s_scaled.slotWords;
             pc.scaled = 1;
             s_scaled.untiledBytes += uint64_t(outW) * outH * 4;
@@ -7955,14 +10033,18 @@ void main()
         vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontPipeline);
         s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontLayout, 0, AddSharedParts(w, 4), w);
         vkCmdPushConstants(s_cmd, s_frontLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(s_cmd, (outW + 7) / 8, (outH + 7) / 8, 1);
+        {
+            int timed = TimingBegin("front_compute", outW, outH);
+            vkCmdDispatch(s_cmd, (outW + 7) / 8, (outH + 7) / 8, 1);
+            TimingEnd(timed);
+        }
         GuardGpu(pc.base, frontBytes, false, "front buffer");
         FullBarrier();
         SubmitRecorded(7);  // the presenter's blit comes later in queue order
         video::SubmitFrontImage(front.image, outW, outH, width, height);
         // Back at 1x (a live change): the host-resolution image is no longer
         // needed. The presenter has this frame to show instead.
-        if (!scaled && s_frontScaled.image && s_renderScaleX * s_renderScaleY == 1)
+        if (!scaled && s_frontScaled.image && s_renderScale.IsOne())
             DestroyFrontImage(s_frontScaled, s_frontScaledWidth, s_frontScaledHeight);
         if (g_eagerWrites)
         {
@@ -7978,6 +10060,13 @@ void main()
                 s_submitCv.wait(lock, [] { return s_inFlight.empty() || s_submissions[s_inFlight.front()].number > previousSwap; });
             }
             previousSwap = thisSwap;
+        }
+
+        if (s_visual.active)
+        {
+            VisualImage(front.image, outW, outH, VK_IMAGE_ASPECT_COLOR_BIT,
+                        std::format("frame-{}-final", s_visual.frame), false);
+            LogOcclusionCounts(s_visual.directory.string().c_str());
         }
 
         // NFSMW_CHECK_FRONT=<n>: at the n-th GPU present, read the image back
@@ -8015,7 +10104,11 @@ void main()
             region.bufferOffset = at;
             region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             region.imageExtent = { width, height, 1 };
-            vkCmdCopyImageToBuffer(s_cmd, front.image, VK_IMAGE_LAYOUT_GENERAL, s_ring, 1, &region);
+            {
+                int timed = TimingBegin("transfer");
+                vkCmdCopyImageToBuffer(s_cmd, front.image, VK_IMAGE_LAYOUT_GENERAL, s_ring, 1, &region);
+                TimingEnd(timed);
+            }
             Flush();
             if (FILE* f = fopen(checkPath.c_str(), "wb"))
             {
@@ -8036,8 +10129,69 @@ void main()
 
     void OnSwap(uint64_t frame)
     {
+#ifdef __ANDROID__
+        // Bounded aggregate evidence, no images or guest data. GPU interval
+        // totals are asynchronous completed submissions, not per-frame times.
+        static gpu::PerformanceWindow samples;
+        static auto previous = std::chrono::steady_clock::now();
+        static uint64_t lastDraws = s_stats.draws, complexFrames = 0;
+        static uint64_t gpuStart = s_gpuExecNs.load(), passesStart = s_stats.passes,
+            resolvesStart = s_stats.resolves, submitsStart = s_stats.submits;
+        static uint32_t firstLevel = s_passBarrier, lastWindowLevel = UINT32_MAX;
+        static bool mixed = false;
+        static unsigned rows = 0;
+        static std::filesystem::path csv;
+        const auto sampleNow = std::chrono::steady_clock::now();
+        if (frame > 1) samples.Add(std::chrono::duration<double, std::milli>(sampleNow - previous).count());
+        previous = sampleNow;
+        s_timingSampledInWindow += s_passTimingSample;
+        complexFrames += s_stats.draws - lastDraws >= 1500;
+        lastDraws = s_stats.draws;
+        mixed |= firstLevel != s_passBarrier;
+        if (frame % 120 == 0)
+        {
+            const uint64_t gpuNow = s_gpuExecNs.load();
+            const bool transition = mixed || firstLevel != lastWindowLevel || samples.count != 120;
+            if (rows < 600)
+            {
+                if (csv.empty())
+                {
+                    csv = GetUserPath() / "logs" / ("performance-" + std::to_string(std::time(nullptr)) + ".csv");
+                    std::error_code error;
+                    std::filesystem::create_directories(csv.parent_path(), error);
+                }
+                std::ofstream out(csv, std::ios::app);
+                if (out)
+                {
+                    if (!rows) out << "end_frame,barrier,transition,complex_frames,samples,cp_swap_mean_ms,cp_swap_p50_ms,cp_swap_p95_ms,cp_swap_p99_ms,gpu_completed_ms_per_sample,passes,resolves,submits,sampled_frames\n";
+                    out << std::format("{},{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{},{},{},{}\n",
+                        frame, firstLevel, transition ? 1 : 0, complexFrames, samples.count,
+                        samples.count ? samples.sum / samples.count : 0, samples.Percentile(.5), samples.Percentile(.95), samples.Percentile(.99),
+                        samples.count && s_timestamps ? double(gpuNow - gpuStart) / 1e6 / samples.count : -1,
+                        s_stats.passes - passesStart, s_stats.resolves - resolvesStart, s_stats.submits - submitsStart, s_timingSampledInWindow);
+                }
+                ++rows;
+            }
+            fprintf(stderr, "[benchmark] frame %llu barrier %u transition %d complex %llu/120 CP-swap p50 %.2f p95 %.2f p99 %.2f ms\n",
+                (unsigned long long)frame, firstLevel, int(transition), (unsigned long long)complexFrames,
+                samples.Percentile(.5), samples.Percentile(.95), samples.Percentile(.99));
+            lastWindowLevel = firstLevel;
+            samples = {}; complexFrames = 0; mixed = false; s_timingSampledInWindow = 0;
+            gpuStart = gpuNow; passesStart = s_stats.passes; resolvesStart = s_stats.resolves; submitsStart = s_stats.submits;
+            // Next window's actual level is set below, before its first draw.
+            firstLevel = UINT32_MAX;
+        }
+        else if (firstLevel == UINT32_MAX)
+        {
+            firstLevel = s_passBarrier;
+            mixed = false;
+        }
+#endif
         if (s_vk)
+        {
             ApplyLiveSettings();
+            TrimTextures(frame);
+        }
         if (s_uploadLog)
         {
             UploadLog& log = *s_uploadLog;
@@ -8059,13 +10213,30 @@ void main()
             log.now = frame >= log.first && frame <= log.last;
             writewatch::SetWriterFrame(frame);
         }
+        static uint64_t timingLastDraws = 0;
+        s_passTimingSample = s_passTimingEnabled && s_passTimingSchedule.Next(s_stats.draws - timingLastDraws);
+        timingLastDraws = s_stats.draws;
+        s_passTimingFrame = frame + 1;
+        if (s_passTimingSample)
+            fprintf(stderr, "[gpu-pass] armed frame %llu sample %u (timing markers may perturb this frame)\n",
+                (unsigned long long)s_passTimingFrame, s_passTimingSchedule.samples);
         s_frame = frame;
+        static int loggedAsync = -1;
+        int async = int(settings::GetBool(settings::Id::AsyncShaders));
+        if (async != loggedAsync)
+        {
+            fprintf(stderr, "[shader-policy] frame %llu async %s; %u workers, budget %lld us; loading setup still waits in full\n",
+                (unsigned long long)frame, async ? "ON" : "OFF", s_pipelineThreads, (long long)s_pipelineWaitUs);
+            loggedAsync = async;
+        }
         if (s_zpdOn)
             ZpdOnSwap(frame);
+        if (s_logShadowMap)
+            ShadowMapProbeOnSwap();
         // NFSMW_PASS_BARRIER: per frame of the window ending here, with the
         // level it ran at, before its [perf] line. Vertex barriers cost a
         // pass's overlap (a split: a pass too).
-        if (s_passBarrierLevel && frame % 120 == 0)
+        if (frame % 120 == 0)
         {
             static BarrierCounts last{};
             const BarrierCounts& c = s_barrierCounts;
@@ -8092,6 +10263,9 @@ void main()
             fprintf(stderr, "[barrier] alt: frames %llu-%llu run with level %u\n", (unsigned long long)(frame + 1),
                 (unsigned long long)(frame + 120), s_passBarrier);
         }
+#ifdef __ANDROID__
+        ApplyAndroidScheduling(frame + 1);
+#endif
         // NFSMW_LOG_UNTILED_AREA=1: with each [perf] line, whether the toggle
         // was on in its window (=alt: every other one) and what it did.
         if (s_logUntiledArea && frame % 120 == 0)
@@ -8175,9 +10349,14 @@ void main()
             s_logDrawsNow = true;
             fprintf(stderr, "[draws] frame %llu\n", (unsigned long long)frame);
         }
-        if (!s_vk || s_profileFrame < 0)
-            return;
-        if (frame == uint64_t(s_profileFrame))
+        static uint64_t visualLastDraws = 0, visualLastPasses = 0;
+        uint64_t frameDraws = s_stats.draws - visualLastDraws, framePasses = s_stats.passes - visualLastPasses;
+        visualLastDraws = s_stats.draws; visualLastPasses = s_stats.passes;
+        uint64_t depthResolves = s_visualDepthResolves; s_visualDepthResolves = 0;
+        bool visualEnded = s_visual.active;
+        if (!s_vk) return;
+        bool armVisual = !visualEnded && s_visual.arm(frame + 1, frameDraws, framePasses, depthResolves, GetUserPath() / "diagnostics");
+        if (armVisual || (s_profileFrame >= 0 && frame == uint64_t(s_profileFrame)))
         {
             s_profiling = true;
             s_passInfos.clear();
@@ -8194,21 +10373,56 @@ void main()
         // where a submission waited).
         double total = 0, between = 0;
         uint64_t lastEnd = 0;
-        fprintf(stderr, "[profile] frame %d: %zu passes\n", s_profileFrame, s_passInfos.size());
+        fprintf(stderr, "[profile] frame %lld: %zu passes\n", s_visual.active ? (long long)s_visual.frame : (long long)s_profileFrame, s_passInfos.size());
         for (const PassInfo& pi : s_passInfos)
         {
             uint64_t ts[2] = {};
-            vkGetQueryPoolResults(s_dev, s_passQueries, pi.query, 2, sizeof(ts), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
-            double us = ts[1] > ts[0] ? double(ts[1] - ts[0]) * s_timestampPeriod / 1000.0 : 0.0;
-            double gap = lastEnd && ts[0] > lastEnd ? double(ts[0] - lastEnd) * s_timestampPeriod / 1000.0 : 0.0;
+            VkResult timestampStatus = s_passQueries ? vkGetQueryPoolResults(s_dev, s_passQueries, pi.query, 2, sizeof(ts), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) : VK_ERROR_FEATURE_NOT_PRESENT;
+            if (timestampStatus != VK_SUCCESS) ts[0] = ts[1] = 0;
+            double us = timestampStatus == VK_SUCCESS ? double(gpu::TimestampTicks(ts[0], ts[1], s_timestampBits)) * s_timestampPeriod / 1000.0 : 0.0;
+            double gap = lastEnd && timestampStatus == VK_SUCCESS ? double(gpu::TimestampTicks(lastEnd, ts[0], s_timestampBits)) * s_timestampPeriod / 1000.0 : 0.0;
+            if (s_visual.active)
+                s_visual.text("render-passes.csv", std::format("{},{},{},{},{},{},{},{},{},{},\"{}\"\n", s_visual.frame, pi.query / 2, us, gap, int(timestampStatus), pi.draws, pi.resolves, pi.uploads, pi.submits, pi.shadowKB, pi.desc), true);
             total += us;
             between += gap;
-            if (ts[1] > ts[0])
+            if (timestampStatus == VK_SUCCESS)
                 lastEnd = ts[1];
             fprintf(stderr, "[profile] %8.1f us  %4u draws  (+%7.1f us before: %u resolves, %u uploads, %u submits, %llu KB synced)  %s\n",
                 us, pi.draws, gap, pi.resolves, pi.uploads, pi.submits, (unsigned long long)pi.shadowKB, pi.desc.c_str());
         }
         fprintf(stderr, "[profile] total %.1f us in passes, %.1f us between them\n", total, between);
+        if (visualEnded)
+        {
+            std::string occlusionLine = std::format("{{\"frame\":{},\"occlusion_counting\":{},\"reports\":[", s_visual.frame, s_zpdOn ? "true" : "false");
+            {
+                std::lock_guard lock(s_zpdLatestMutex);
+                unsigned records = 0;
+                for (const auto& [address, result] : s_zpdLatest)
+                {
+                    if (records == 256) break;
+                    if (records++) occlusionLine += ",";
+                    occlusionLine += std::format("{{\"address\":{},\"count\":{},\"frame\":{}}}", address, result.first, result.second);
+                }
+                occlusionLine += std::format("],\"reports_truncated\":{}}}\n", s_zpdLatest.size() > records ? "true" : "false");
+            }
+            s_visual.text("draw-state.jsonl", occlusionLine, true);
+            bool sampledImageCaptured = false;
+            for (const auto& [key, ptr] : s_textures)
+            {
+                const Texture& t = *ptr;
+                if (!sampledImageCaptured && t.uploaded && t.format == VK_FORMAT_R32_SFLOAT && !t.cube && !t.volume &&
+                    s_visual.depthDestinations.contains(t.guestStart) && s_visual.sampled.contains(t.guestStart))
+                {
+                    sampledImageCaptured = true;
+                    VisualImage(t.image.image, t.width, t.height, VK_IMAGE_ASPECT_COLOR_BIT,
+                        std::format("resolved-textures/frame-{}-{:08x}", s_visual.frame, t.guestStart), true);
+                }
+            }
+            if (!sampledImageCaptured) s_visual.text("summary.txt", "No exact-base sampled R32F representation matched selected depth resolve this frame.\n", true);
+            s_visual.text("summary.txt", std::format("frame {}: {} passes; depth comparison is shader arithmetic (Vulkan sampler compare disabled); pipeline skips {}. Sampled texture snapshots are end-of-frame representations.\n", s_visual.frame, s_passInfos.size(), s_stats.pipelineSkips), true);
+            if (!s_passQueries) s_visual.text("summary.txt", "GPU timestamps unavailable; pass metadata retained with unavailable status.\n", true);
+            s_visual.finish();
+        }
     }
 
     std::vector<uint32_t> CompileShader(const std::string& glsl, int stage, std::string& log)
@@ -8366,6 +10580,34 @@ void main()
 
     MemoryStats GetMemoryStats()
     {
+#ifdef __ANDROID__
+        // RSS is broader than the texture counter in [perf]. Kernel-only
+        // status reads every five seconds also show swap pressure as a race
+        // loads; no expensive full smaps scan on the command processor.
+        static auto last = std::chrono::steady_clock::time_point{};
+        auto now = std::chrono::steady_clock::now();
+        if (now - last >= std::chrono::seconds(5))
+        {
+            last = now;
+            if (FILE* f = fopen("/proc/self/status", "r"))
+            {
+                char line[256];
+                unsigned long long rss = 0, swap = 0, anon = 0, file = 0, shared = 0;
+                while (fgets(line, sizeof(line), f))
+                {
+                    if (sscanf(line, "VmRSS: %llu", &rss) == 1) continue;
+                    if (sscanf(line, "VmSwap: %llu", &swap) == 1) continue;
+                    if (sscanf(line, "RssAnon: %llu", &anon) == 1) continue;
+                    if (sscanf(line, "RssFile: %llu", &file) == 1) continue;
+                    sscanf(line, "RssShmem: %llu", &shared);
+                }
+                fclose(f);
+                fprintf(stderr, "[android-memory] RSS %llu MB (anon %llu, file %llu, shared %llu), swap %llu MB; GPU buffers: shadow %llu, ring %llu MB\n",
+                    rss / 1024, anon / 1024, file / 1024, shared / 1024, swap / 1024,
+                    (unsigned long long)(s_shadowMode ? kSharedSize >> 20 : 0), (unsigned long long)(kRingSize >> 20));
+            }
+        }
+#endif
         MemoryStats m{};
         for (const auto& [key, rt] : s_targets)
         {

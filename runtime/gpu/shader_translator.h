@@ -21,6 +21,11 @@
 
 namespace gpu
 {
+    // Set once by renderer initialization, before shader translation/workers.
+    extern bool g_workReductionEnabled;
+    extern bool g_predicateCoalescingEnabled;
+    extern bool g_forwardControlFlowEnabled;
+
     enum class ShaderStage : uint32_t { Vertex = 0, Pixel = 1 };
 
     struct TranslatedShader
@@ -30,6 +35,7 @@ namespace gpu
         std::string glsl;
 
         uint32_t registerCount = 0;
+        uint32_t predicatedInstructions = 0, predicateBlocks = 0; // instruction guards, excludes CF guards
         uint32_t interpolatorMask = 0;   // VS: written; PS: read
         uint32_t colorTargetMask = 0;    // PS: oC# written
         bool writesDepth = false;

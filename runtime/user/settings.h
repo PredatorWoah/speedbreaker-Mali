@@ -46,6 +46,10 @@ namespace settings
         AntiAliasing,
         Scaling,
         AspectRatio,
+        Brightness,    // the game's picture (video/display_tone.h)
+        DisplayGamma,  // the 360's display gamma ramp (video/display_gamma.h)
+        YellowTint,    // takes the game's yellow cast out of its picture (video/display_tone.h)
+        GameYellowFilter,  // turns the game's own yellow colour filter off (gpu/renderer.cpp, GameFilterConstant)
         Sharpening,
         Anisotropy,
         Mipmaps,
@@ -63,6 +67,11 @@ namespace settings
         // Advanced
         AsyncShaders,
         PerformanceOverlay,
+        GpuScheduling,
+        GpuWorkReduction,
+        PredicateCoalescing,
+        DepthStageReduction,
+        PowerHints,    // Android only (platform/perf_hint.h)
         Count
     };
     constexpr size_t kCount = size_t(Id::Count);
@@ -76,14 +85,16 @@ namespace settings
     // Frame Rate: 60, 30, or Auto (video/frame_rate.h: 60, or 30 while the
     // device is hot or can't hold 60).
     constexpr int32_t kFrameRateAuto = 0;
-    // Internal resolution: 1-3 renders at that multiple of 720p; Auto picks
-    // it from the screen area the picture covers (see renderer).
+    // Internal resolution: the multiple of 720p it renders at, in half steps
+    // (2: 1x, 3: 1.5x = 1080p, 4: 2x, 6: 3x; only the tokens "1x", "1.5x"...
+    // are saved, so the numbers are free to change); Auto picks it from the
+    // screen area the picture covers (see renderer).
     constexpr int32_t kResolutionAuto = 0;
     // Auto: a screen of another shape is filled (video/picture_fit), the HUD
     // kept in a centred 16:9 block: a wider one with a wider view (Hor+), a
-    // narrower one (4:3, 3:2) with a taller view (Vert+, down to 4:3). 16:10
-    // (the Steam Deck, 1280x800 Macs) is too close to 16:9 for that and keeps
-    // thin bars (video::kTallMinStretch). Widescreen: 16:9 with bars.
+    // narrower one (16:10: the Steam Deck, 1280x800 Macs; 3:2, 4:3) with a
+    // taller view (Vert+, down to 4:3). Only a screen within 1% of 16:9 keeps
+    // the 16:9 frame (video::kTallMinStretch). Widescreen: 16:9 with bars.
     enum class AspectMode : int32_t { Auto = 0, Widescreen = 1 };
     // Anisotropy: 1 (off), 2, 4, 8, 16, or one of these.
     constexpr int32_t kAnisotropyAuto = 0;   // 16x on a discrete GPU or an M-series iPad, 4x on other integrated ones

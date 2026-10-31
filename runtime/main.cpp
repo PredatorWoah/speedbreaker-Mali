@@ -10,6 +10,7 @@
 
 #include "stdafx.h"
 #include "kernel/arena.h"
+#include "kernel/memory_status.h"
 #include "kernel/module.h"
 #include "kernel/write_watch.h"
 #include "kernel/dispatcher.h"
@@ -19,17 +20,28 @@
 #include <hid/input.h>
 #include <cpu/guest_thread.h>
 #include <cpu/host_cpu.h>
+#include <platform/perf_hint.h>
 #include <install/install_cli.h>
 #include <install/locate.h>
+#include <install/placement.h>
 #include <install/sha256.h>
+#include <install/disc_mount.h>
 #include <report/report.h>
+#include <game/cheats.h>
 #include <ui/installer_screen.h>
 #include <ui/ui.h>
 #include <user/paths.h>
 #include <user/settings.h>
+#include <user/title_art.h>
+#include <user/save_backup.h>
 #include <user/version_check.h>
 
 #include <SDL3/SDL.h>
+#ifdef __ANDROID__
+#include <SDL3/SDL_main.h>
+#include <platform/android/storage.h>
+#include <platform/android/disc_picker.h>
+#endif
 #if defined(__APPLE__) && TARGET_OS_IOS
 #include <SDL3/SDL_main.h>  // SDL starts UIKit and calls main() from it
 #include <platform/ios_files.h>
@@ -176,6 +188,7 @@ namespace
         auto* params = static_cast<GuestMainParams*>(arg);
         GuestThread::SetDefaultStackSize(params->stackSize);
         SetHostThreadName("nfsmw-main");
+        perfhint::AddThisThread("game main thread");
         if (g_memory.FindFunction(params->entry) == nullptr)
         {
             fprintf(stderr, "[runtime] no recompiled function at the entry point\n");
@@ -269,6 +282,18 @@ namespace
 
 int main(int argc, char** argv)
 {
+#ifdef __ANDROID__
+    setenv("NFSMW_RENDER_SCALE", "1", 0);  // RP6 bring-up: 720p.
+    // Bounded aggregate diagnostics for the audio/performance test build.
+    setenv("NFSMW_AUDIO_LOG", "1", 0);
+    setenv("NFSMW_XMA_STATS", "1", 0);
+    setenv("NFSMW_GPU_TIMING", "1", 0);
+    setenv("NFSMW_VISUAL_CAPTURE", "0", 0);  // Performance build: no image readback stalls.
+    setenv("NFSMW_REFLECTION_LOG", "1", 0);  // Bounded metadata-only material probe.
+    const auto files = platform::android::Files();
+    std::filesystem::create_directories(files / "imports");
+    chdir(files.c_str());
+#endif
 #if defined(__APPLE__) && TARGET_OS_IOS
     // iOS starts an app in /, which it can't write. Relative paths (test
     // output in build/, a ./game/files development copy) mean the app's
@@ -276,9 +301,23 @@ int main(int argc, char** argv)
     if (const char* home = std::getenv("HOME"))
         chdir((std::string(home) + "/Documents").c_str());
 #endif
-    // Before anything uses the per-user folders: nfsmw-recomp's become
-    // SpeedBreaker's (user/paths.h).
-    std::string migrated = MigrateUserFolders();
+    // Which folder the game runs from, before anything changes directory:
+    // the installer never puts the game inside it (install/placement.h), and
+    // a portable.txt there keeps all of SpeedBreaker's data in it
+    // (user/portable.h).
+    install::SetProgramPath(argc > 0 ? argv[0] : nullptr);
+    // Before anything uses the per-user folders: portable mode or not, and
+    // then (not in portable mode) nfsmw-recomp's folders become
+    // SpeedBreaker's (user/paths.h). A portable folder that can't be written
+    // (a read-only drive, a locked card) is still used: the game plays, and
+    // the player is told settings and saves won't be kept; never a quiet
+    // switch to the home folder, which would split saves between two places.
+    const portable::Layout& portableLayout = portable::Detect(install::BundleFolder());
+    const int portableError = portable::CheckWritable(portableLayout);
+    std::string migrated = MigrateUserFolders() + portable::Describe(portableLayout);
+    if (portableError)
+        migrated += std::format("[paths] portable mode: {} can't be written ({}): settings and saves won't be kept\n",
+            portableLayout.data.string(), strerror(portableError));
     // The name volume mixers and the desktop show (before SDL starts).
     SDL_SetAppMetadata("SpeedBreaker", report::BuildString(), nullptr);
     if (std::optional<int> code = install::RunInstallCommand(argc, argv))
@@ -295,9 +334,41 @@ int main(int argc, char** argv)
     report::StartLogWriter();
     report::RegisterThread("main (window)");
 
+    // The guest's 4 GB (kernel/memory.cpp, reserved before main): where it
+    // went, or why it couldn't, and on iOS what the app's signature allows
+    // (kernel/memory_status.h). For the log, the system summary and, when
+    // the game can't start, the page that says why.
+    memstatus::Status memory;
+    memory.base = reinterpret_cast<uintptr_t>(g_memory.base);
+    memory.failure = memstatus::Failure(g_memory.base ? 0 : std::max(g_memory.failedStep, 1));
+    memory.error = g_memory.failedError;
+    memstatus::Gather(memory);
+    fprintf(stderr, "%s\n", memstatus::LogLine(memory).c_str());
+    report::SetSystemItem("Memory", memstatus::SummaryItem(memory));
     if (g_memory.base == nullptr)
     {
-        fprintf(stderr, "[runtime] could not reserve 4 GB of guest address space\n");
+        // An iOS copy signed without Extended Virtual Addressing (a free
+        // Apple Account's sideload) ends up here: say so on screen rather
+        // than vanish. Before the game's code runs at all.
+        memstatus::Message message = memstatus::StartupFailure(memory);
+        fprintf(stderr, "[runtime] could not reserve 4 GB of guest address space: %s\n", message.title.c_str());
+        for (const std::string& p : message.paragraphs)
+            fprintf(stderr, "[runtime]   %s\n", p.c_str());
+        settings::Load();
+        if (video::Initialize())
+        {
+            ui::RunStartupError(message.title, message.paragraphs, message.details, [] { return video::RunFrame(); });
+            video::Shutdown();
+        }
+        else if (const char* h = std::getenv("NFSMW_HEADLESS"); !h || h[0] != '1')
+        {
+            // No window for the page: the system's own message box.
+            std::string text;
+            for (const std::string& p : message.paragraphs)
+                text += p + "\n\n";
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, message.title.c_str(), (text + message.details).c_str(), nullptr);
+        }
+        report::FlushLog();
         return 1;
     }
 
@@ -340,6 +411,13 @@ int main(int argc, char** argv)
         settings::SetDeviceDefault(settings::Id::FrameRate, older ? 30 : settings::kFrameRateAuto, "an iPhone, " + gpu);
     }
 #endif
+#ifdef __ANDROID__
+    // Anti-aliasing (~0.65 ms of GPU a frame) and bicubic sharpening cost
+    // frame time that a Mali-G1 in a city doesn't have: both off by default
+    // on a phone (Settings > Graphics, the Quality Preset put them back).
+    settings::SetDeviceDefault(settings::Id::AntiAliasing, 0, "Android");
+    settings::SetDeviceDefault(settings::Id::Sharpening, 0, "Android");
+#endif
     bool settingsLoaded = settings::Load();
     // Which version ran last: a line in the log (so a bug report shows when a
     // problem began), the "What's new" note below, and this version recorded
@@ -352,13 +430,58 @@ int main(int argc, char** argv)
         fprintf(stderr, "[version] %s\n", version::Describe(versionChange, last, report::Version()).c_str());
         if (versionChange != version::Change::Same)
             settings::RecordVersion(report::Version());
+#ifdef __ANDROID__
+        // Once, coming from 0.1.24-0.1.26 (Android's Auto, and a saved 60
+        // switched to it): Auto becomes 60. Its 30 fps, even on a 120 Hz
+        // panel, was too choppy for the owner; 60 is the target, held longer
+        // by making frames cheaper. Auto stays a choice in the menu.
+        if (!last.empty() && version::Compare(last, "0.1.27") < 0 &&
+            settings::GetStoredValue(settings::Id::FrameRate) == settings::kFrameRateAuto)
+        {
+            settings::Set(settings::Id::FrameRate, 60);
+            fprintf(stderr, "[frame rate] Auto -> 60, once, coming from v%s\n", last.c_str());
+            settings::Save();
+        }
+        // Once, coming from before 0.1.29 (the defaults then were AA on and
+        // sharpening 0.3, and a saved file holds every option): those two
+        // exact values become off. A different value was the player's choice.
+        if (!last.empty() && version::Compare(last, "0.1.29") < 0 &&
+            settings::GetStoredValue(settings::Id::AntiAliasing) == 1 && settings::GetStoredValue(settings::Id::Sharpening) == 0.3)
+        {
+            settings::Set(settings::Id::AntiAliasing, 0);
+            settings::Set(settings::Id::Sharpening, 0);
+            fprintf(stderr, "[settings] anti-aliasing and sharpening off, once, coming from v%s\n", last.c_str());
+            settings::Save();
+        }
+#endif
     }
     else
         fprintf(stderr, "[version] v%s (the last version isn't known: settings.toml didn't load)\n", report::Version());
     // The window must live on the main thread (macOS); the game gets its own.
     bool windowed = video::Initialize();
+#ifdef __ANDROID__
+    // A failed Android Vulkan/frontend init must not accidentally start a
+    // headless guest. Headless is available only as an explicit diagnostic.
+    const char* headless = std::getenv("NFSMW_HEADLESS");
+    if (!windowed && !(headless && headless[0] == '1'))
+    {
+        fprintf(stderr, "[runtime] Android video initialization failed; guest execution not started\n");
+        report::FlushLog();
+        return 1;
+    }
+#endif
     if (!settingsLoaded)
         ui::Toast(settings::LastError(), 12.0);  // a mistake in settings.toml: it was kept as .bad
+    if (portableError)
+        ui::Toast(std::format("SpeedBreaker's folder can't be written ({}): settings and saves won't be kept this time. "
+            "Move the folder to a drive it can write to.", strerror(portableError)), 12.0);
+    // iOS: a copy without Increased Memory Limit (a free Apple Account's
+    // sideload) starts, but iOS may close it in a busy scene: say so once.
+    if (std::string notice = memstatus::LowMemoryNotice(memory); !notice.empty())
+    {
+        fprintf(stderr, "[memory] %s\n", notice.c_str());
+        ui::Toast(notice, 12.0);
+    }
     report::NoticePreviousCrash();
 
     // NFSMW_LIFELINE_PID (scripts/steamos/speedbreaker.sh): the launcher's PID. The
@@ -378,6 +501,7 @@ int main(int argc, char** argv)
             }).detach();
 
     std::filesystem::path xexPath;
+    std::vector<uint8_t> discXex;
     std::string gameOrigin;  // for the system summary
     if (argc > 1)
     {
@@ -388,6 +512,21 @@ int main(int argc, char** argv)
             SetGamePath(std::filesystem::absolute(xexPath).parent_path());
         gameOrigin = "the XEX on the command line";
     }
+#ifdef __ANDROID__
+    else if (windowed)
+    {
+        auto selected = platform::android::ChooseDisc([] { return video::RunFrame(); });
+        if (!selected) { video::Shutdown(); return 0; }
+        std::string error;
+        if (!discmount::Mount(selected->source, error))
+        { fprintf(stderr, "[disc] mount failed: %s\n", error.c_str()); report::FlushLog(); return 1; }
+        SetGamePath(discmount::Root());
+        xexPath = discmount::Root() / "default.xex";
+        discXex = std::move(selected->xex);
+        gameOrigin = "ISO selected with Android Files: " + selected->name;
+        platform::android::RememberDisc();
+    }
+#endif
     else if (std::optional<install::GameInstall> game = install::FindGameInstall())
     {
         SetGamePath(game->path);
@@ -433,7 +572,7 @@ int main(int argc, char** argv)
     }
     fprintf(stderr, "[runtime] game files: %s\n", GetGamePath().string().c_str());
 
-    std::vector<uint8_t> file = LoadFile(xexPath);
+    std::vector<uint8_t> file = discXex.empty() ? LoadFile(xexPath) : std::move(discXex);
     if (file.empty())
     {
         fprintf(stderr, "[runtime] cannot read %s\n", xexPath.string().c_str());
@@ -449,11 +588,16 @@ int main(int argc, char** argv)
     }
     memcpy(g_memory.Translate(image.base), image.data.get(), image.size);
     fprintf(stderr, "[loader] image %08zX-%08zX, entry %08zX\n", image.base, image.base + image.size, image.entry_point);
+    // The disc's own icon and title for the launcher (user/title_art.h).
+    title_art::Save(file, image.data.get(), uint32_t(image.base), uint32_t(image.size));
+    // The saves as they are before the game (and its cheats) run (user/save_backup.h).
+    save_backup::BackUp();
 
     // Which game files this is, then the whole system summary for the log.
     {
         std::string sha = install::ToHex(install::Sha256Of(file.data(), file.size()));
         const install::Manifest& manifest = install::GameManifest();
+        game::cheats::Initialize(sha == "aebdf3c14d1e4e4ed2c130d94bc1a0e97bd6d5bf39bdfdef33c3909c9cc4ba4c");
         report::SetSystemItem("Game", std::format("{} ({}); default.xex {} bytes, SHA-256 {} ({}); manifest {}",
             GetGamePath().string(), gameOrigin, file.size(), sha, sha == manifest.Xex().sha256 ? "the supported version" : "NOT the supported version",
             manifest.version));
@@ -475,7 +619,7 @@ int main(int argc, char** argv)
     pthread_create(&thread, &attr, GuestMain, &params);
     report::StartWatchdog();  // hang reports (and the NFSMW_TEST_* switches)
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
     // NFSMW_ALLOW_DEBUGGER=1: let gdb/perf attach with Yama ptrace_scope 1.
     if (const char* v = std::getenv("NFSMW_ALLOW_DEBUGGER"); v && v[0] == '1')
         prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);

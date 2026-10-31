@@ -219,7 +219,16 @@ namespace report
         // 35 MB in 2 s.
         constexpr uint64_t kLoadingBytes = 4ull << 20;
 
-        void WriteHangReport(const std::string& reason, double sinceFrame, double sinceRead, int episode)
+        // When the watchdog last saw a new frame and a disc read (steady clock,
+        // ns; 0 before it runs), for a report written outside it (ThreadReport).
+        std::atomic<int64_t> s_lastFrameNs{ 0 }, s_lastReadNs{ 0 };
+
+        int64_t SteadyNs()
+        {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+
+        std::string ReportText(const std::string& reason, double sinceFrame, double sinceRead)
         {
             std::vector<ThreadSample> samples = SampleThreads();
             std::string text;
@@ -246,6 +255,15 @@ namespace report
             }
             text += "\nThe log's last lines:\n" + RecentOutput(400);
             text += "\nSystem:\n" + SystemSummary();
+            return text;
+        }
+
+        // How long a load may sit without reads or audio, frames still coming.
+        constexpr double kStallSeconds = 30.0;
+
+        void WriteHangReport(const std::string& reason, double sinceFrame, double sinceRead, int episode, bool toast = true)
+        {
+            const std::string text = ReportText(reason, sinceFrame, sinceRead);
 
             std::filesystem::path dir = LogDirectory();
             std::error_code ec;
@@ -262,7 +280,8 @@ namespace report
                 fprintf(stderr, "[hang] %s. Hang report: %s\n", reason.c_str(), path.c_str());
             else
                 fprintf(stderr, "[hang] %s. Couldn't write the hang report to %s\n", reason.c_str(), path.c_str());
-            ui::Toast(std::format("The game seems to have stopped. A hang report was saved; to send it: {}.", detail::kSaveBugReportHint), 20.0);
+            if (toast)
+                ui::Toast(std::format("The game seems to have stopped. A hang report was saved; to send it: {}.", detail::kSaveBugReportHint), 20.0);
         }
 
         void Watchdog(Thresholds limits)
@@ -281,6 +300,13 @@ namespace report
             uint64_t window[20] = {};
             size_t windowPos = 0;
             bool episode = false, pausedInGap = false;
+            // A load that stops while its loading screen still animates: frames
+            // come, but nothing is read and no audio is decoded (the vivo X300
+            // Pro, 2026-10-21, going back to the career safehouse). Reported
+            // once per stall, quietly (it may be a silent menu left alone).
+            uint64_t lastAudio = g_audioFrames.load(std::memory_order_relaxed);
+            auto lastAudioAt = now, stallReadAt = now;
+            bool stallReported = false;
             int episodes = 0;
             while (true)
             {
@@ -290,6 +316,7 @@ namespace report
                 if (seconds(now - lastTick) > 5.0)
                 {
                     lastFrameAt = lastReadAt = resetAt = now;
+                    lastAudioAt = stallReadAt = now;
                     pausedInGap = true;
                 }
                 lastTick = now;
@@ -297,7 +324,17 @@ namespace report
                 uint64_t bytes = g_fileBytesRead.load(std::memory_order_relaxed);
                 window[windowPos++ % 20] = bytes - lastBytes;
                 if (bytes != lastBytes)
-                    lastReadAt = now;
+                {
+                    lastReadAt = stallReadAt = now;
+                    s_lastReadNs.store(SteadyNs(), std::memory_order_relaxed);
+                }
+                // Audio decoding: music, speech and effects all go through XMA.
+                const uint64_t audio = g_audioFrames.load(std::memory_order_relaxed);
+                if (audio != lastAudio)
+                {
+                    lastAudio = audio;
+                    lastAudioAt = now;
+                }
                 lastBytes = bytes;
                 uint64_t recentBytes = 0;
                 for (uint64_t b : window)
@@ -324,6 +361,7 @@ namespace report
                     pausedInGap = false;
                     lastFrames = frames;
                     lastFrameAt = lastFrameSeen = now;
+                    s_lastFrameNs.store(SteadyNs(), std::memory_order_relaxed);
                     gapBytes = bytes;
                 }
                 if (paused)
@@ -331,6 +369,20 @@ namespace report
                     // A menu, a hidden window or a suspension: not the game's doing.
                     lastFrameAt = now;
                     pausedInGap = true;
+                    lastAudioAt = stallReadAt = now;  // the stall's clocks start over too
+                }
+                {
+                    const double quiet = std::min(seconds(now - stallReadAt), seconds(now - lastAudioAt));
+                    const bool drawing = seconds(now - lastFrameSeen) < 2.0;
+                    if (quiet < 5.0)
+                        stallReported = false;
+                    else if (drawing && quiet >= kStallSeconds && !stallReported && !paused)
+                    {
+                        stallReported = true;
+                        WriteHangReport(std::format("frames still come, but nothing has been read from the disc and no audio decoded "
+                            "for {:.0f} s (a load that stopped behind its loading screen?)", quiet),
+                            seconds(now - lastFrameSeen), seconds(now - lastReadAt), ++episodes, false);
+                    }
                 }
                 // A command processor wait counts under the menu (the game
                 // draws its pause screen there, so its waits keep passing),
@@ -527,6 +579,12 @@ namespace report
             when += std::format("{}{:.0f} s in one command processor wait", when.empty() ? "" : " or ", limits.cpWait);
         fprintf(stderr, "[watchdog] a hang report after %s\n", when.c_str());
         std::thread(Watchdog, limits).detach();
+    }
+
+    std::string ThreadReport(const std::string& why)
+    {
+        const int64_t now = SteadyNs(), frame = s_lastFrameNs.load(), read = s_lastReadNs.load();
+        return ReportText(why, frame ? double(now - frame) / 1e9 : 0.0, read ? double(now - read) / 1e9 : 0.0);
     }
 
     namespace detail
